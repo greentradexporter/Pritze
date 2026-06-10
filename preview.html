@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nashik Salon Booking - Preview</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #009688; /* Teal */
+            --primary-light: #e0f2f1;
+            --bg: #ffffff;
+            --text-main: #2d3436;
+            --text-muted: #636e72;
+            --card-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            --radius: 12px;
+        }
+
+        * {
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f2f5;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: var(--text-main);
+        }
+
+        /* Mobile Frame */
+        .phone-container {
+            width: 375px;
+            height: 700px;
+            background: white;
+            border-radius: 40px;
+            border: 8px solid #333;
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .status-bar {
+            height: 30px;
+            padding: 0 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        /* Screen Container */
+        .screen {
+            flex: 1;
+            display: none;
+            flex-direction: column;
+            overflow-y: auto;
+            animation: fadeIn 0.3s ease-out;
+        }
+
+        .screen.active {
+            display: flex;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Common Components */
+        header {
+            background: var(--primary);
+            color: white;
+            padding: 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        header h1 {
+            margin: 0;
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .btn {
+            padding: 14px 20px;
+            border-radius: var(--radius);
+            border: none;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            width: 100%;
+        }
+
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:active { opacity: 0.9; transform: scale(0.98); }
+
+        .btn-outline { background: transparent; border: 2px solid var(--primary); color: var(--primary); }
+        .btn-outline:active { background: var(--primary-light); }
+
+        .card {
+            background: white;
+            border-radius: var(--radius);
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: var(--card-shadow);
+            border: 1px solid #eee;
+        }
+
+        /* Welcome Screen Styles */
+        #welcome-screen {
+            padding: 40px 24px;
+            text-align: center;
+        }
+
+        .logo-icon {
+            font-size: 80px;
+            color: var(--primary);
+            margin-bottom: 32px;
+            margin-top: 60px;
+        }
+
+        .welcome-title { font-size: 28px; font-weight: 800; margin-bottom: 12px; }
+        .welcome-subtitle { color: var(--text-muted); margin-bottom: 60px; }
+
+        /* List Styles */
+        .list-container { padding: 16px; }
+
+        /* Form Styles */
+        .form-group { margin-bottom: 16px; }
+        .form-group label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; }
+        .form-group input, .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-family: inherit;
+        }
+
+        /* FAB */
+        .fab {
+            position: absolute;
+            bottom: 24px;
+            right: 24px;
+            width: 56px;
+            height: 56px;
+            border-radius: 28px;
+            background: var(--primary);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            cursor: pointer;
+        }
+
+        /* Mock Notification */
+        .snackbar {
+            position: absolute;
+            bottom: 80px;
+            left: 20px;
+            right: 20px;
+            background: #333;
+            color: white;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: none;
+            z-index: 100;
+        }
+
+    </style>
+</head>
+<body>
+
+<div class="phone-container">
+    <div class="status-bar">
+        <span>9:41</span>
+        <div style="display: flex; gap: 4px;">
+            <span class="material-icons-rounded" style="font-size: 14px;">signal_cellular_alt</span>
+            <span class="material-icons-rounded" style="font-size: 14px;">wifi</span>
+            <span class="material-icons-rounded" style="font-size: 14px;">battery_full</span>
+        </div>
+    </div>
+
+    <!-- Welcome Screen -->
+    <div id="welcome-screen" class="screen active">
+            <span class="material-icons logo-icon">content_cut</span>
+        <h1 class="welcome-title">Nashik Salon Booking</h1>
+        <p class="welcome-subtitle">Book your next grooming session with ease.</p>
+        <div style="margin-top: auto; display: flex; flex-direction: column; gap: 16px;">
+            <button class="btn btn-primary" onclick="showScreen('customer-home')">I am a Customer</button>
+            <button class="btn btn-outline" onclick="showScreen('salon-dashboard')">I am a Salon Owner</button>
+        </div>
+    </div>
+
+    <!-- Customer Home Screen -->
+    <div id="customer-home" class="screen">
+        <header>
+            <h1>Available Salons</h1>
+        </header>
+        <div class="list-container" id="salon-list">
+            <!-- Salons will be injected here -->
+        </div>
+    </div>
+
+    <!-- Salon Dashboard Screen -->
+    <div id="salon-dashboard" class="screen">
+        <header>
+            <span class="material-icons" onclick="showScreen('welcome-screen')" style="cursor: pointer;">arrow_back</span>
+            <h1>Inbox</h1>
+            <span class="material-icons" style="margin-left: auto; cursor: pointer;" onclick="showScreen('profile-setup')">settings</span>
+        </header>
+        <div class="list-container" id="booking-list">
+            <!-- Bookings will be injected here -->
+        </div>
+    </div>
+
+    <!-- Profile Setup Screen -->
+    <div id="profile-setup" class="screen">
+        <header>
+            <span class="material-icons" onclick="showScreen('salon-dashboard')" style="cursor: pointer;">arrow_back</span>
+            <h1>Setup Salon Profile</h1>
+        </header>
+        <div class="list-container">
+            <div class="form-group">
+                <label>Salon Name</label>
+                <input type="text" placeholder="Enter salon name">
+            </div>
+            <div class="form-group">
+                <label>Owner Name</label>
+                <input type="text" placeholder="Enter owner name">
+            </div>
+            <div class="form-group">
+                <label>Complete Address</label>
+                <textarea rows="3" placeholder="e.g. College Road, Nashik"></textarea>
+            </div>
+            <div class="form-group">
+                <label>Phone Number</label>
+                <input type="tel" placeholder="Enter phone number">
+            </div>
+            
+            <h3 style="margin-top: 24px;">Services</h3>
+            <div id="preview-services-list">
+                <!-- Services added will appear here -->
+            </div>
+            <button class="btn btn-outline" style="margin-bottom: 24px;" onclick="addMockService()">
+                <span class="material-icons">add</span> Add Service
+            </button>
+
+            <button class="btn btn-primary" onclick="showSnackbar('Profile Saved Successfully!')">Save Profile</button>
+        </div>
+    </div>
+
+    <div id="snackbar" class="snackbar"></div>
+</div>
+
+<script>
+    const salons = [
+        { id: 1, name: 'Royal Cuts Nashik', address: 'College Road, Nashik', services: 5 },
+        { id: 2, name: 'Modern Salon', address: 'Gangapur Road, Nashik', services: 8 },
+        { id: 3, name: 'The Grooming Room', address: 'Indira Nagar, Nashik', services: 3 }
+    ];
+
+    const bookings = [
+        { id: 1, customer: 'Rahul Sharma', service: 'Haircut + Styling', date: '2023-10-25', time: '10:30 AM', status: 'pending' },
+        { id: 2, customer: 'Priya Patel', service: 'Facial & Spa', date: '2023-10-25', time: '02:00 PM', status: 'confirmed' }
+    ];
+
+    function showScreen(screenId) {
+        document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+        document.getElementById(screenId).classList.add('active');
+        
+        if (screenId === 'customer-home') renderSalons();
+        if (screenId === 'salon-dashboard') renderBookings();
+    }
+
+    function renderSalons() {
+        const list = document.getElementById('salon-list');
+        list.innerHTML = salons.map(salon => `
+            <div class="card">
+                <div style="font-size: 18px; font-weight: 700;">${salon.name}</div>
+                <div style="color: var(--text-muted); font-size: 14px; margin: 4px 0 12px 0;">${salon.address}</div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="background: var(--primary-light); color: var(--primary); padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;">
+                        ${salon.services} Services
+                    </span>
+                    <button class="btn btn-primary" style="width: auto; padding: 8px 16px; font-size: 14px;" onclick="showSnackbar('Booking feature coming soon!')">Book Now</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function renderBookings() {
+        const list = document.getElementById('booking-list');
+        list.innerHTML = bookings.map(b => `
+            <div class="card">
+                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                    <div>
+                        <div style="font-size: 18px; font-weight: 700;">${b.customer}</div>
+                        <div style="font-size: 14px; color: var(--text-muted); margin-top: 4px;">Service: ${b.service}</div>
+                    </div>
+                    <span style="border: 1px solid ${b.status === 'confirmed' ? '#4caf50' : '#ff9800'}; color: ${b.status === 'confirmed' ? '#4caf50' : '#ff9800'}; padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: 800; text-transform: uppercase;">
+                        ${b.status}
+                    </span>
+                </div>
+                <div style="display: flex; gap: 12px; margin-top: 12px; font-size: 13px;">
+                    <span style="display: flex; align-items: center; gap: 4px;"><i class="material-icons" style="font-size: 16px; color: var(--primary);">calendar_today</i> ${b.date}</span>
+                    <span style="display: flex; align-items: center; gap: 4px;"><i class="material-icons" style="font-size: 16px; color: var(--primary);">access_time</i> ${b.time}</span>
+                </div>
+                ${b.status === 'pending' ? `
+                    <div style="display: flex; gap: 8px; margin-top: 16px;">
+                        <button class="btn btn-outline" style="padding: 8px; font-size: 13px; color: #f44336; border-color: #f44336;">Reject</button>
+                        <button class="btn btn-primary" style="padding: 8px; font-size: 13px;" onclick="showSnackbar('Booking Confirmed!')">Confirm</button>
+                    </div>
+                ` : ''}
+            </div>
+        `).join('');
+    }
+
+    function addMockService() {
+        const list = document.getElementById('preview-services-list');
+        const div = document.createElement('div');
+        div.className = 'card';
+        div.style.padding = '12px';
+        div.style.marginBottom = '8px';
+        div.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: 600;">Basic Haircut</span>
+                <span style="font-weight: 700; color: var(--primary);">₹250</span>
+            </div>
+        `;
+        list.appendChild(div);
+    }
+
+    function showSnackbar(msg) {
+        const bar = document.getElementById('snackbar');
+        bar.innerText = msg;
+        bar.style.display = 'block';
+        setTimeout(() => bar.style.display = 'none', 3000);
+    }
+</script>
+
+</body>
+</html>
