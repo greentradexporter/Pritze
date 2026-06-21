@@ -5,7 +5,10 @@ import '../../state/app_state_scope.dart';
 import '../../state/app_state.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_bottom_nav.dart';
+import '../../widgets/account_actions.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/salon_logo.dart';
+import '../../widgets/service_icon.dart';
 import '../../widgets/trimtime_logo.dart';
 import 'salon_booking_screen.dart';
 import 'salon_detail_screen.dart';
@@ -19,108 +22,107 @@ class CustomerHomeScreen extends StatefulWidget {
 
 class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
   _ServiceCategory? _selectedCategory;
+  final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final bookableSalons = appState.bookableSalons;
     final openSalons = bookableSalons.where((salon) => salon.isOpen).length;
-    final availableSlots = bookableSalons.fold<int>(0, (sum, salon) {
-      return sum +
-          salon.services.fold<int>(0, (serviceSum, service) {
-            return serviceSum +
-                appState.slotsForService(salon.id, service.id).length;
-          });
-    });
+    final availableSlots = bookableSalons.fold<int>(
+      0,
+      (sum, salon) => sum + appState.availableSlotCountForSalon(salon.id),
+    );
     final visibleSalons = _rankedSalons(appState);
     final accent = _selectedCategory?.color ?? AppColors.primary;
 
     return Scaffold(
       bottomNavigationBar: const AppBottomNav(selectedIndex: 0),
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(18, 14, 18, 24),
-          children: [
-            _BrandHeader(openSalons: openSalons, accent: accent),
-            const SizedBox(height: 14),
-            _HomeCommand(
-              accent: accent,
-              openSalons: openSalons,
-              availableSlots: availableSlots,
-              selectedCategory: _selectedCategory,
-              searchQuery: _searchQuery,
-              onSearchChanged: (value) => setState(() => _searchQuery = value),
-              onClearSearch: _searchQuery.isEmpty
-                  ? null
-                  : () => setState(() => _searchQuery = ''),
-            ),
-            const SizedBox(height: 18),
-            SectionHeader(
-              title: 'Services',
-              actionLabel: _selectedCategory == null ? null : 'Clear',
-              onAction: _selectedCategory == null
-                  ? null
-                  : () => setState(() => _selectedCategory = null),
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              height: 64,
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                children: [
-                  _CategoryChip(
-                    category: _popularCategories[0],
-                    selected: _selectedCategory == _popularCategories[0],
-                    count: _popularCategories[0].salonCount(bookableSalons),
-                    onTap: () => _toggleCategory(_popularCategories[0]),
-                  ),
-                  _CategoryChip(
-                    category: _popularCategories[1],
-                    selected: _selectedCategory == _popularCategories[1],
-                    count: _popularCategories[1].salonCount(bookableSalons),
-                    onTap: () => _toggleCategory(_popularCategories[1]),
-                  ),
-                  _CategoryChip(
-                    category: _popularCategories[2],
-                    selected: _selectedCategory == _popularCategories[2],
-                    count: _popularCategories[2].salonCount(bookableSalons),
-                    onTap: () => _toggleCategory(_popularCategories[2]),
-                  ),
-                  _CategoryChip(
-                    category: _popularCategories[3],
-                    selected: _selectedCategory == _popularCategories[3],
-                    count: _popularCategories[3].salonCount(bookableSalons),
-                    onTap: () => _toggleCategory(_popularCategories[3]),
-                  ),
-                ],
+        child: RefreshIndicator(
+          onRefresh: appState.refresh,
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.fromLTRB(18, 14, 18, 24),
+            children: [
+              _BrandHeader(
+                openSalons: openSalons,
+                accent: accent,
+                canLogout: appState.hasActiveCustomerSession,
               ),
-            ),
-            const SizedBox(height: 18),
-            _ResultsHeader(
-              title: _searchQuery.isNotEmpty
-                  ? 'Search results'
-                  : (_selectedCategory == null
-                        ? 'Recommended'
-                        : '${_selectedCategory!.label} matches'),
-              subtitle: _selectedCategory == null
-                  ? 'Sorted by opening, slots, and rating.'
-                  : 'Filtered by service, then ranked by open status, next slot, and rating.',
-              accent: accent,
-            ),
-            const SizedBox(height: 10),
-            if (visibleSalons.isEmpty)
-              const EmptyState(
-                icon: Icons.search_off,
-                title: 'No matching services',
-                message: 'Try another service or check nearby salons later.',
-              )
-            else
-              for (final salon in visibleSalons) ...[
-                _SalonCard(salon: salon, selectedCategory: _selectedCategory),
-                const SizedBox(height: 14),
-              ],
-          ],
+              const SizedBox(height: 14),
+              _HomeCommand(
+                accent: accent,
+                openSalons: openSalons,
+                availableSlots: availableSlots,
+                selectedCategory: _selectedCategory,
+                searchController: _searchController,
+                onSearchChanged: (value) =>
+                    setState(() => _searchQuery = value),
+                onClearSearch: _searchQuery.isEmpty
+                    ? null
+                    : () => setState(() {
+                        _searchController.clear();
+                        _searchQuery = '';
+                      }),
+              ),
+              const SizedBox(height: 18),
+              SectionHeader(
+                title: 'Services',
+                actionLabel: _selectedCategory == null ? null : 'Clear',
+                onAction: _selectedCategory == null
+                    ? null
+                    : () => setState(() => _selectedCategory = null),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                height: 82,
+                child: ListView(
+                  scrollDirection: Axis.horizontal,
+                  children: [
+                    for (final category in _popularCategories)
+                      _CategoryChip(
+                        category: category,
+                        selected: _selectedCategory == category,
+                        count: category.salonCount(bookableSalons),
+                        onTap: () => _toggleCategory(category),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              _ResultsHeader(
+                title: _searchQuery.isNotEmpty
+                    ? 'Search results'
+                    : (_selectedCategory == null
+                          ? 'Recommended'
+                          : '${_selectedCategory!.label} matches'),
+                subtitle: _selectedCategory == null
+                    ? 'Sorted by opening, slots, and rating.'
+                    : 'Filtered by service, then ranked by open status, next slot, and rating.',
+                accent: accent,
+              ),
+              const SizedBox(height: 10),
+              if (visibleSalons.isEmpty)
+                const EmptyState(
+                  icon: Icons.search_off,
+                  title: 'No matching services',
+                  message: 'Try another service or check nearby salons later.',
+                )
+              else
+                for (final salon in visibleSalons) ...[
+                  _SalonCard(salon: salon, selectedCategory: _selectedCategory),
+                  const SizedBox(height: 14),
+                ],
+            ],
+          ),
         ),
       ),
     );
@@ -192,26 +194,23 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
     Salon salon,
     _ServiceCategory category,
   ) {
-    TimeSlot? earliest;
-    for (final service in salon.services.where(category.matches)) {
-      final slots = appState.slotsForService(salon.id, service.id);
-      if (slots.isEmpty) {
-        continue;
-      }
-      final firstSlot = slots.first;
-      if (earliest == null || firstSlot.start.isBefore(earliest.start)) {
-        earliest = firstSlot;
-      }
-    }
-    return earliest;
+    return appState.earliestSlotForServices(
+      salon.id,
+      salon.services.where(category.matches).map((service) => service.id),
+    );
   }
 }
 
 class _BrandHeader extends StatelessWidget {
   final int openSalons;
   final Color accent;
+  final bool canLogout;
 
-  const _BrandHeader({required this.openSalons, required this.accent});
+  const _BrandHeader({
+    required this.openSalons,
+    required this.accent,
+    required this.canLogout,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -239,7 +238,7 @@ class _BrandHeader extends StatelessWidget {
                   ),
                   const SizedBox(width: 4),
                   Text(
-                    'Nearby · $openSalons open now',
+                    'Skip the wait · $openSalons open now',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.w800,
                     ),
@@ -249,17 +248,7 @@ class _BrandHeader extends StatelessWidget {
             ],
           ),
         ),
-        IconButton(
-          onPressed: () {},
-          icon: Icon(Icons.notifications_none, color: accent),
-          tooltip: 'Notifications',
-          style: IconButton.styleFrom(
-            backgroundColor: accent.withAlpha(18),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14),
-            ),
-          ),
-        ),
+        AccountOverflowMenu(role: UserRole.customer, canLogout: canLogout),
       ],
     );
   }
@@ -270,7 +259,7 @@ class _HomeCommand extends StatelessWidget {
   final int openSalons;
   final int availableSlots;
   final _ServiceCategory? selectedCategory;
-  final String searchQuery;
+  final TextEditingController searchController;
   final ValueChanged<String> onSearchChanged;
   final VoidCallback? onClearSearch;
 
@@ -279,7 +268,7 @@ class _HomeCommand extends StatelessWidget {
     required this.openSalons,
     required this.availableSlots,
     required this.selectedCategory,
-    required this.searchQuery,
+    required this.searchController,
     required this.onSearchChanged,
     required this.onClearSearch,
   });
@@ -298,7 +287,7 @@ class _HomeCommand extends StatelessWidget {
         children: [
           Text(
             selectedCategory == null
-                ? 'Find your next cut without calling around'
+                ? 'Skip the wait. Book your cut.'
                 : '${selectedCategory!.label} sorted by availability',
             style: Theme.of(
               context,
@@ -307,7 +296,7 @@ class _HomeCommand extends StatelessWidget {
           const SizedBox(height: 8),
           Text(
             selectedCategory == null
-                ? 'Search, compare barbers, and hold a slot in a few taps.'
+                ? 'Search services, compare barbers, and lock a live slot in a few taps.'
                 : 'Open shops appear first, then earliest slots, then rating.',
             style: Theme.of(
               context,
@@ -316,7 +305,7 @@ class _HomeCommand extends StatelessWidget {
           const SizedBox(height: 14),
           _HeroSearch(
             accent: accent,
-            value: searchQuery,
+            controller: searchController,
             onChanged: onSearchChanged,
             onClear: onClearSearch,
           ),
@@ -354,13 +343,13 @@ class _HomeCommand extends StatelessWidget {
 
 class _HeroSearch extends StatelessWidget {
   final Color accent;
-  final String value;
+  final TextEditingController controller;
   final ValueChanged<String> onChanged;
   final VoidCallback? onClear;
 
   const _HeroSearch({
     required this.accent,
-    required this.value,
+    required this.controller,
     required this.onChanged,
     required this.onClear,
   });
@@ -368,8 +357,7 @@ class _HeroSearch extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return TextField(
-      controller: TextEditingController(text: value)
-        ..selection = TextSelection.collapsed(offset: value.length),
+      controller: controller,
       onChanged: onChanged,
       textInputAction: TextInputAction.search,
       decoration: InputDecoration(
@@ -377,8 +365,11 @@ class _HeroSearch extends StatelessWidget {
         prefixIcon: Icon(Icons.search, color: accent, size: 21),
         suffixIcon: IconButton(
           onPressed: onClear,
-          icon: Icon(value.isEmpty ? Icons.tune : Icons.close, color: accent),
-          tooltip: value.isEmpty ? 'Filters' : 'Clear search',
+          icon: Icon(
+            controller.text.isEmpty ? Icons.tune : Icons.close,
+            color: accent,
+          ),
+          tooltip: controller.text.isEmpty ? 'Filters' : 'Clear search',
         ),
         filled: true,
         fillColor: AppColors.canvas,
@@ -524,10 +515,10 @@ class _CategoryChip extends StatelessWidget {
             ),
             child: Row(
               children: [
-                SoftIconBox(
-                  icon: category.icon,
+                ServiceImageIcon(
+                  category: category.label,
                   color: category.color,
-                  size: 38,
+                  size: 42,
                 ),
                 const SizedBox(width: 10),
                 Expanded(
@@ -587,15 +578,14 @@ class _SalonCard extends StatelessWidget {
         .map((s) => s.name)
         .join(', ');
     final barbers = appState.barbersForSalon(salon.id);
-    final nextSlots = matchedServices.isEmpty
-        ? <TimeSlot>[]
-        : appState
-              .slotsForService(salon.id, matchedServices.first.id)
-              .take(2)
-              .toList();
-    final nextSlotLabel = nextSlots.isEmpty
+    final nextSlot = _earliestSlotForServices(
+      appState,
+      salon.id,
+      matchedServices,
+    );
+    final nextSlotLabel = nextSlot == null
         ? 'No slot'
-        : appState.formatTime(nextSlots.first.start);
+        : appState.formatTime(nextSlot.start);
 
     return GlassCard(
       onTap: () {
@@ -628,18 +618,10 @@ class _SalonCard extends StatelessWidget {
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Container(
-                          height: 44,
-                          width: 44,
-                          decoration: BoxDecoration(
-                            color: accent.withAlpha(18),
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Icon(
-                            Icons.content_cut,
-                            color: accent,
-                            size: 22,
-                          ),
+                        SalonLogo(
+                          logoUrl: salon.logoUrl,
+                          color: accent,
+                          size: 46,
                         ),
                         const SizedBox(width: 12),
                         Expanded(
@@ -690,7 +672,7 @@ class _SalonCard extends StatelessWidget {
                         _MetaChip(
                           icon: Icons.badge_outlined,
                           label: '${barbers.length} barbers',
-                          color: AppColors.blue,
+                          color: AppColors.primary,
                         ),
                         _MetaChip(
                           icon: Icons.near_me_outlined,
@@ -830,6 +812,7 @@ class _AvatarStack extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final visibleBarbers = barbers.take(3).toList();
+    final remaining = barbers.length - visibleBarbers.length;
     if (visibleBarbers.isEmpty) {
       return _MetaChip(
         icon: Icons.badge_outlined,
@@ -839,7 +822,8 @@ class _AvatarStack extends StatelessWidget {
     }
 
     return SizedBox(
-      width: 28.0 + ((visibleBarbers.length - 1) * 20),
+      width:
+          28.0 + ((visibleBarbers.length - 1) * 20) + (remaining > 0 ? 24 : 0),
       height: 28,
       child: Stack(
         clipBehavior: Clip.none,
@@ -860,10 +844,37 @@ class _AvatarStack extends StatelessWidget {
                 ),
               ),
             ),
+          if (remaining > 0)
+            Positioned(
+              left: visibleBarbers.length * 20,
+              child: CircleAvatar(
+                radius: 14,
+                backgroundColor: AppColors.champagne,
+                foregroundColor: color,
+                child: Text(
+                  '+$remaining',
+                  style: const TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
   }
+}
+
+TimeSlot? _earliestSlotForServices(
+  AppState appState,
+  String salonId,
+  Iterable<SalonService> services,
+) {
+  return appState.earliestSlotForServices(
+    salonId,
+    services.map((service) => service.id),
+  );
 }
 
 class _ServiceShortcut extends StatelessWidget {
@@ -906,18 +917,43 @@ class _ServiceCategory {
     final name = service.name.toLowerCase();
     switch (label) {
       case 'Haircut':
-        return category == 'hair' ||
+        return category.contains('hair') && !category.contains('color') ||
             name.contains('cut') ||
             name.contains('fade');
       case 'Beard':
-        return category == 'beard' || name.contains('shave');
-      case 'Spa':
-        return category == 'treatment' ||
-            category == 'skin' ||
-            name.contains('spa') ||
+        return category.contains('beard') ||
+            category.contains('shav') ||
+            name.contains('shave');
+      case 'Facial':
+        return category.contains('facial') ||
+            category.contains('cleanup') ||
+            category.contains('skin') ||
+            name.contains('facial') ||
             name.contains('cleanup');
+      case 'Spa':
+        return category.contains('spa') ||
+            category.contains('massage') ||
+            name.contains('spa') ||
+            name.contains('massage');
+      case 'Mani/Pedi':
+        return category.contains('mani') ||
+            category.contains('pedi') ||
+            category.contains('nail');
+      case 'Threading':
+        return category.contains('thread');
+      case 'Waxing':
+        return category.contains('wax');
       case 'Color':
-        return category == 'color' || name.contains('color');
+        return category.contains('color') ||
+            category.contains('colour') ||
+            name.contains('color') ||
+            name.contains('colour');
+      case 'Makeup':
+        return category.contains('makeup') ||
+            category.contains('bridal') ||
+            category.contains('groom package') ||
+            category.contains('combo') ||
+            name.contains('makeup');
       default:
         return false;
     }
@@ -937,12 +973,37 @@ const _popularCategories = [
   _ServiceCategory(
     icon: Icons.face_retouching_natural,
     label: 'Beard',
-    color: AppColors.coral,
+    color: AppColors.goldDeep,
   ),
-  _ServiceCategory(icon: Icons.spa, label: 'Spa', color: AppColors.plum),
+  _ServiceCategory(
+    icon: Icons.spa_outlined,
+    label: 'Facial',
+    color: AppColors.leaf,
+  ),
+  _ServiceCategory(icon: Icons.spa, label: 'Spa', color: AppColors.charcoal),
+  _ServiceCategory(
+    icon: Icons.back_hand_outlined,
+    label: 'Mani/Pedi',
+    color: AppColors.rose,
+  ),
+  _ServiceCategory(
+    icon: Icons.gesture,
+    label: 'Threading',
+    color: AppColors.gold,
+  ),
+  _ServiceCategory(
+    icon: Icons.waves_outlined,
+    label: 'Waxing',
+    color: AppColors.copper,
+  ),
   _ServiceCategory(
     icon: Icons.palette_outlined,
     label: 'Color',
-    color: AppColors.blue,
+    color: AppColors.copper,
+  ),
+  _ServiceCategory(
+    icon: Icons.auto_awesome,
+    label: 'Makeup',
+    color: AppColors.rose,
   ),
 ];

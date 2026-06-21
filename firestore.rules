@@ -10,11 +10,14 @@ service cloud.firestore {
       return signedIn() && request.auth.uid == userId;
     }
 
-    function barberClaimsOwnPhoneProfile() {
+    function barberClaimsOwnProfile() {
       return signedIn() &&
         resource.data.uid == null &&
         request.resource.data.uid == request.auth.uid &&
-        request.auth.token.phone_number == resource.data.phone &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid))
+          .data.contact == resource.data.phone ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid))
+          .data.email == resource.data.email) &&
         request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly(['uid', 'updatedAt']);
     }
@@ -37,10 +40,16 @@ service cloud.firestore {
       allow update: if signedIn() &&
         (resource.data.uid == request.auth.uid ||
          resource.data.ownerUid == request.auth.uid ||
-         barberClaimsOwnPhoneProfile());
+         barberClaimsOwnProfile());
       allow delete: if signedIn() &&
         (resource.data.uid == request.auth.uid ||
          resource.data.ownerUid == request.auth.uid);
+    }
+
+    match /slotLocks/{slotLockId} {
+      allow read: if true;
+      allow create, update: if signedIn();
+      allow delete: if false;
     }
 
     match /bookings/{bookingId} {

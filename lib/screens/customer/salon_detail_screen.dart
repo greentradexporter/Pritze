@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
+import '../../models/service_catalog.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/salon_logo.dart';
+import '../../widgets/service_icon.dart';
 import 'salon_booking_screen.dart';
 
 class SalonDetailScreen extends StatelessWidget {
@@ -294,10 +297,10 @@ class _DetailHero extends StatelessWidget {
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      SoftIconBox(
-                        icon: Icons.storefront_outlined,
+                      SalonLogo(
+                        logoUrl: salon.logoUrl,
                         color: accent,
-                        size: 44,
+                        size: 50,
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -350,7 +353,7 @@ class _DetailHero extends StatelessWidget {
                       AppPill(
                         icon: Icons.near_me_outlined,
                         label: salon.distanceLabel,
-                        color: AppColors.blue,
+                        color: AppColors.primary,
                       ),
                       AppPill(
                         icon: Icons.schedule,
@@ -386,7 +389,11 @@ class _ServiceTile extends StatelessWidget {
       onTap: onTap,
       child: Row(
         children: [
-          SoftIconBox(icon: _serviceIcon(service.category), color: _color),
+          ServiceImageIcon(
+            category: service.category,
+            color: serviceColorForCategory(service.category),
+            size: 50,
+          ),
           const SizedBox(width: 14),
           Expanded(
             child: Column(
@@ -427,34 +434,6 @@ class _ServiceTile extends StatelessWidget {
         ],
       ),
     );
-  }
-
-  Color get _color {
-    switch (service.category.toLowerCase()) {
-      case 'beard':
-        return AppColors.coral;
-      case 'treatment':
-      case 'skin':
-        return AppColors.plum;
-      case 'color':
-        return AppColors.blue;
-      default:
-        return AppColors.primary;
-    }
-  }
-
-  IconData _serviceIcon(String category) {
-    switch (category.toLowerCase()) {
-      case 'beard':
-        return Icons.face_retouching_natural;
-      case 'treatment':
-      case 'skin':
-        return Icons.spa;
-      case 'color':
-        return Icons.palette_outlined;
-      default:
-        return Icons.content_cut;
-    }
   }
 }
 

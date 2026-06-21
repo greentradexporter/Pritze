@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
+import '../../models/service_catalog.dart';
+import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/account_actions.dart';
 import '../../widgets/status_chip.dart';
 import 'salon_profile_setup_screen.dart';
 
@@ -34,6 +37,15 @@ class SalonDashboardScreen extends StatelessWidget {
                     builder: (_) => const SalonProfileSetupScreen(),
                   ),
                 );
+              },
+            ),
+            AccountOverflowMenu(
+              role: UserRole.owner,
+              canLogout: true,
+              onLoggedOut: () async {
+                if (context.mounted && Navigator.of(context).canPop()) {
+                  Navigator.of(context).pop();
+                }
               },
             ),
             const SizedBox(width: 8),
@@ -68,6 +80,12 @@ class _OwnerOverview extends StatelessWidget {
     final appState = AppStateScope.watch(context);
     final workCount = appState.barberWorkCount(salon.id);
     final serviceRevenue = appState.serviceRevenue(salon.id);
+    final revenueEntries =
+        serviceRevenue.entries.where((entry) => entry.value > 0).toList()
+          ..sort((a, b) => b.value.compareTo(a.value));
+    final pendingRequests = appState.pendingJoinRequests
+        .where((request) => request.salonId == salon.id)
+        .toList();
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(18, 14, 18, 28),
@@ -82,6 +100,15 @@ class _OwnerOverview extends StatelessWidget {
         if (!appState.isSalonBookable(salon.id)) ...[
           const SizedBox(height: 14),
           _OwnerSetupBanner(salon: salon),
+        ],
+        if (pendingRequests.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          SectionHeader(title: 'Barber requests (${pendingRequests.length})'),
+          const SizedBox(height: 10),
+          for (final request in pendingRequests) ...[
+            _JoinRequestCard(request: request),
+            const SizedBox(height: 10),
+          ],
         ],
         const SizedBox(height: 18),
         const SectionHeader(title: 'Chair board'),
@@ -114,7 +141,7 @@ class _OwnerOverview extends StatelessWidget {
               label: 'In progress',
               value:
                   '${appState.countByStatus(salon.id, BookingStatus.inProgress)}',
-              color: AppColors.blue,
+              color: AppColors.primary,
             ),
             _MetricCard(
               icon: Icons.done_all,
@@ -142,17 +169,22 @@ class _OwnerOverview extends StatelessWidget {
         const SizedBox(height: 18),
         const SectionHeader(title: 'Service revenue'),
         const SizedBox(height: 10),
-        GlassCard(
-          child: Column(
-            children: [
-              for (final service in salon.services)
-                _ProgressRow(
-                  label: service.name,
-                  value: '₹${serviceRevenue[service.id] ?? 0}',
-                ),
-            ],
+        if (revenueEntries.isEmpty)
+          const GlassCard(child: Text('Completed bookings will appear here.'))
+        else
+          GlassCard(
+            child: Column(
+              children: [
+                for (final entry in revenueEntries.take(8))
+                  _ProgressRow(
+                    label:
+                        appState.getService(salon.id, entry.key)?.name ??
+                        'Booked service',
+                    value: '₹${entry.value}',
+                  ),
+              ],
+            ),
           ),
-        ),
       ],
     );
   }
@@ -166,7 +198,10 @@ class _OwnerBookings extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final bookings = appState.bookingsForSalon(salonId);
+    final bookings = appState
+        .bookingsForSalon(salonId)
+        .where((booking) => booking.status != BookingStatus.cancelled)
+        .toList();
 
     if (bookings.isEmpty) {
       return const EmptyState(
@@ -344,7 +379,10 @@ class _OwnerBookingCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      service?.name ?? 'Service',
+                      service?.name ??
+                          (booking.serviceName.isEmpty
+                              ? 'Service'
+                              : booking.serviceName),
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ],
@@ -366,31 +404,36 @@ class _OwnerBookingCard extends StatelessWidget {
             spacing: 8,
             runSpacing: 8,
             children: [
-              _StatusButton(
-                label: 'Pending',
-                status: BookingStatus.pending,
-                booking: booking,
-              ),
-              _StatusButton(
-                label: 'Confirm',
-                status: BookingStatus.confirmed,
-                booking: booking,
-              ),
-              _StatusButton(
-                label: 'Start',
-                status: BookingStatus.inProgress,
-                booking: booking,
-              ),
-              _StatusButton(
-                label: 'Complete',
-                status: BookingStatus.completed,
-                booking: booking,
-              ),
-              _StatusButton(
-                label: 'Cancel',
-                status: BookingStatus.cancelled,
-                booking: booking,
-              ),
+              if (booking.status == BookingStatus.pending) ...[
+                _StatusButton(
+                  label: 'Confirm',
+                  status: BookingStatus.confirmed,
+                  booking: booking,
+                ),
+                _StatusButton(
+                  label: 'Cancel',
+                  status: BookingStatus.cancelled,
+                  booking: booking,
+                ),
+              ],
+              if (booking.status == BookingStatus.confirmed) ...[
+                _StatusButton(
+                  label: 'Start',
+                  status: BookingStatus.inProgress,
+                  booking: booking,
+                ),
+                _StatusButton(
+                  label: 'Cancel',
+                  status: BookingStatus.cancelled,
+                  booking: booking,
+                ),
+              ],
+              if (booking.status == BookingStatus.inProgress)
+                _StatusButton(
+                  label: 'Complete',
+                  status: BookingStatus.completed,
+                  booking: booking,
+                ),
             ],
           ),
         ],
@@ -403,7 +446,7 @@ class _OwnerBookingCard extends StatelessWidget {
       case BookingStatus.pending:
         return AppColors.amber;
       case BookingStatus.confirmed:
-        return AppColors.blue;
+        return AppColors.goldDeep;
       case BookingStatus.inProgress:
         return AppColors.primary;
       case BookingStatus.completed:
@@ -477,43 +520,131 @@ class _OwnerStaff extends StatelessWidget {
   }
 
   void _showAddBarberDialog(BuildContext context) {
-    final appState = AppStateScope.read(context);
-    final nameController = TextEditingController();
-    final phoneController = TextEditingController();
-    final experienceController = TextEditingController(text: '2');
-    final resumeController = TextEditingController();
-    final selectedServices = appState.ownerSalon.services
-        .map((service) => service.id)
-        .toSet();
-    var speciality = _barberSpecialities.first;
-    var isSaving = false;
-
-    showDialog<void>(
+    showModalBottomSheet<void>(
       context: context,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: const Text('Add barber'),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (context) => const _AddBarberSheet(),
+    );
+  }
+}
+
+class _AddBarberSheet extends StatefulWidget {
+  const _AddBarberSheet();
+
+  @override
+  State<_AddBarberSheet> createState() => _AddBarberSheetState();
+}
+
+class _AddBarberSheetState extends State<_AddBarberSheet> {
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _phoneController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _experienceController = TextEditingController(text: '2');
+  final _resumeController = TextEditingController();
+  final _serviceSearchController = TextEditingController();
+  final Set<String> _selectedServices = {};
+  String _speciality = _barberSpecialities.first;
+  String _serviceQuery = '';
+  bool _servicesExpanded = false;
+  bool _isSaving = false;
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _phoneController.dispose();
+    _emailController.dispose();
+    _experienceController.dispose();
+    _resumeController.dispose();
+    _serviceSearchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    final services = appState.ownerSalon.services;
+    final specialityServices = services
+        .where(
+          (service) => serviceMatchesBarberSpeciality(service, _speciality),
+        )
+        .toList();
+    final visibleServices = specialityServices.where((service) {
+      final query = _serviceQuery.trim().toLowerCase();
+      return query.isEmpty ||
+          service.name.toLowerCase().contains(query) ||
+          service.category.toLowerCase().contains(query);
+    }).toList();
+
+    return FractionallySizedBox(
+      heightFactor: 0.92,
+      child: Padding(
+        padding: EdgeInsets.only(
+          left: 18,
+          right: 18,
+          bottom: MediaQuery.viewInsetsOf(context).bottom + 12,
+        ),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            children: [
+              const SizedBox(height: 10),
+              Container(
+                width: 38,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.line,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Add barber',
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Close',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: ListView(
                   children: [
-                    TextField(
-                      controller: nameController,
+                    TextFormField(
+                      controller: _nameController,
                       decoration: const InputDecoration(labelText: 'Name'),
+                      validator: _phone,
                     ),
                     const SizedBox(height: 10),
-                    TextField(
-                      controller: phoneController,
+                    TextFormField(
+                      controller: _emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: const InputDecoration(
+                        labelText: 'Email address',
+                      ),
+                      validator: _email,
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      controller: _phoneController,
                       keyboardType: TextInputType.phone,
                       decoration: const InputDecoration(
                         labelText: 'Phone number',
                       ),
+                      validator: _required,
                     ),
                     const SizedBox(height: 10),
                     DropdownButtonFormField<String>(
-                      initialValue: speciality,
+                      initialValue: _speciality,
+                      isExpanded: true,
                       decoration: const InputDecoration(
                         labelText: 'Speciality',
                       ),
@@ -523,21 +654,33 @@ class _OwnerStaff extends StatelessWidget {
                       ],
                       onChanged: (value) {
                         if (value != null) {
-                          setDialogState(() => speciality = value);
+                          setState(() {
+                            _speciality = value;
+                            _selectedServices.removeWhere((serviceId) {
+                              final service = services
+                                  .where((item) => item.id == serviceId)
+                                  .firstOrNull;
+                              return service == null ||
+                                  !serviceMatchesBarberSpeciality(
+                                    service,
+                                    value,
+                                  );
+                            });
+                          });
                         }
                       },
                     ),
                     const SizedBox(height: 10),
-                    TextField(
-                      controller: experienceController,
+                    TextFormField(
+                      controller: _experienceController,
                       keyboardType: TextInputType.number,
                       decoration: const InputDecoration(
                         labelText: 'Years of experience',
                       ),
                     ),
                     const SizedBox(height: 10),
-                    TextField(
-                      controller: resumeController,
+                    TextFormField(
+                      controller: _resumeController,
                       minLines: 2,
                       maxLines: 3,
                       decoration: const InputDecoration(
@@ -545,86 +688,158 @@ class _OwnerStaff extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        for (final service in appState.ownerSalon.services)
-                          FilterChip(
-                            label: Text(service.name),
-                            selected: selectedServices.contains(service.id),
-                            onSelected: (selected) {
-                              setDialogState(() {
-                                if (selected) {
-                                  selectedServices.add(service.id);
-                                } else {
-                                  selectedServices.remove(service.id);
-                                }
-                              });
-                            },
+                    Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(color: AppColors.line),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Column(
+                        children: [
+                          ListTile(
+                            title: const Text('Assigned services'),
+                            subtitle: Text(
+                              '${_selectedServices.length} selected',
+                            ),
+                            trailing: Icon(
+                              _servicesExpanded
+                                  ? Icons.expand_less
+                                  : Icons.expand_more,
+                            ),
+                            onTap: () => setState(
+                              () => _servicesExpanded = !_servicesExpanded,
+                            ),
                           ),
-                      ],
+                          if (_servicesExpanded)
+                            Column(
+                              children: [
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    12,
+                                    8,
+                                    12,
+                                    4,
+                                  ),
+                                  child: TextField(
+                                    controller: _serviceSearchController,
+                                    onChanged: (value) =>
+                                        setState(() => _serviceQuery = value),
+                                    decoration: const InputDecoration(
+                                      labelText: 'Search services',
+                                      prefixIcon: Icon(Icons.search),
+                                    ),
+                                  ),
+                                ),
+                                ConstrainedBox(
+                                  constraints: const BoxConstraints(
+                                    maxHeight: 220,
+                                  ),
+                                  child: ListView.builder(
+                                    shrinkWrap: true,
+                                    itemCount: visibleServices.length,
+                                    itemBuilder: (context, index) {
+                                      final service = visibleServices[index];
+                                      return CheckboxListTile(
+                                        dense: true,
+                                        value: _selectedServices.contains(
+                                          service.id,
+                                        ),
+                                        title: Text(service.name),
+                                        subtitle: Text(service.category),
+                                        onChanged: (selected) {
+                                          setState(() {
+                                            if (selected == true) {
+                                              _selectedServices.add(service.id);
+                                            } else {
+                                              _selectedServices.remove(
+                                                service.id,
+                                              );
+                                            }
+                                          });
+                                        },
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ],
+                            ),
+                        ],
+                      ),
                     ),
+                    const SizedBox(height: 16),
                   ],
                 ),
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Cancel'),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: _isSaving ? null : () => _save(appState),
+                  icon: _isSaving
+                      ? const SizedBox(
+                          height: 18,
+                          width: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.person_add_alt),
+                  label: Text(_isSaving ? 'Adding...' : 'Add barber'),
                 ),
-                FilledButton(
-                  onPressed: isSaving
-                      ? null
-                      : () async {
-                          if (nameController.text.trim().isEmpty ||
-                              phoneController.text.trim().isEmpty) {
-                            return;
-                          }
-                          if (selectedServices.isEmpty) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Select at least one service.'),
-                              ),
-                            );
-                            return;
-                          }
-                          setDialogState(() => isSaving = true);
-                          try {
-                            await appState.addOwnerBarber(
-                              name: nameController.text,
-                              phone: phoneController.text,
-                              speciality: speciality,
-                              experienceYears:
-                                  int.tryParse(experienceController.text) ?? 1,
-                              resumeSummary: resumeController.text,
-                              serviceIds: selectedServices.toList(),
-                            );
-                            if (context.mounted) {
-                              Navigator.pop(context);
-                            }
-                          } catch (error) {
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text('Barber save failed: $error'),
-                                ),
-                              );
-                            }
-                          } finally {
-                            if (context.mounted) {
-                              setDialogState(() => isSaving = false);
-                            }
-                          }
-                        },
-                  child: Text(isSaving ? 'Saving...' : 'Add'),
-                ),
-              ],
-            );
-          },
-        );
-      },
+              ),
+            ],
+          ),
+        ),
+      ),
     );
+  }
+
+  String? _required(String? value) {
+    return value == null || value.trim().isEmpty ? 'Required' : null;
+  }
+
+  String? _phone(String? value) {
+    final digits = (value ?? '').replaceAll(RegExp(r'\D'), '');
+    final localDigits = digits.length == 12 && digits.startsWith('91')
+        ? digits.substring(2)
+        : digits;
+    return localDigits.length == 10 ? null : 'Enter a 10-digit phone number';
+  }
+
+  String? _email(String? value) {
+    return RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch((value ?? '').trim())
+        ? null
+        : 'Enter a valid email address';
+  }
+
+  Future<void> _save(AppState appState) async {
+    if (!_formKey.currentState!.validate()) {
+      return;
+    }
+    if (_selectedServices.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select at least one service.')),
+      );
+      return;
+    }
+    setState(() => _isSaving = true);
+    try {
+      await appState.addOwnerBarber(
+        name: _nameController.text,
+        phone: _phoneController.text,
+        email: _emailController.text,
+        speciality: _speciality,
+        experienceYears: int.tryParse(_experienceController.text) ?? 1,
+        resumeSummary: _resumeController.text,
+        serviceIds: _selectedServices.toList(),
+      );
+      if (mounted) {
+        Navigator.pop(context);
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Barber save failed: $error')));
+        setState(() => _isSaving = false);
+      }
+    }
   }
 }
 
@@ -648,10 +863,13 @@ class _JoinRequestCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final services = request.serviceIds
+    final serviceNames = request.serviceIds
         .map((id) => appState.getService(request.salonId, id)?.name)
         .whereType<String>()
-        .join(', ');
+        .toList();
+    final serviceSummary = serviceNames.isEmpty
+        ? 'General grooming'
+        : '${serviceNames.take(3).join(', ')}${serviceNames.length > 3 ? ' +${serviceNames.length - 3} more' : ''}';
 
     return GlassCard(
       child: Column(
@@ -685,11 +903,16 @@ class _JoinRequestCard extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           Text(
-            '${request.experienceYears} yrs exp - ${services.isEmpty ? 'General grooming' : services}',
+            '${request.experienceYears} yrs experience · $serviceSummary',
             style: const TextStyle(
               color: AppColors.ink,
               fontWeight: FontWeight.w700,
             ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '${request.barberPhone}${request.barberEmail.isEmpty ? '' : ' · ${request.barberEmail}'}',
+            style: Theme.of(context).textTheme.bodyMedium,
           ),
           const SizedBox(height: 6),
           Text(
@@ -729,7 +952,7 @@ class _JoinRequestCard extends StatelessWidget {
                     );
                   }
                 },
-                child: const Text('Approve'),
+                child: const Text('Accept barber'),
               ),
             ],
           ),
@@ -779,6 +1002,19 @@ class _StaffCard extends StatelessWidget {
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  barber.uid == null
+                      ? 'Login verification pending${barber.email.isEmpty ? '' : ' · ${barber.email}'}'
+                      : 'Account verified',
+                  style: TextStyle(
+                    color: barber.uid == null
+                        ? AppColors.amber
+                        : AppColors.success,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ],
             ),
@@ -842,19 +1078,17 @@ class _OwnerLoginGate extends StatefulWidget {
 
 class _OwnerLoginGateState extends State<_OwnerLoginGate> {
   final _nameController = TextEditingController();
-  final _phoneController = TextEditingController();
   final _emailController = TextEditingController();
-  final _otpController = TextEditingController();
-  bool _usePhone = true;
+  final _emailLinkController = TextEditingController();
+  bool _useEmail = true;
   bool _isSubmitting = false;
-  String? _verificationId;
+  bool _linkSent = false;
 
   @override
   void dispose() {
     _nameController.dispose();
-    _phoneController.dispose();
     _emailController.dispose();
-    _otpController.dispose();
+    _emailLinkController.dispose();
     super.dispose();
   }
 
@@ -880,21 +1114,21 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
                   segments: const [
                     ButtonSegment(
                       value: true,
-                      icon: Icon(Icons.phone_outlined),
-                      label: Text('Phone'),
+                      icon: Icon(Icons.alternate_email),
+                      label: Text('Email'),
                     ),
                     ButtonSegment(
                       value: false,
-                      icon: Icon(Icons.mail_outline),
+                      icon: Icon(Icons.account_circle_outlined),
                       label: Text('Google'),
                     ),
                   ],
-                  selected: {_usePhone},
+                  selected: {_useEmail},
                   onSelectionChanged: (selection) {
                     setState(() {
-                      _usePhone = selection.first;
-                      _verificationId = null;
-                      _otpController.clear();
+                      _useEmail = selection.first;
+                      _linkSent = false;
+                      _emailLinkController.clear();
                     });
                   },
                 ),
@@ -907,42 +1141,46 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                if (_usePhone)
+                if (_useEmail) ...[
                   TextField(
-                    controller: _phoneController,
-                    keyboardType: TextInputType.phone,
+                    controller: _emailController,
+                    keyboardType: TextInputType.emailAddress,
                     decoration: const InputDecoration(
-                      labelText: 'Business phone',
-                      prefixIcon: Icon(Icons.phone_outlined),
+                      labelText: 'Email address',
+                      prefixIcon: Icon(Icons.alternate_email),
                     ),
-                  )
-                else
+                  ),
+                  if (_linkSent) ...[
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _emailLinkController,
+                      keyboardType: TextInputType.url,
+                      decoration: const InputDecoration(
+                        labelText: 'Paste email sign-in link',
+                        prefixIcon: Icon(Icons.mark_email_read_outlined),
+                      ),
+                    ),
+                  ],
+                ] else
                   const _GoogleLoginNotice(
-                    title: 'Use the Google account on this device',
+                    title: 'Google shortcut',
                     message:
-                        'No email typing is needed here. Android will show the Google account picker.',
+                        'Use this only if you prefer Google. Email sign in works with Outlook, Yahoo, business email, and Gmail.',
                   ),
-                if (_usePhone &&
-                    AppStateScope.watch(context).usesRealPhoneOtp &&
-                    _verificationId != null) ...[
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _otpController,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(
-                      labelText: 'Enter received OTP',
-                      prefixIcon: Icon(Icons.password_outlined),
-                    ),
-                  ),
-                ],
                 const SizedBox(height: 16),
                 FilledButton.icon(
                   onPressed: _isSubmitting ? null : _login,
-                  icon: Icon(_usePhone ? Icons.phone : Icons.mail),
+                  icon: Icon(
+                    _useEmail
+                        ? Icons.mark_email_unread_outlined
+                        : Icons.account_circle_outlined,
+                  ),
                   label: Text(
-                    _usePhone && _verificationId == null
-                        ? 'Send OTP'
-                        : (_usePhone ? 'Verify owner' : 'Continue with Google'),
+                    _useEmail
+                        ? (_linkSent
+                              ? 'Sign in with email link'
+                              : 'Email me a sign-in link')
+                        : 'Continue with Google',
                   ),
                 ),
               ],
@@ -955,52 +1193,37 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
 
   Future<void> _login() async {
     final name = _nameController.text.trim();
-    final contact = _usePhone
-        ? _phoneController.text.trim()
-        : _emailController.text.trim();
-    if (name.isEmpty || (_usePhone && contact.isEmpty)) {
+    final email = _emailController.text.trim();
+    if (name.isEmpty || (_useEmail && email.isEmpty)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter owner name and login detail')),
+        const SnackBar(content: Text('Enter owner name and email address')),
       );
       return;
     }
     final appState = AppStateScope.read(context);
     setState(() => _isSubmitting = true);
     try {
-      if (_usePhone) {
-        if (appState.usesRealPhoneOtp && _verificationId == null) {
-          final verificationId = await appState.startCustomerPhoneVerification(
-            phone: contact,
-          );
+      if (_useEmail) {
+        if (!_linkSent) {
+          await appState.sendEmailSignInLink(email: email);
           if (!mounted) {
             return;
           }
-          if (verificationId == null) {
-            await appState.loginOwnerWithPhone(name: name, phone: contact);
-            if (!mounted) {
-              return;
-            }
-            Navigator.of(context).pushReplacement(
-              MaterialPageRoute(
-                builder: (_) => const SalonProfileSetupScreen(),
-              ),
-            );
-            return;
-          }
-          setState(() => _verificationId = verificationId);
+          setState(() => _linkSent = true);
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('OTP sent. Enter it to continue.')),
+            const SnackBar(
+              content: Text('Sign-in email sent. Paste the link to continue.'),
+            ),
           );
           return;
         }
-        await appState.loginOwnerWithPhone(
+        await appState.loginOwnerWithEmail(
           name: name,
-          phone: contact,
-          verificationId: _verificationId,
-          smsCode: _otpController.text,
+          email: email,
+          emailLink: _emailLinkController.text,
         );
       } else {
-        await appState.loginOwnerWithGmail(name: name, email: contact);
+        await appState.loginOwnerWithGmail(name: name, email: email);
       }
       if (!mounted) {
         return;

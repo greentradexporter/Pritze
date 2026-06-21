@@ -7,6 +7,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_models.dart';
+import '../models/service_catalog.dart';
 
 const _activeRolePreferenceKey = 'pritze.activeRole';
 
@@ -15,6 +16,9 @@ class AppState extends ChangeNotifier {
   final List<Barber> _barbers = [];
   final List<Booking> _bookings = [];
   final List<JoinRequest> _joinRequests = [];
+  final Set<String> _occupiedSlotKeys = {};
+  final Map<String, List<TimeSlot>> _slotCache = {};
+  DateTime? _slotCacheCreatedAt;
 
   int _bookingCounter = 100;
   int _serviceCounter = 30;
@@ -36,8 +40,6 @@ class AppState extends ChangeNotifier {
   }
 
   bool get usesFirebase => false;
-
-  bool get usesRealPhoneOtp => false;
 
   UserRole? get activeRole => _activeRole;
 
@@ -70,8 +72,6 @@ class AppState extends ChangeNotifier {
   bool get hasActiveBarberSession =>
       _activeRole == UserRole.barber && _barberAccount != null;
 
-  String? get activeCustomerPhone => _customerAccount?.contact;
-
   String? get activeCustomerContact => _customerAccount?.contact;
 
   String get ownerSalonId {
@@ -99,7 +99,10 @@ class AppState extends ChangeNotifier {
           .where(
             (barber) =>
                 barber.isActive &&
-                (barber.uid == account.id || barber.phone == account.contact),
+                (barber.uid == account.id ||
+                    barber.phone == account.contact ||
+                    barber.email.toLowerCase() ==
+                        account.contact.toLowerCase()),
           )
           .firstOrNull;
     }
@@ -117,7 +120,9 @@ class AppState extends ChangeNotifier {
               .where(
                 (request) =>
                     request.requesterUid == account.id ||
-                    request.barberPhone == account.contact,
+                    request.barberPhone == account.contact ||
+                    request.barberEmail.toLowerCase() ==
+                        account.contact.toLowerCase(),
               )
               .toList()
             ..sort((a, b) => b.requestedAt.compareTo(a.requestedAt));
@@ -138,8 +143,14 @@ class AppState extends ChangeNotifier {
     if (_activeRole != UserRole.customer || _customerAccount == null) {
       return [];
     }
+    final account = _customerAccount!;
     return _bookings
-        .where((booking) => booking.customerPhone == _customerAccount!.contact)
+        .where(
+          (booking) =>
+              booking.customerUid == account.id ||
+              (booking.customerUid == null &&
+                  booking.customerPhone == account.contact),
+        )
         .toList()
       ..sort((a, b) => b.start.compareTo(a.start));
   }
@@ -218,7 +229,9 @@ class AppState extends ChangeNotifier {
     String serviceId, {
     String? barberId,
   }) {
-    if (!isSalonBookable(salonId)) {
+    final salon = getSalon(salonId);
+    final service = getService(salonId, serviceId);
+    if (salon == null || service == null || !isSalonBookable(salonId)) {
       return [];
     }
     final eligibleBarbers = barbersForService(
@@ -226,18 +239,41 @@ class AppState extends ChangeNotifier {
       serviceId,
     ).where((barber) => barberId == null || barber.id == barberId).toList();
     final now = DateTime.now();
-    final hours = <int>[9, 10, 11, 12, 14, 15, 16, 17, 18];
+    _expireSlotCache(now);
+    final cacheKey = '$salonId|$serviceId|${barberId ?? '*'}';
+    final cached = _slotCache[cacheKey];
+    if (cached != null) {
+      return cached;
+    }
+    final openMinutes = _parseClockMinutes(salon.openTime) ?? 9 * 60;
+    final closeMinutes = _parseClockMinutes(salon.closeTime) ?? 20 * 60;
+    if (closeMinutes <= openMinutes) {
+      return [];
+    }
+    final durationMinutes = service.durationMinutes > 0
+        ? service.durationMinutes
+        : 30;
     final slots = <TimeSlot>[];
 
     for (var dayOffset = 0; dayOffset < 4; dayOffset++) {
       final day = DateTime(now.year, now.month, now.day + dayOffset);
-      for (final hour in hours) {
-        final start = DateTime(day.year, day.month, day.day, hour);
+      for (
+        var minuteOfDay = openMinutes;
+        minuteOfDay + durationMinutes <= closeMinutes;
+        minuteOfDay += 30
+      ) {
+        final start = DateTime(
+          day.year,
+          day.month,
+          day.day,
+          minuteOfDay ~/ 60,
+          minuteOfDay % 60,
+        );
         if (start.isBefore(now.add(const Duration(minutes: 45)))) {
           continue;
         }
         for (final barber in eligibleBarbers) {
-          if (_isBarberFree(barber.id, start)) {
+          if (_isBarberFree(barber.id, start, durationMinutes)) {
             slots.add(
               TimeSlot(
                 salonId: salonId,
@@ -252,11 +288,103 @@ class AppState extends ChangeNotifier {
     }
 
     slots.sort((a, b) => a.start.compareTo(b.start));
-    return slots.take(18).toList();
+    final visibleSlots = barberId == null
+        ? _deduplicateAnyBarberSlots(slots)
+        : slots;
+    final result = List<TimeSlot>.unmodifiable(visibleSlots.take(18));
+    _slotCache[cacheKey] = result;
+    _slotCacheCreatedAt ??= now;
+    return result;
+  }
+
+  int availableSlotCountForSalon(String salonId) {
+    final salon = getSalon(salonId);
+    if (salon == null || !isSalonBookable(salonId)) {
+      return 0;
+    }
+    final openMinutes = _parseClockMinutes(salon.openTime) ?? 9 * 60;
+    final closeMinutes = _parseClockMinutes(salon.closeTime) ?? 20 * 60;
+    if (closeMinutes <= openMinutes) {
+      return 0;
+    }
+    final now = DateTime.now();
+    var count = 0;
+    for (final barber in barbersForSalon(salonId)) {
+      final durations = barber.serviceIds
+          .map((serviceId) => getService(salonId, serviceId)?.durationMinutes)
+          .whereType<int>()
+          .where((duration) => duration > 0)
+          .toList();
+      if (durations.isEmpty) {
+        continue;
+      }
+      durations.sort();
+      final shortestDuration = durations.first;
+      for (var dayOffset = 0; dayOffset < 4; dayOffset++) {
+        final day = DateTime(now.year, now.month, now.day + dayOffset);
+        for (
+          var minuteOfDay = openMinutes;
+          minuteOfDay + shortestDuration <= closeMinutes;
+          minuteOfDay += 30
+        ) {
+          final start = DateTime(
+            day.year,
+            day.month,
+            day.day,
+            minuteOfDay ~/ 60,
+            minuteOfDay % 60,
+          );
+          if (start.isBefore(now.add(const Duration(minutes: 45)))) {
+            continue;
+          }
+          if (_isBarberFree(barber.id, start, shortestDuration)) {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  TimeSlot? earliestSlotForServices(
+    String salonId,
+    Iterable<String> serviceIds,
+  ) {
+    final requestedIds = serviceIds.toSet();
+    if (requestedIds.isEmpty) {
+      return null;
+    }
+    TimeSlot? earliest;
+    for (final barber in barbersForSalon(salonId)) {
+      final services =
+          barber.serviceIds
+              .where(requestedIds.contains)
+              .map((serviceId) => getService(salonId, serviceId))
+              .whereType<SalonService>()
+              .toList()
+            ..sort((a, b) => a.durationMinutes.compareTo(b.durationMinutes));
+      if (services.isEmpty) {
+        continue;
+      }
+      final service = services.first;
+      final slots = slotsForService(salonId, service.id, barberId: barber.id);
+      if (slots.isEmpty) {
+        continue;
+      }
+      final candidate = slots.first;
+      if (earliest == null || candidate.start.isBefore(earliest.start)) {
+        earliest = candidate;
+      }
+    }
+    return earliest;
   }
 
   Future<void> restoreSignedInUser() async {
     await _restoreActiveRole();
+  }
+
+  Future<void> refresh() async {
+    notifyListeners();
   }
 
   Future<void> selectRole(UserRole role) async {
@@ -305,39 +433,59 @@ class AppState extends ChangeNotifier {
     if (_activeRole != UserRole.customer || account == null) {
       throw StateError('Customer login is required before booking.');
     }
+    final service = getService(slot.salonId, slot.serviceId);
+    final barber = getBarber(slot.barberId);
+    if (service == null ||
+        barber == null ||
+        !barber.isActive ||
+        barber.salonId != slot.salonId ||
+        !barber.serviceIds.contains(slot.serviceId) ||
+        !_isWithinOperatingHours(slot, service.durationMinutes)) {
+      throw StateError('This appointment is no longer available.');
+    }
+    if (!_isSlotAvailable(slot, service.durationMinutes)) {
+      throw StateError(
+        'This slot was just booked. Please choose another time.',
+      );
+    }
     final booking = Booking(
       id: 'booking-${_bookingCounter++}',
+      customerUid: _customerAccount?.id,
       salonId: slot.salonId,
       serviceId: slot.serviceId,
       barberId: slot.barberId,
       customerName: account.name,
       customerPhone: account.contact,
       start: slot.start,
+      durationMinutes: service.durationMinutes,
+      serviceName: service.name,
+      servicePrice: service.price,
       status: BookingStatus.pending,
       createdAt: DateTime.now(),
     );
     _bookings.add(booking);
+    _setSlotOccupancy(
+      barberId: slot.barberId,
+      start: slot.start,
+      durationMinutes: service.durationMinutes,
+      occupied: true,
+    );
     notifyListeners();
     return booking;
   }
 
-  Future<String?> startCustomerPhoneVerification({
-    required String phone,
-  }) async {
-    return null;
-  }
+  Future<void> sendEmailSignInLink({required String email}) async {}
 
-  Future<UserAccount> loginCustomerWithPhone({
+  Future<UserAccount> loginCustomerWithEmail({
     required String name,
-    required String phone,
-    String? verificationId,
-    String? smsCode,
+    required String email,
+    String? emailLink,
   }) async {
     final account = UserAccount(
       id: 'customer-${_accountCounter++}',
       name: name.trim(),
-      contact: normalizePhone(phone),
-      provider: LoginProvider.phone,
+      contact: email.trim(),
+      provider: LoginProvider.email,
     );
     _activateRole(UserRole.customer, account);
     return account;
@@ -351,25 +499,9 @@ class AppState extends ChangeNotifier {
       id: 'customer-${_accountCounter++}',
       name: name.trim(),
       contact: email.trim(),
-      provider: LoginProvider.gmail,
+      provider: LoginProvider.google,
     );
     _activateRole(UserRole.customer, account);
-    return account;
-  }
-
-  Future<UserAccount> loginOwnerWithPhone({
-    required String name,
-    required String phone,
-    String? verificationId,
-    String? smsCode,
-  }) async {
-    final account = UserAccount(
-      id: 'owner-${_accountCounter++}',
-      name: name.trim(),
-      contact: normalizePhone(phone),
-      provider: LoginProvider.phone,
-    );
-    _activateRole(UserRole.owner, account);
     return account;
   }
 
@@ -381,37 +513,57 @@ class AppState extends ChangeNotifier {
       id: 'owner-${_accountCounter++}',
       name: name.trim(),
       contact: email.trim(),
-      provider: LoginProvider.gmail,
+      provider: LoginProvider.google,
     );
     _activateRole(UserRole.owner, account);
     return account;
   }
 
-  Future<UserAccount> loginBarberWithPhone({
+  Future<UserAccount> loginOwnerWithEmail({
     required String name,
-    required String phone,
-    String? verificationId,
-    String? smsCode,
+    required String email,
+    String? emailLink,
   }) async {
     final account = UserAccount(
-      id: 'barber-account-${_accountCounter++}',
+      id: 'owner-${_accountCounter++}',
       name: name.trim(),
-      contact: normalizePhone(phone),
-      provider: LoginProvider.phone,
+      contact: email.trim(),
+      provider: LoginProvider.email,
     );
-    _activateRole(UserRole.barber, account);
+    _activateRole(UserRole.owner, account);
     return account;
   }
 
   Future<UserAccount> loginBarberWithGmail({
     required String name,
     required String email,
+    String? phone,
   }) async {
     final account = UserAccount(
       id: 'barber-account-${_accountCounter++}',
       name: name.trim(),
-      contact: email.trim(),
-      provider: LoginProvider.gmail,
+      contact: phone == null || phone.trim().isEmpty
+          ? email.trim()
+          : normalizePhone(phone),
+      provider: LoginProvider.google,
+    );
+    _activateRole(UserRole.barber, account);
+    return account;
+  }
+
+  Future<UserAccount> loginBarberWithEmail({
+    required String name,
+    required String email,
+    String? phone,
+    String? emailLink,
+  }) async {
+    final account = UserAccount(
+      id: 'barber-account-${_accountCounter++}',
+      name: name.trim(),
+      contact: phone == null || phone.trim().isEmpty
+          ? email.trim()
+          : normalizePhone(phone),
+      provider: LoginProvider.email,
     );
     _activateRole(UserRole.barber, account);
     return account;
@@ -423,9 +575,35 @@ class AppState extends ChangeNotifier {
   ) async {
     final index = _bookings.indexWhere((booking) => booking.id == bookingId);
     if (index == -1) {
+      throw StateError('Booking not found.');
+    }
+    final previous = _bookings[index];
+    if (previous.status == status) {
       return;
     }
-    _bookings[index] = _bookings[index].copyWith(status: status);
+    if (previous.status == BookingStatus.cancelled ||
+        previous.status == BookingStatus.completed) {
+      throw StateError(
+        'A ${previous.status.label.toLowerCase()} booking cannot be changed.',
+      );
+    }
+    _bookings[index] = previous.copyWith(status: status);
+    final booking = _bookings[index];
+    if (status == BookingStatus.cancelled) {
+      _setSlotOccupancy(
+        barberId: booking.barberId,
+        start: booking.start,
+        durationMinutes: booking.durationMinutes,
+        occupied: false,
+      );
+    } else {
+      _setSlotOccupancy(
+        barberId: booking.barberId,
+        start: booking.start,
+        durationMinutes: booking.durationMinutes,
+        occupied: true,
+      );
+    }
     notifyListeners();
   }
 
@@ -434,14 +612,24 @@ class AppState extends ChangeNotifier {
     required String ownerName,
     required String address,
     required String phone,
+    String? logoUrl,
     required String openTime,
     required String closeTime,
   }) async {
+    final openingMinutes = _parseClockMinutes(openTime);
+    final closingMinutes = _parseClockMinutes(closeTime);
+    if (openingMinutes == null || closingMinutes == null) {
+      throw FormatException('Use a valid time such as 9:00 AM or 18:30.');
+    }
+    if (closingMinutes <= openingMinutes) {
+      throw ArgumentError('Closing time must be after opening time.');
+    }
     final salon = ownerSalon.copyWith(
       name: name.trim(),
       ownerName: ownerName.trim(),
       address: address.trim(),
       phone: normalizePhone(phone),
+      logoUrl: logoUrl?.trim(),
       openTime: openTime.trim(),
       closeTime: closeTime.trim(),
     );
@@ -456,6 +644,12 @@ class AppState extends ChangeNotifier {
     required int price,
     required int durationMinutes,
   }) async {
+    if (name.trim().isEmpty) {
+      throw ArgumentError('Service name is required.');
+    }
+    if (price <= 0 || durationMinutes <= 0) {
+      throw ArgumentError('Price and duration must be greater than zero.');
+    }
     final salon = ownerSalon;
     final service = SalonService(
       id: 'service-${_serviceCounter++}',
@@ -466,6 +660,47 @@ class AppState extends ChangeNotifier {
     );
     _replaceSalon(salon.copyWith(services: [...salon.services, service]));
     notifyListeners();
+  }
+
+  Future<int> addOwnerServicesFromCatalog({
+    Iterable<String>? categories,
+  }) async {
+    final salon = ownerSalon;
+    final selectedCategories = categories
+        ?.map((category) => category.trim().toLowerCase())
+        .where((category) => category.isNotEmpty)
+        .toSet();
+    final existingNames = salon.services
+        .map((service) => service.name.trim().toLowerCase())
+        .toSet();
+    final servicesToAdd = <SalonService>[];
+    for (final template in serviceCatalog) {
+      if (selectedCategories != null &&
+          selectedCategories.isNotEmpty &&
+          !selectedCategories.contains(template.category.toLowerCase())) {
+        continue;
+      }
+      if (existingNames.contains(template.name.trim().toLowerCase())) {
+        continue;
+      }
+      servicesToAdd.add(
+        SalonService(
+          id: 'service-${_serviceCounter++}',
+          name: template.name,
+          category: template.category,
+          price: template.price,
+          durationMinutes: template.durationMinutes,
+        ),
+      );
+    }
+    if (servicesToAdd.isEmpty) {
+      return 0;
+    }
+    _replaceSalon(
+      salon.copyWith(services: [...salon.services, ...servicesToAdd]),
+    );
+    notifyListeners();
+    return servicesToAdd.length;
   }
 
   Future<void> removeOwnerService(String serviceId) async {
@@ -487,25 +722,52 @@ class AppState extends ChangeNotifier {
   Future<void> addOwnerBarber({
     required String name,
     required String phone,
+    String email = '',
     required String speciality,
     required int experienceYears,
     required String resumeSummary,
     required List<String> serviceIds,
   }) async {
-    _barbers.add(
-      Barber(
-        id: 'barber-${_barberCounter++}',
+    final normalizedPhone = normalizePhone(phone);
+    final normalizedEmail = email.trim().toLowerCase();
+    if (_barbers.any(
+      (barber) =>
+          barber.isActive &&
+          (barber.phone == normalizedPhone ||
+              (normalizedEmail.isNotEmpty && barber.email == normalizedEmail)),
+    )) {
+      throw StateError('A barber with this phone or email already exists.');
+    }
+    final assignedServiceIds = serviceIds.isEmpty
+        ? ownerSalon.services.map((service) => service.id).toList()
+        : serviceIds;
+    final barber = Barber(
+      id: _newEntityId('barber', _barberCounter++),
+      salonId: ownerSalonId,
+      name: name.trim(),
+      phone: normalizedPhone,
+      email: normalizedEmail,
+      speciality: speciality.trim().isEmpty ? 'Grooming expert' : speciality,
+      experienceYears: experienceYears,
+      resumeSummary: resumeSummary.trim().isEmpty
+          ? 'Customer-first grooming professional.'
+          : resumeSummary.trim(),
+      serviceIds: assignedServiceIds,
+    );
+    _barbers.add(barber);
+    _joinRequests.add(
+      JoinRequest(
+        id: _newEntityId('request', _requestCounter++),
         salonId: ownerSalonId,
-        name: name.trim(),
-        phone: normalizePhone(phone),
-        speciality: speciality.trim().isEmpty ? 'Grooming expert' : speciality,
-        experienceYears: experienceYears,
-        resumeSummary: resumeSummary.trim().isEmpty
-            ? 'Customer-first grooming professional.'
-            : resumeSummary.trim(),
-        serviceIds: serviceIds.isEmpty
-            ? ownerSalon.services.map((service) => service.id).toList()
-            : serviceIds,
+        barberName: barber.name,
+        barberPhone: normalizedPhone,
+        barberEmail: normalizedEmail,
+        speciality: barber.speciality,
+        experienceYears: barber.experienceYears,
+        resumeSummary: barber.resumeSummary,
+        serviceIds: assignedServiceIds,
+        status: JoinRequestStatus.approved,
+        requestedAt: DateTime.now(),
       ),
     );
     notifyListeners();
@@ -515,17 +777,19 @@ class AppState extends ChangeNotifier {
     required String salonId,
     required String barberName,
     required String barberPhone,
+    String barberEmail = '',
     required String speciality,
     required int experienceYears,
     required String resumeSummary,
     required List<String> serviceIds,
   }) async {
     final request = JoinRequest(
-      id: 'request-${_requestCounter++}',
+      id: _newEntityId('request', _requestCounter++),
       requesterUid: _barberAccount?.id,
       salonId: salonId,
       barberName: barberName.trim(),
       barberPhone: normalizePhone(barberPhone),
+      barberEmail: barberEmail.trim().toLowerCase(),
       speciality: speciality.trim().isEmpty ? 'Grooming expert' : speciality,
       experienceYears: experienceYears,
       resumeSummary: resumeSummary.trim().isEmpty
@@ -550,11 +814,12 @@ class AppState extends ChangeNotifier {
     }
     final request = _joinRequests[index];
     final barber = Barber(
-      id: 'barber-${_barberCounter++}',
+      id: _newEntityId('barber', _barberCounter++),
       uid: request.requesterUid,
       salonId: request.salonId,
       name: request.barberName,
       phone: request.barberPhone,
+      email: request.barberEmail,
       speciality: request.speciality,
       experienceYears: request.experienceYears,
       resumeSummary: request.resumeSummary,
@@ -604,8 +869,7 @@ class AppState extends ChangeNotifier {
               booking.status == BookingStatus.completed,
         )
         .fold(0, (total, booking) {
-          return total +
-              (getService(booking.salonId, booking.serviceId)?.price ?? 0);
+          return total + _bookingPrice(booking);
         });
   }
 
@@ -639,9 +903,7 @@ class AppState extends ChangeNotifier {
     final now = DateTime.now();
     final activeStatuses = {BookingStatus.confirmed, BookingStatus.inProgress};
     final candidates = bookingsForBarber(barberId).where((booking) {
-      final service = getService(booking.salonId, booking.serviceId);
-      final duration = service?.durationMinutes ?? 30;
-      final end = booking.start.add(Duration(minutes: duration));
+      final end = booking.start.add(Duration(minutes: booking.durationMinutes));
       return activeStatuses.contains(booking.status) &&
           now.isAfter(booking.start) &&
           now.isBefore(end);
@@ -674,15 +936,16 @@ class AppState extends ChangeNotifier {
   Map<String, int> serviceRevenue(String salonId) {
     final result = <String, int>{};
     for (final booking in bookingsForSalon(salonId)) {
-      if (!_isToday(booking.start) ||
-          booking.status != BookingStatus.completed) {
+      if (booking.status != BookingStatus.completed) {
         continue;
       }
       final service = getService(salonId, booking.serviceId);
-      if (service == null) {
+      final price = _bookingPrice(booking);
+      if (price <= 0) {
         continue;
       }
-      result[service.id] = (result[service.id] ?? 0) + service.price;
+      final serviceId = service?.id ?? booking.serviceId;
+      result[serviceId] = (result[serviceId] ?? 0) + price;
     }
     return result;
   }
@@ -789,6 +1052,21 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _expireSlotCache(DateTime now) {
+    final createdAt = _slotCacheCreatedAt;
+    if (createdAt != null && now.difference(createdAt).inSeconds >= 30) {
+      _slotCache.clear();
+      _slotCacheCreatedAt = null;
+    }
+  }
+
+  @override
+  void notifyListeners() {
+    _slotCache.clear();
+    _slotCacheCreatedAt = null;
+    super.notifyListeners();
+  }
+
   void _setSyncError(Object error) {
     _lastSyncError =
         'Could not save to Firebase. Check your internet connection and try again.';
@@ -798,17 +1076,82 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool _isBarberFree(String barberId, DateTime start) {
+  String _newEntityId(String prefix, int counter) {
+    return '$prefix-${DateTime.now().microsecondsSinceEpoch}-$counter';
+  }
+
+  bool _isBarberFree(String barberId, DateTime start, int durationMinutes) {
+    final candidateEnd = start.add(Duration(minutes: durationMinutes));
+    if (_slotSegmentStarts(start, durationMinutes).any(
+      (segment) => _occupiedSlotKeys.contains(_slotKey(barberId, segment)),
+    )) {
+      return false;
+    }
     return !_bookings.any((booking) {
       if (booking.barberId != barberId ||
           booking.status == BookingStatus.cancelled) {
         return false;
       }
-      return booking.start.year == start.year &&
-          booking.start.month == start.month &&
-          booking.start.day == start.day &&
-          booking.start.hour == start.hour;
+      final bookingEnd = booking.start.add(
+        Duration(minutes: booking.durationMinutes),
+      );
+      return booking.start.isBefore(candidateEnd) && start.isBefore(bookingEnd);
     });
+  }
+
+  bool _isSlotAvailable(TimeSlot slot, int durationMinutes) {
+    return _isBarberFree(slot.barberId, slot.start, durationMinutes);
+  }
+
+  bool _isWithinOperatingHours(TimeSlot slot, int durationMinutes) {
+    final salon = getSalon(slot.salonId);
+    if (salon == null) {
+      return false;
+    }
+    final openMinutes = _parseClockMinutes(salon.openTime);
+    final closeMinutes = _parseClockMinutes(salon.closeTime);
+    if (openMinutes == null || closeMinutes == null) {
+      return false;
+    }
+    final startMinutes = slot.start.hour * 60 + slot.start.minute;
+    return startMinutes >= openMinutes &&
+        startMinutes + durationMinutes <= closeMinutes;
+  }
+
+  void _setSlotOccupancy({
+    required String barberId,
+    required DateTime start,
+    required int durationMinutes,
+    required bool occupied,
+  }) {
+    for (final segment in _slotSegmentStarts(start, durationMinutes)) {
+      final key = _slotKey(barberId, segment);
+      if (occupied) {
+        _occupiedSlotKeys.add(key);
+      } else {
+        _occupiedSlotKeys.remove(key);
+      }
+    }
+  }
+
+  List<TimeSlot> _deduplicateAnyBarberSlots(List<TimeSlot> slots) {
+    final grouped = <DateTime, List<TimeSlot>>{};
+    for (final slot in slots) {
+      grouped.putIfAbsent(slot.start, () => []).add(slot);
+    }
+    return [
+      for (final entry in grouped.entries)
+        entry.value[(entry.key.millisecondsSinceEpoch ~/
+                const Duration(minutes: 30).inMilliseconds) %
+            entry.value.length],
+    ]..sort((a, b) => a.start.compareTo(b.start));
+  }
+
+  int _bookingPrice(Booking booking) {
+    if (booking.servicePrice > 0) {
+      return booking.servicePrice;
+    }
+    return getService(booking.salonId, booking.serviceId)?.price ?? 0;
   }
 
   bool _isToday(DateTime date) {
@@ -835,6 +1178,7 @@ class AppState extends ChangeNotifier {
       ownerName: owner?.name ?? '',
       address: '',
       phone: owner?.contact ?? '',
+      logoUrl: '',
       distanceLabel: 'Nearby',
       rating: 0,
       reviewCount: 0,
@@ -849,7 +1193,6 @@ class AppState extends ChangeNotifier {
 class FirebaseAppState extends AppState {
   final FirebaseFirestore firestore;
   final FirebaseAuth auth;
-  PhoneAuthCredential? _pendingPhoneCredential;
   bool _googleInitialized = false;
   final List<StreamSubscription<Object?>> _subscriptions = [];
   final List<StreamSubscription<Object?>> _privateSubscriptions = [];
@@ -865,14 +1208,85 @@ class FirebaseAppState extends AppState {
   bool get usesFirebase => true;
 
   @override
-  bool get usesRealPhoneOtp => true;
-
-  @override
   Future<void> restoreSignedInUser() async {
     await super.restoreSignedInUser();
     final user = auth.currentUser;
     if (user != null) {
       await _restoreAccountForUser(user);
+    }
+  }
+
+  @override
+  Future<void> refresh() async {
+    try {
+      final salonsSnapshot = await firestore
+          .collection('salons')
+          .get(const GetOptions(source: Source.server));
+      final barbersSnapshot = await firestore
+          .collection('barbers')
+          .get(const GetOptions(source: Source.server));
+      final locksSnapshot = await firestore
+          .collection('slotLocks')
+          .where('active', isEqualTo: true)
+          .get(const GetOptions(source: Source.server));
+      _salons
+        ..clear()
+        ..addAll(salonsSnapshot.docs.map(_salonFromFirestore));
+      _barbers
+        ..clear()
+        ..addAll(barbersSnapshot.docs.map(_barberFromFirestore));
+      _occupiedSlotKeys
+        ..clear()
+        ..addAll(locksSnapshot.docs.map(_slotKeyFromLock));
+
+      final user = auth.currentUser;
+      if (user != null) {
+        for (final query in <(String, String)>[
+          ('customer', 'customerUid'),
+          ('owner', 'ownerUid'),
+          ('barber', 'barberUid'),
+        ]) {
+          final snapshot = await firestore
+              .collection('bookings')
+              .where(query.$2, isEqualTo: user.uid)
+              .get(const GetOptions(source: Source.server));
+          _bookingSnapshots[query.$1] = {
+            for (final doc in snapshot.docs) doc.id: _bookingFromFirestore(doc),
+          };
+        }
+        final mergedBookings = <String, Booking>{};
+        for (final items in _bookingSnapshots.values) {
+          mergedBookings.addAll(items);
+        }
+        _bookings
+          ..clear()
+          ..addAll(mergedBookings.values);
+
+        for (final query in <(String, String)>[
+          ('requester', 'requesterUid'),
+          ('owner', 'ownerUid'),
+        ]) {
+          final snapshot = await firestore
+              .collection('joinRequests')
+              .where(query.$2, isEqualTo: user.uid)
+              .get(const GetOptions(source: Source.server));
+          _joinRequestSnapshots[query.$1] = {
+            for (final doc in snapshot.docs)
+              doc.id: _joinRequestFromFirestore(doc),
+          };
+        }
+        final mergedRequests = <String, JoinRequest>{};
+        for (final items in _joinRequestSnapshots.values) {
+          mergedRequests.addAll(items);
+        }
+        _joinRequests
+          ..clear()
+          ..addAll(mergedRequests.values);
+      }
+      notifyListeners();
+    } catch (error) {
+      _setSyncError(error);
+      rethrow;
     }
   }
 
@@ -909,71 +1323,135 @@ class FirebaseAppState extends AppState {
   @override
   Future<Booking> createBooking({required TimeSlot slot}) async {
     return _runFirebaseSave(() async {
-      final booking = await super.createBooking(slot: slot);
-      await _setBooking(booking);
+      final account = _customerAccount;
+      if (_activeRole != UserRole.customer || account == null) {
+        throw StateError('Customer login is required before booking.');
+      }
+      final customerUid = auth.currentUser?.uid;
+      if (customerUid == null || customerUid != account.id) {
+        throw StateError('Please sign in again before booking this slot.');
+      }
+      final service = getService(slot.salonId, slot.serviceId);
+      final selectedBarber = getBarber(slot.barberId);
+      if (service == null ||
+          selectedBarber == null ||
+          !selectedBarber.isActive ||
+          selectedBarber.salonId != slot.salonId ||
+          !selectedBarber.serviceIds.contains(slot.serviceId) ||
+          !_isWithinOperatingHours(slot, service.durationMinutes)) {
+        throw StateError('This appointment is no longer available.');
+      }
+      final bookingDoc = firestore.collection('bookings').doc();
+      final lockStarts = _slotSegmentStarts(
+        slot.start,
+        service.durationMinutes,
+      );
+      final lockDocs = [
+        for (final start in lockStarts)
+          firestore
+              .collection('slotLocks')
+              .doc(_slotLockId(slot.barberId, start)),
+      ];
+      final salon = await firestore
+          .collection('salons')
+          .doc(slot.salonId)
+          .get();
+      final barber = await firestore
+          .collection('barbers')
+          .doc(slot.barberId)
+          .get();
+      if (!salon.exists || !barber.exists) {
+        throw StateError('This appointment is no longer available.');
+      }
+      final booking = Booking(
+        id: bookingDoc.id,
+        customerUid: customerUid,
+        salonId: slot.salonId,
+        serviceId: slot.serviceId,
+        barberId: slot.barberId,
+        customerName: account.name,
+        customerPhone: account.contact,
+        start: slot.start,
+        durationMinutes: service.durationMinutes,
+        serviceName: service.name,
+        servicePrice: service.price,
+        status: BookingStatus.pending,
+        createdAt: DateTime.now(),
+      );
+      await firestore.runTransaction((transaction) async {
+        final lockSnapshots = <DocumentSnapshot<Map<String, dynamic>>>[];
+        for (final lockDoc in lockDocs) {
+          lockSnapshots.add(await transaction.get(lockDoc));
+        }
+        if (lockSnapshots.any(
+          (snapshot) => snapshot.exists && snapshot.data()?['active'] != false,
+        )) {
+          throw StateError(
+            'This slot was just booked. Please choose another time.',
+          );
+        }
+        transaction.set(
+          bookingDoc,
+          _bookingToFirestore(
+            booking,
+            customerUid: customerUid,
+            ownerUid: salon.data()?['ownerUid'] as String?,
+            barberUid: barber.data()?['uid'] as String?,
+          ),
+        );
+        for (var index = 0; index < lockDocs.length; index++) {
+          transaction.set(lockDocs[index], {
+            'bookingId': booking.id,
+            'salonId': booking.salonId,
+            'serviceId': booking.serviceId,
+            'barberId': booking.barberId,
+            'start': Timestamp.fromDate(lockStarts[index]),
+            'bookingStart': Timestamp.fromDate(booking.start),
+            'active': true,
+            'createdAt': Timestamp.fromDate(booking.createdAt),
+            'updatedAt': FieldValue.serverTimestamp(),
+          });
+        }
+      });
+      if (!_bookings.any((item) => item.id == booking.id)) {
+        _bookings.add(booking);
+      }
+      _setSlotOccupancy(
+        barberId: slot.barberId,
+        start: slot.start,
+        durationMinutes: service.durationMinutes,
+        occupied: true,
+      );
+      notifyListeners();
       return booking;
     });
   }
 
   @override
-  Future<String?> startCustomerPhoneVerification({
-    required String phone,
-  }) async {
-    final completer = Completer<String?>();
-    await auth.verifyPhoneNumber(
-      phoneNumber: normalizePhone(phone),
-      verificationCompleted: (credential) {
-        _pendingPhoneCredential = credential;
-        if (!completer.isCompleted) {
-          completer.complete(null);
-        }
-      },
-      verificationFailed: (error) {
-        if (!completer.isCompleted) {
-          completer.completeError(error);
-        }
-      },
-      codeSent: (verificationId, forceResendingToken) {
-        if (!completer.isCompleted) {
-          completer.complete(verificationId);
-        }
-      },
-      codeAutoRetrievalTimeout: (verificationId) {
-        if (!completer.isCompleted) {
-          completer.complete(verificationId);
-        }
-      },
+  Future<void> sendEmailSignInLink({required String email}) {
+    return auth.sendSignInLinkToEmail(
+      email: email.trim(),
+      actionCodeSettings: ActionCodeSettings(
+        url: 'https://trimtime-46539.firebaseapp.com/email-login',
+        handleCodeInApp: true,
+        androidPackageName: 'com.trimtime.app',
+        androidInstallApp: true,
+      ),
     );
-    return completer.future;
   }
 
   @override
-  Future<UserAccount> loginCustomerWithPhone({
+  Future<UserAccount> loginCustomerWithEmail({
     required String name,
-    required String phone,
-    String? verificationId,
-    String? smsCode,
+    required String email,
+    String? emailLink,
   }) async {
-    final credential =
-        _pendingPhoneCredential ??
-        (verificationId == null || smsCode == null || smsCode.trim().isEmpty
-            ? null
-            : PhoneAuthProvider.credential(
-                verificationId: verificationId,
-                smsCode: smsCode.trim(),
-              ));
-    if (credential == null) {
-      throw StateError('OTP verification is required for phone login.');
-    }
-    final result = await auth.signInWithCredential(credential);
-    final account = UserAccount(
-      id: result.user?.uid ?? normalizePhone(phone),
-      name: name.trim(),
-      contact: normalizePhone(phone),
-      provider: LoginProvider.phone,
+    final account = await _signInWithEmailLink(
+      fallbackName: name,
+      email: email,
+      emailLink: emailLink,
     );
     _activateRole(UserRole.customer, account);
-    _pendingPhoneCredential = null;
     await _upsertUser(account, role: UserRole.customer);
     return account;
   }
@@ -993,37 +1471,6 @@ class FirebaseAppState extends AppState {
   }
 
   @override
-  Future<UserAccount> loginOwnerWithPhone({
-    required String name,
-    required String phone,
-    String? verificationId,
-    String? smsCode,
-  }) async {
-    final credential =
-        _pendingPhoneCredential ??
-        (verificationId == null || smsCode == null || smsCode.trim().isEmpty
-            ? null
-            : PhoneAuthProvider.credential(
-                verificationId: verificationId,
-                smsCode: smsCode.trim(),
-              ));
-    if (credential == null) {
-      throw StateError('OTP verification is required for phone login.');
-    }
-    final result = await auth.signInWithCredential(credential);
-    final account = UserAccount(
-      id: result.user?.uid ?? normalizePhone(phone),
-      name: name.trim(),
-      contact: normalizePhone(phone),
-      provider: LoginProvider.phone,
-    );
-    _activateRole(UserRole.owner, account);
-    _pendingPhoneCredential = null;
-    await _upsertUser(account, role: UserRole.owner);
-    return account;
-  }
-
-  @override
   Future<UserAccount> loginOwnerWithGmail({
     required String name,
     required String email,
@@ -1038,34 +1485,18 @@ class FirebaseAppState extends AppState {
   }
 
   @override
-  Future<UserAccount> loginBarberWithPhone({
+  Future<UserAccount> loginOwnerWithEmail({
     required String name,
-    required String phone,
-    String? verificationId,
-    String? smsCode,
+    required String email,
+    String? emailLink,
   }) async {
-    final credential =
-        _pendingPhoneCredential ??
-        (verificationId == null || smsCode == null || smsCode.trim().isEmpty
-            ? null
-            : PhoneAuthProvider.credential(
-                verificationId: verificationId,
-                smsCode: smsCode.trim(),
-              ));
-    if (credential == null) {
-      throw StateError('OTP verification is required for phone login.');
-    }
-    final result = await auth.signInWithCredential(credential);
-    final account = UserAccount(
-      id: result.user?.uid ?? normalizePhone(phone),
-      name: name.trim(),
-      contact: normalizePhone(phone),
-      provider: LoginProvider.phone,
+    final account = await _signInWithEmailLink(
+      fallbackName: name,
+      email: email,
+      emailLink: emailLink,
     );
-    _activateRole(UserRole.barber, account);
-    _pendingPhoneCredential = null;
-    await _upsertUser(account, role: UserRole.barber);
-    await _linkCurrentBarberAccount(account);
+    _activateRole(UserRole.owner, account);
+    await _upsertUser(account, role: UserRole.owner);
     return account;
   }
 
@@ -1073,11 +1504,36 @@ class FirebaseAppState extends AppState {
   Future<UserAccount> loginBarberWithGmail({
     required String name,
     required String email,
+    String? phone,
   }) async {
-    final account = await _signInWithGoogle(
+    var account = await _signInWithGoogle(
       fallbackName: name,
       fallbackEmail: email,
     );
+    if (phone != null && phone.trim().isNotEmpty) {
+      account = account.copyWith(contact: normalizePhone(phone));
+    }
+    _activateRole(UserRole.barber, account);
+    await _upsertUser(account, role: UserRole.barber);
+    await _linkCurrentBarberAccount(account);
+    return account;
+  }
+
+  @override
+  Future<UserAccount> loginBarberWithEmail({
+    required String name,
+    required String email,
+    String? phone,
+    String? emailLink,
+  }) async {
+    var account = await _signInWithEmailLink(
+      fallbackName: name,
+      email: email,
+      emailLink: emailLink,
+    );
+    if (phone != null && phone.trim().isNotEmpty) {
+      account = account.copyWith(contact: normalizePhone(phone));
+    }
     _activateRole(UserRole.barber, account);
     await _upsertUser(account, role: UserRole.barber);
     await _linkCurrentBarberAccount(account);
@@ -1090,11 +1546,58 @@ class FirebaseAppState extends AppState {
     BookingStatus status,
   ) async {
     await _runFirebaseSave(() async {
+      final booking = _bookings
+          .where((item) => item.id == bookingId)
+          .firstOrNull;
+      if (booking == null) {
+        throw StateError('Booking not found.');
+      }
+      if (booking.status == status) {
+        return;
+      }
+      if (booking.status == BookingStatus.cancelled ||
+          booking.status == BookingStatus.completed) {
+        throw StateError(
+          'A ${booking.status.label.toLowerCase()} booking cannot be changed.',
+        );
+      }
+
+      final bookingDoc = firestore.collection('bookings').doc(bookingId);
+      if (status == BookingStatus.cancelled) {
+        final lockDocs = [
+          for (final start in _slotSegmentStarts(
+            booking.start,
+            booking.durationMinutes,
+          ))
+            firestore
+                .collection('slotLocks')
+                .doc(_slotLockId(booking.barberId, start)),
+        ];
+        await firestore.runTransaction((transaction) async {
+          final lockSnapshots = <DocumentSnapshot<Map<String, dynamic>>>[];
+          for (final lockDoc in lockDocs) {
+            lockSnapshots.add(await transaction.get(lockDoc));
+          }
+          transaction.set(bookingDoc, {
+            'status': _bookingStatusName(status),
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+          for (var index = 0; index < lockDocs.length; index++) {
+            if (lockSnapshots[index].data()?['bookingId'] == booking.id) {
+              transaction.set(lockDocs[index], {
+                'active': false,
+                'updatedAt': FieldValue.serverTimestamp(),
+              }, SetOptions(merge: true));
+            }
+          }
+        });
+      } else {
+        await bookingDoc.set({
+          'status': _bookingStatusName(status),
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
       await super.updateBookingStatus(bookingId, status);
-      await firestore.collection('bookings').doc(bookingId).set({
-        'status': _bookingStatusName(status),
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
     });
   }
 
@@ -1104,6 +1607,7 @@ class FirebaseAppState extends AppState {
     required String ownerName,
     required String address,
     required String phone,
+    String? logoUrl,
     required String openTime,
     required String closeTime,
   }) async {
@@ -1113,6 +1617,7 @@ class FirebaseAppState extends AppState {
         ownerName: ownerName,
         address: address,
         phone: phone,
+        logoUrl: logoUrl,
         openTime: openTime,
         closeTime: closeTime,
       );
@@ -1139,6 +1644,21 @@ class FirebaseAppState extends AppState {
   }
 
   @override
+  Future<int> addOwnerServicesFromCatalog({
+    Iterable<String>? categories,
+  }) async {
+    return _runFirebaseSave(() async {
+      final added = await super.addOwnerServicesFromCatalog(
+        categories: categories,
+      );
+      if (added > 0) {
+        await _setSalon(ownerSalon);
+      }
+      return added;
+    });
+  }
+
+  @override
   Future<void> removeOwnerService(String serviceId) async {
     await _runFirebaseSave(() async {
       await super.removeOwnerService(serviceId);
@@ -1153,6 +1673,7 @@ class FirebaseAppState extends AppState {
   Future<void> addOwnerBarber({
     required String name,
     required String phone,
+    String email = '',
     required String speciality,
     required int experienceYears,
     required String resumeSummary,
@@ -1163,6 +1684,7 @@ class FirebaseAppState extends AppState {
       await super.addOwnerBarber(
         name: name,
         phone: phone,
+        email: email,
         speciality: speciality,
         experienceYears: experienceYears,
         resumeSummary: resumeSummary,
@@ -1170,6 +1692,12 @@ class FirebaseAppState extends AppState {
       );
       if (_barbers.length > before) {
         await _setBarber(_barbers.last);
+      }
+      final request = _joinRequests.lastOrNull;
+      if (request != null &&
+          request.status == JoinRequestStatus.approved &&
+          request.barberPhone == normalizePhone(phone)) {
+        await _setJoinRequest(request);
       }
     });
   }
@@ -1179,6 +1707,7 @@ class FirebaseAppState extends AppState {
     required String salonId,
     required String barberName,
     required String barberPhone,
+    String barberEmail = '',
     required String speciality,
     required int experienceYears,
     required String resumeSummary,
@@ -1190,6 +1719,7 @@ class FirebaseAppState extends AppState {
         salonId: salonId,
         barberName: barberName,
         barberPhone: barberPhone,
+        barberEmail: barberEmail,
         speciality: speciality,
         experienceYears: experienceYears,
         resumeSummary: resumeSummary,
@@ -1260,6 +1790,18 @@ class FirebaseAppState extends AppState {
           ..addAll(snapshot.docs.map(_barberFromFirestore));
         notifyListeners();
       }),
+    );
+    _subscriptions.add(
+      firestore
+          .collection('slotLocks')
+          .where('active', isEqualTo: true)
+          .snapshots()
+          .listen((snapshot) {
+            _occupiedSlotKeys
+              ..clear()
+              ..addAll(snapshot.docs.map(_slotKeyFromLock));
+            notifyListeners();
+          }),
     );
     _subscriptions.add(
       auth.authStateChanges().listen((user) {
@@ -1397,10 +1939,13 @@ class FirebaseAppState extends AppState {
 
   LoginProvider _providerFromData(Object? value, User user) {
     final provider = (value as String?)?.toLowerCase();
+    if (provider == 'email') {
+      return LoginProvider.email;
+    }
     if (provider == 'phone' || user.phoneNumber != null) {
       return LoginProvider.phone;
     }
-    return LoginProvider.gmail;
+    return LoginProvider.google;
   }
 
   Future<T> _runFirebaseSave<T>(Future<T> Function() operation) async {
@@ -1417,10 +1962,13 @@ class FirebaseAppState extends AppState {
   }
 
   Future<void> _linkCurrentBarberAccount(UserAccount account) async {
+    final signedInEmail = auth.currentUser?.email?.trim().toLowerCase();
     final index = _barbers.indexWhere(
       (barber) =>
           barber.isActive &&
-          (barber.uid == account.id || barber.phone == account.contact),
+          (barber.uid == account.id ||
+              barber.phone == account.contact ||
+              (signedInEmail != null && barber.email == signedInEmail)),
     );
     if (index == -1) {
       return;
@@ -1477,7 +2025,35 @@ class FirebaseAppState extends AppState {
                 ? googleAccount.displayName!.trim()
                 : fallbackName.trim()),
       contact: user?.email ?? googleAccount.email,
-      provider: LoginProvider.gmail,
+      provider: LoginProvider.google,
+    );
+  }
+
+  Future<UserAccount> _signInWithEmailLink({
+    required String fallbackName,
+    required String email,
+    String? emailLink,
+  }) async {
+    final trimmedEmail = email.trim();
+    final trimmedLink = emailLink?.trim() ?? '';
+    if (trimmedLink.isEmpty) {
+      throw StateError('Paste the sign-in link sent to your email.');
+    }
+    if (!auth.isSignInWithEmailLink(trimmedLink)) {
+      throw StateError('This email sign-in link is not valid.');
+    }
+    final result = await auth.signInWithEmailLink(
+      email: trimmedEmail,
+      emailLink: trimmedLink,
+    );
+    final user = result.user;
+    return UserAccount(
+      id: user?.uid ?? trimmedEmail,
+      name: user?.displayName?.trim().isNotEmpty == true
+          ? user!.displayName!.trim()
+          : fallbackName.trim(),
+      contact: user?.email ?? trimmedEmail,
+      provider: LoginProvider.email,
     );
   }
 
@@ -1485,6 +2061,7 @@ class FirebaseAppState extends AppState {
     return firestore.collection('users').doc(account.id).set({
       'name': account.name,
       'contact': account.contact,
+      'email': auth.currentUser?.email?.trim().toLowerCase(),
       'provider': account.provider.label.toLowerCase(),
       'roles': FieldValue.arrayUnion([role.name]),
       'activeRole': role.name,
@@ -1508,28 +2085,6 @@ class FirebaseAppState extends AppState {
       data['ownerUid'] = uid;
     }
     return firestore.collection('barbers').doc(barber.id).set(data);
-  }
-
-  Future<void> _setBooking(Booking booking) async {
-    final salon = await firestore
-        .collection('salons')
-        .doc(booking.salonId)
-        .get();
-    final barber = await firestore
-        .collection('barbers')
-        .doc(booking.barberId)
-        .get();
-    await firestore
-        .collection('bookings')
-        .doc(booking.id)
-        .set(
-          _bookingToFirestore(
-            booking,
-            customerUid: auth.currentUser?.uid,
-            ownerUid: salon.data()?['ownerUid'] as String?,
-            barberUid: barber.data()?['uid'] as String?,
-          ),
-        );
   }
 
   Future<void> _setJoinRequest(JoinRequest request) async {
@@ -1556,6 +2111,7 @@ Map<String, Object?> _salonToMap(Salon salon) {
     'ownerName': salon.ownerName,
     'address': salon.address,
     'phone': salon.phone,
+    'logoUrl': salon.logoUrl,
     'distanceLabel': salon.distanceLabel,
     'rating': salon.rating,
     'reviewCount': salon.reviewCount,
@@ -1583,6 +2139,7 @@ Map<String, Object?> _barberToMap(Barber barber) {
     'salonId': barber.salonId,
     'name': barber.name,
     'phone': barber.phone,
+    'email': barber.email,
     'speciality': barber.speciality,
     'experienceYears': barber.experienceYears,
     'resumeSummary': barber.resumeSummary,
@@ -1608,6 +2165,9 @@ Map<String, Object?> _bookingToFirestore(
     'customerName': booking.customerName,
     'customerPhone': booking.customerPhone,
     'start': Timestamp.fromDate(booking.start),
+    'durationMinutes': booking.durationMinutes,
+    'serviceName': booking.serviceName,
+    'servicePrice': booking.servicePrice,
     'status': _bookingStatusName(booking.status),
     'createdAt': Timestamp.fromDate(booking.createdAt),
     'updatedAt': FieldValue.serverTimestamp(),
@@ -1625,6 +2185,7 @@ Map<String, Object?> _joinRequestToFirestore(
     'ownerUid': ownerUid,
     'barberName': request.barberName,
     'barberPhone': request.barberPhone,
+    'barberEmail': request.barberEmail,
     'speciality': request.speciality,
     'experienceYears': request.experienceYears,
     'resumeSummary': request.resumeSummary,
@@ -1646,6 +2207,7 @@ Salon _salonFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
     ownerName: _string(data['ownerName'], 'Owner'),
     address: _string(data['address'], 'Address pending verification'),
     phone: _string(data['phone'], ''),
+    logoUrl: _string(data['logoUrl'], ''),
     distanceLabel: _string(data['distanceLabel'], 'Nearby'),
     rating: _double(data['rating'], 4.5),
     reviewCount: _int(data['reviewCount'], 0),
@@ -1674,6 +2236,7 @@ Barber _barberFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
     salonId: _string(data['salonId'], ''),
     name: _string(data['name'], 'Barber'),
     phone: _string(data['phone'], ''),
+    email: _string(data['email'], ''),
     speciality: _string(data['speciality'], 'Grooming expert'),
     experienceYears: _int(data['experienceYears'], 1),
     resumeSummary: _string(
@@ -1689,12 +2252,16 @@ Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
   final data = doc.data() ?? {};
   return Booking(
     id: doc.id,
+    customerUid: data['customerUid'] as String?,
     salonId: _string(data['salonId'], ''),
     serviceId: _string(data['serviceId'], ''),
     barberId: _string(data['barberId'], ''),
     customerName: _string(data['customerName'], 'Customer'),
     customerPhone: _string(data['customerPhone'], ''),
     start: _date(data['start']),
+    durationMinutes: _int(data['durationMinutes'], 30),
+    serviceName: _string(data['serviceName'], ''),
+    servicePrice: _int(data['servicePrice'], 0),
     status: _bookingStatusFromName(_string(data['status'], 'pending')),
     createdAt: _date(data['createdAt']),
   );
@@ -1710,6 +2277,7 @@ JoinRequest _joinRequestFromFirestore(
     salonId: _string(data['salonId'], ''),
     barberName: _string(data['barberName'], 'Barber'),
     barberPhone: _string(data['barberPhone'], ''),
+    barberEmail: _string(data['barberEmail'], ''),
     speciality: _string(data['speciality'], 'Grooming expert'),
     experienceYears: _int(data['experienceYears'], 1),
     resumeSummary: _string(
@@ -1722,8 +2290,29 @@ JoinRequest _joinRequestFromFirestore(
   );
 }
 
+String _slotKeyFromLock(DocumentSnapshot<Map<String, dynamic>> doc) {
+  final data = doc.data() ?? {};
+  return _slotKey(_string(data['barberId'], ''), _date(data['start']));
+}
+
 String _bookingStatusName(BookingStatus status) {
   return status.name;
+}
+
+String _slotKey(String barberId, DateTime start) {
+  return '$barberId-${start.toIso8601String()}';
+}
+
+String _slotLockId(String barberId, DateTime start) {
+  return '${barberId}_${start.millisecondsSinceEpoch}';
+}
+
+List<DateTime> _slotSegmentStarts(DateTime start, int durationMinutes) {
+  final safeDuration = durationMinutes > 0 ? durationMinutes : 30;
+  return [
+    for (var offset = 0; offset < safeDuration; offset += 5)
+      start.add(Duration(minutes: offset)),
+  ];
 }
 
 BookingStatus _bookingStatusFromName(String value) {
@@ -1782,4 +2371,33 @@ List<String> _stringList(Object? value) {
   return (value as List<dynamic>? ?? []).whereType<String>().toList(
     growable: false,
   );
+}
+
+int? _parseClockMinutes(String value) {
+  final normalized = value.trim().toUpperCase().replaceAll('.', '');
+  final match = RegExp(
+    r'^(\d{1,2})(?::(\d{2}))?\s*([AP]M)?$',
+  ).firstMatch(normalized);
+  if (match == null) {
+    return null;
+  }
+  var hour = int.tryParse(match.group(1) ?? '');
+  final minute = int.tryParse(match.group(2) ?? '0');
+  final period = match.group(3);
+  if (hour == null || minute == null || minute > 59) {
+    return null;
+  }
+  if (period != null) {
+    if (hour < 1 || hour > 12) {
+      return null;
+    }
+    if (period == 'AM') {
+      hour = hour == 12 ? 0 : hour;
+    } else if (hour != 12) {
+      hour += 12;
+    }
+  } else if (hour > 23) {
+    return null;
+  }
+  return hour * 60 + minute;
 }

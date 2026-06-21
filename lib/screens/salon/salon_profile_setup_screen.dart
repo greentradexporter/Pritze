@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
+import '../../models/service_catalog.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/salon_logo.dart';
+import '../../widgets/service_icon.dart';
 
 class SalonProfileSetupScreen extends StatefulWidget {
   const SalonProfileSetupScreen({super.key});
@@ -21,6 +24,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
   final _phoneController = TextEditingController();
   final _openTimeController = TextEditingController();
   final _closeTimeController = TextEditingController();
+  String _logoUrl = '';
   bool _loaded = false;
   bool _isSaving = false;
 
@@ -35,6 +39,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _ownerNameController.text = salon.ownerName;
     _addressController.text = salon.address;
     _phoneController.text = salon.phone;
+    _logoUrl = salon.logoUrl;
     _openTimeController.text = salon.openTime;
     _closeTimeController.text = salon.closeTime;
     _loaded = true;
@@ -117,6 +122,31 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   const SizedBox(height: 12),
                   Row(
                     children: [
+                      SalonLogo(logoUrl: _logoUrl, size: 58),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Shop logo',
+                              style: Theme.of(context).textTheme.titleMedium,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _logoUrl.isEmpty
+                                  ? 'Default shop mark shown to customers.'
+                                  : 'Bundled logo shown to customers.',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
                       Expanded(
                         child: TextFormField(
                           controller: _openTimeController,
@@ -124,7 +154,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                             labelText: 'Opening',
                             prefixIcon: Icon(Icons.schedule),
                           ),
-                          validator: _required,
+                          validator: _time,
                         ),
                       ),
                       const SizedBox(width: 10),
@@ -135,7 +165,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                             labelText: 'Closing',
                             prefixIcon: Icon(Icons.schedule),
                           ),
-                          validator: _required,
+                          validator: _time,
                         ),
                       ),
                     ],
@@ -154,8 +184,38 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
             const SizedBox(height: 24),
             SectionHeader(
               title: 'Service menu',
-              actionLabel: 'Add',
+              actionLabel: 'Add custom',
               onAction: () => _showAddServiceDialog(context),
+            ),
+            const SizedBox(height: 10),
+            GlassCard(
+              color: AppColors.champagne.withAlpha(70),
+              child: Row(
+                children: [
+                  const ServiceImageIcon(category: 'Haircut', size: 48),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Choose and import only the service categories offered by this shop.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: AppColors.ink,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  FilledButton(
+                    onPressed: _isSaving
+                        ? null
+                        : () => _showServiceImportSheet(context),
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size(0, 48),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                    ),
+                    child: const Text('Import'),
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 10),
             for (final service in salon.services) ...[
@@ -168,9 +228,138 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     );
   }
 
+  Future<void> _addMasterServices(
+    BuildContext context,
+    Set<String> categories,
+  ) async {
+    setState(() => _isSaving = true);
+    try {
+      final added = await AppStateScope.read(
+        context,
+      ).addOwnerServicesFromCatalog(categories: categories);
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            added == 0
+                ? 'Master service menu is already added'
+                : 'Added $added services from the Pritze master menu',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Import failed: $error')));
+    } finally {
+      if (mounted) {
+        setState(() => _isSaving = false);
+      }
+    }
+  }
+
+  Future<void> _showServiceImportSheet(BuildContext context) async {
+    final selected = <String>{};
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return FractionallySizedBox(
+              heightFactor: 0.82,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Import service categories',
+                      style: Theme.of(context).textTheme.headlineSmall,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Choose only the service types this shop actually offers.',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: ListView(
+                        children: [
+                          for (final category in serviceCategoryLabels)
+                            CheckboxListTile(
+                              value: selected.contains(category),
+                              title: Text(category),
+                              controlAffinity: ListTileControlAffinity.leading,
+                              onChanged: (checked) {
+                                setSheetState(() {
+                                  if (checked == true) {
+                                    selected.add(category);
+                                  } else {
+                                    selected.remove(category);
+                                  }
+                                });
+                              },
+                            ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: selected.isEmpty
+                            ? null
+                            : () => Navigator.pop(sheetContext, true),
+                        icon: const Icon(Icons.download_done),
+                        label: Text('Import ${selected.length} categories'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    if (confirmed == true && context.mounted) {
+      await _addMasterServices(context, selected);
+    }
+  }
+
   String? _required(String? value) {
     if (value == null || value.trim().isEmpty) {
       return 'Required';
+    }
+    return null;
+  }
+
+  String? _time(String? value) {
+    final requiredError = _required(value);
+    if (requiredError != null) {
+      return requiredError;
+    }
+    final normalized = value!.trim().toUpperCase().replaceAll('.', '');
+    final match = RegExp(
+      r'^(\d{1,2})(?::(\d{2}))?\s*([AP]M)?$',
+    ).firstMatch(normalized);
+    if (match == null) {
+      return 'Use 9:00 AM or 18:30';
+    }
+    final hour = int.tryParse(match.group(1) ?? '');
+    final minute = int.tryParse(match.group(2) ?? '0');
+    final period = match.group(3);
+    if (hour == null ||
+        minute == null ||
+        minute > 59 ||
+        (period == null ? hour > 23 : hour < 1 || hour > 12)) {
+      return 'Enter a valid time';
     }
     return null;
   }
@@ -186,6 +375,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         ownerName: _ownerNameController.text,
         address: _addressController.text,
         phone: _phoneController.text,
+        logoUrl: _logoUrl,
         openTime: _openTimeController.text,
         closeTime: _closeTimeController.text,
       );
@@ -215,14 +405,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     final durationController = TextEditingController(text: '30');
     var category = 'Hair';
     var isSaving = false;
-    const categories = [
-      'Hair',
-      'Beard',
-      'Treatment',
-      'Skin',
-      'Color',
-      'Grooming',
-    ];
+    const categories = serviceCategoryLabels;
 
     showDialog<void>(
       context: context,
@@ -287,7 +470,15 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                           final duration =
                               int.tryParse(durationController.text) ?? 30;
                           if (nameController.text.trim().isEmpty ||
-                              price <= 0) {
+                              price <= 0 ||
+                              duration <= 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'Enter a service name, price, and duration greater than zero.',
+                                ),
+                              ),
+                            );
                             return;
                           }
                           setDialogState(() => isSaving = true);
@@ -336,9 +527,9 @@ class _ServiceCard extends StatelessWidget {
     return GlassCard(
       child: Row(
         children: [
-          SoftIconBox(
-            icon: Icons.spa_outlined,
-            color: AppColors.primary,
+          ServiceImageIcon(
+            category: service.category,
+            color: serviceColorForCategory(service.category),
             size: 46,
           ),
           const SizedBox(width: 12),

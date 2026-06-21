@@ -47,14 +47,16 @@ extension UserRoleLabel on UserRole {
   }
 }
 
-enum LoginProvider { phone, gmail }
+enum LoginProvider { email, google, phone }
 
 extension LoginProviderLabel on LoginProvider {
   String get label {
     switch (this) {
+      case LoginProvider.email:
+        return 'Email';
       case LoginProvider.phone:
         return 'Phone';
-      case LoginProvider.gmail:
+      case LoginProvider.google:
         return 'Google';
     }
   }
@@ -72,6 +74,20 @@ class UserAccount {
     required this.contact,
     required this.provider,
   });
+
+  UserAccount copyWith({
+    String? id,
+    String? name,
+    String? contact,
+    LoginProvider? provider,
+  }) {
+    return UserAccount(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      contact: contact ?? this.contact,
+      provider: provider ?? this.provider,
+    );
+  }
 }
 
 class SalonService {
@@ -112,6 +128,7 @@ class Salon {
   final String ownerName;
   final String address;
   final String phone;
+  final String logoUrl;
   final String distanceLabel;
   final double rating;
   final int reviewCount;
@@ -126,6 +143,7 @@ class Salon {
     required this.ownerName,
     required this.address,
     required this.phone,
+    required this.logoUrl,
     required this.distanceLabel,
     required this.rating,
     required this.reviewCount,
@@ -141,6 +159,7 @@ class Salon {
     String? ownerName,
     String? address,
     String? phone,
+    String? logoUrl,
     String? distanceLabel,
     double? rating,
     int? reviewCount,
@@ -155,6 +174,7 @@ class Salon {
       ownerName: ownerName ?? this.ownerName,
       address: address ?? this.address,
       phone: phone ?? this.phone,
+      logoUrl: logoUrl ?? this.logoUrl,
       distanceLabel: distanceLabel ?? this.distanceLabel,
       rating: rating ?? this.rating,
       reviewCount: reviewCount ?? this.reviewCount,
@@ -172,6 +192,7 @@ class Barber {
   final String salonId;
   final String name;
   final String phone;
+  final String email;
   final String speciality;
   final int experienceYears;
   final String resumeSummary;
@@ -184,6 +205,7 @@ class Barber {
     required this.salonId,
     required this.name,
     required this.phone,
+    this.email = '',
     required this.speciality,
     this.experienceYears = 1,
     this.resumeSummary = 'Customer-first grooming professional.',
@@ -197,6 +219,7 @@ class Barber {
     String? salonId,
     String? name,
     String? phone,
+    String? email,
     String? speciality,
     int? experienceYears,
     String? resumeSummary,
@@ -209,6 +232,7 @@ class Barber {
       salonId: salonId ?? this.salonId,
       name: name ?? this.name,
       phone: phone ?? this.phone,
+      email: email ?? this.email,
       speciality: speciality ?? this.speciality,
       experienceYears: experienceYears ?? this.experienceYears,
       resumeSummary: resumeSummary ?? this.resumeSummary,
@@ -236,46 +260,62 @@ class TimeSlot {
 
 class Booking {
   final String id;
+  final String? customerUid;
   final String salonId;
   final String serviceId;
   final String barberId;
   final String customerName;
   final String customerPhone;
   final DateTime start;
+  final int durationMinutes;
+  final String serviceName;
+  final int servicePrice;
   final BookingStatus status;
   final DateTime createdAt;
 
   const Booking({
     required this.id,
+    this.customerUid,
     required this.salonId,
     required this.serviceId,
     required this.barberId,
     required this.customerName,
     required this.customerPhone,
     required this.start,
+    this.durationMinutes = 30,
+    this.serviceName = '',
+    this.servicePrice = 0,
     required this.status,
     required this.createdAt,
   });
 
   Booking copyWith({
     String? id,
+    String? customerUid,
     String? salonId,
     String? serviceId,
     String? barberId,
     String? customerName,
     String? customerPhone,
     DateTime? start,
+    int? durationMinutes,
+    String? serviceName,
+    int? servicePrice,
     BookingStatus? status,
     DateTime? createdAt,
   }) {
     return Booking(
       id: id ?? this.id,
+      customerUid: customerUid ?? this.customerUid,
       salonId: salonId ?? this.salonId,
       serviceId: serviceId ?? this.serviceId,
       barberId: barberId ?? this.barberId,
       customerName: customerName ?? this.customerName,
       customerPhone: customerPhone ?? this.customerPhone,
       start: start ?? this.start,
+      durationMinutes: durationMinutes ?? this.durationMinutes,
+      serviceName: serviceName ?? this.serviceName,
+      servicePrice: servicePrice ?? this.servicePrice,
       status: status ?? this.status,
       createdAt: createdAt ?? this.createdAt,
     );
@@ -288,6 +328,7 @@ class JoinRequest {
   final String salonId;
   final String barberName;
   final String barberPhone;
+  final String barberEmail;
   final String speciality;
   final int experienceYears;
   final String resumeSummary;
@@ -301,6 +342,7 @@ class JoinRequest {
     required this.salonId,
     required this.barberName,
     required this.barberPhone,
+    this.barberEmail = '',
     required this.speciality,
     this.experienceYears = 1,
     this.resumeSummary = 'Customer-first grooming professional.',
@@ -315,6 +357,7 @@ class JoinRequest {
     String? salonId,
     String? barberName,
     String? barberPhone,
+    String? barberEmail,
     String? speciality,
     int? experienceYears,
     String? resumeSummary,
@@ -328,6 +371,7 @@ class JoinRequest {
       salonId: salonId ?? this.salonId,
       barberName: barberName ?? this.barberName,
       barberPhone: barberPhone ?? this.barberPhone,
+      barberEmail: barberEmail ?? this.barberEmail,
       speciality: speciality ?? this.speciality,
       experienceYears: experienceYears ?? this.experienceYears,
       resumeSummary: resumeSummary ?? this.resumeSummary,

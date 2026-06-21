@@ -1,7 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:flutter/foundation.dart';
 
 class FirebaseBootstrap {
   final bool enabled;
@@ -20,9 +19,6 @@ class FirebaseBootstrap {
     try {
       await Firebase.initializeApp();
       final auth = FirebaseAuth.instance;
-      if (kDebugMode) {
-        await auth.setSettings(appVerificationDisabledForTesting: true);
-      }
       return FirebaseBootstrap._(
         enabled: true,
         firestore: FirebaseFirestore.instance,

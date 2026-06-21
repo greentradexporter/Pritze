@@ -30,7 +30,7 @@ class TrimtimeLogo extends StatelessWidget {
           child: Padding(
             padding: EdgeInsets.all(size * 0.06),
             child: Image.asset(
-              'assets/brand/pritze_icon_mark_transparent.png',
+              'assets/brand/pritze_logo.jpeg',
               fit: BoxFit.contain,
             ),
           ),

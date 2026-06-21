@@ -1,38 +1,45 @@
 import 'package:flutter/material.dart';
 
 class AppColors {
-  static const Color ink = Color(0xFF111827);
-  static const Color muted = Color(0xFF667085);
-  static const Color line = Color(0xFFE2E8E5);
+  static const Color ink = Color(0xFF11100E);
+  static const Color muted = Color(0xFF766D61);
+  static const Color line = Color(0xFFE9E0D2);
   static const Color surface = Color(0xFFFFFFFF);
-  static const Color canvas = Color(0xFFF7F9F8);
-  static const Color primary = Color(0xFF263248);
-  static const Color primaryDark = Color(0xFF111827);
-  static const Color mint = Color(0xFFEFF3F6);
-  static const Color amber = Color(0xFFD89116);
-  static const Color coral = Color(0xFFD94F44);
-  static const Color blue = Color(0xFF4169E1);
-  static const Color plum = Color(0xFF7657D9);
-  static const Color success = Color(0xFF3F7B52);
+  static const Color canvas = Color(0xFFFFFCF7);
+  static const Color primary = Color(0xFFB47A13);
+  static const Color primaryDark = Color(0xFF11100E);
+  static const Color charcoal = Color(0xFF181612);
+  static const Color gold = Color(0xFFC9962C);
+  static const Color goldDeep = Color(0xFF8B5A07);
+  static const Color champagne = Color(0xFFF7E9C9);
+  static const Color copper = Color(0xFFC2762F);
+  static const Color rose = Color(0xFFB76D5E);
+  static const Color leaf = Color(0xFF3F7B52);
+  static const Color mint = Color(0xFFF5EFE4);
+  static const Color amber = gold;
+  static const Color coral = rose;
+  static const Color blue = Color(0xFF556C86);
+  static const Color plum = Color(0xFF7B5B86);
+  static const Color success = leaf;
 }
 
 class AppGradients {
   static const LinearGradient hero = LinearGradient(
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
-    colors: [Color(0xFF111827), Color(0xFF263248), Color(0xFF4169E1)],
+    colors: [Color(0xFF10100E), Color(0xFF262018), Color(0xFFC9962C)],
   );
 
   static const LinearGradient warm = LinearGradient(
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
-    colors: [Color(0xFFFFF6DE), Color(0xFFFBECE9)],
+    colors: [Color(0xFFFFF8E8), Color(0xFFF4E4C8)],
   );
 
   static const LinearGradient coral = LinearGradient(
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
-    colors: [Color(0xFFD94F44), Color(0xFFD89116)],
+    colors: [Color(0xFF8B5A07), Color(0xFFC9962C)],
   );
 }
 
@@ -103,7 +110,7 @@ class AppTheme {
         color: AppColors.surface,
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(8),
           side: const BorderSide(color: AppColors.line),
         ),
       ),
@@ -119,11 +126,11 @@ class AppTheme {
           borderSide: const BorderSide(color: AppColors.line),
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(12),
           borderSide: const BorderSide(color: AppColors.line),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(12),
           borderSide: const BorderSide(color: AppColors.primary, width: 1.4),
         ),
       ),
@@ -133,7 +140,7 @@ class AppTheme {
           foregroundColor: Colors.white,
           minimumSize: const Size.fromHeight(48),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(12),
           ),
           textStyle: const TextStyle(fontWeight: FontWeight.w800),
         ),
@@ -144,7 +151,7 @@ class AppTheme {
           side: const BorderSide(color: AppColors.line),
           minimumSize: const Size.fromHeight(46),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(12),
           ),
           textStyle: const TextStyle(fontWeight: FontWeight.w800),
         ),

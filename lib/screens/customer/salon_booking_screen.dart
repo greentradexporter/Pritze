@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/salon_logo.dart';
 import '../../widgets/status_chip.dart';
 import 'my_bookings_screen.dart';
 
@@ -26,6 +28,7 @@ class SalonBookingScreen extends StatefulWidget {
 class _SalonBookingScreenState extends State<SalonBookingScreen> {
   String? _selectedSlotKey;
   String? _selectedBarberId;
+  bool _isBooking = false;
 
   @override
   void initState() {
@@ -66,7 +69,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     final selectedSlot = slots
         .where((slot) => slot.key == _selectedSlotKey)
         .firstOrNull;
-    final accent = _serviceColor(service.category);
+    const accent = AppColors.primary;
 
     return Scaffold(
       appBar: AppBar(
@@ -83,8 +86,28 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
           ),
         ],
       ),
+      bottomNavigationBar: SafeArea(
+        minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
+        child: FilledButton.icon(
+          onPressed: selectedSlot == null || _isBooking
+              ? null
+              : () => _startBookingLogin(context, selectedSlot),
+          icon: _isBooking
+              ? const SizedBox(
+                  height: 18,
+                  width: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.check_circle),
+          label: Text(_isBooking ? 'Booking...' : 'Book this slot'),
+          style: FilledButton.styleFrom(
+            backgroundColor: accent,
+            padding: const EdgeInsets.symmetric(vertical: 16),
+          ),
+        ),
+      ),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(18, 10, 18, 24),
+        padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
         children: [
           _BookingSummary(
             salon: salon,
@@ -137,7 +160,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    'No account needed yet. You will login with phone or Google only after tapping book.',
+                    'No account needed yet. You will sign in with email or Google only after tapping book.',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: AppColors.ink,
                       fontWeight: FontWeight.w700,
@@ -147,24 +170,16 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
               ],
             ),
           ),
-          const SizedBox(height: 18),
-          FilledButton.icon(
-            onPressed: selectedSlot == null
-                ? null
-                : () => _startBookingLogin(context, selectedSlot),
-            icon: const Icon(Icons.check_circle),
-            label: const Text('Book this slot'),
-            style: FilledButton.styleFrom(
-              backgroundColor: accent,
-              padding: const EdgeInsets.symmetric(vertical: 16),
-            ),
-          ),
+          const SizedBox(height: 74),
         ],
       ),
     );
   }
 
   Future<void> _startBookingLogin(BuildContext context, TimeSlot slot) async {
+    if (_isBooking) {
+      return;
+    }
     final appState = AppStateScope.read(context);
     if (appState.hasActiveCustomerSession) {
       await _completeBooking(context, slot);
@@ -178,6 +193,10 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   }
 
   Future<void> _completeBooking(BuildContext context, TimeSlot slot) async {
+    if (_isBooking) {
+      return;
+    }
+    setState(() => _isBooking = true);
     final appState = AppStateScope.read(context);
     late final Booking booking;
     try {
@@ -186,10 +205,14 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Booking failed: $error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Booking failed: ${_bookingErrorText(error)}')),
+      );
       return;
+    } finally {
+      if (mounted) {
+        setState(() => _isBooking = false);
+      }
     }
     final salon = appState.getSalon(booking.salonId);
     final service = appState.getService(booking.salonId, booking.serviceId);
@@ -205,6 +228,10 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
         return AlertDialog(
           icon: const Icon(Icons.check_circle, color: AppColors.primary),
           title: const Text('Booking request sent'),
+          titleTextStyle: Theme.of(context).textTheme.headlineSmall,
+          actionsOverflowDirection: VerticalDirection.down,
+          actionsAlignment: MainAxisAlignment.center,
+          actionsPadding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -227,18 +254,30 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
             ],
           ),
           actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Done'),
+            SizedBox(
+              width: 220,
+              child: OutlinedButton(
+                onPressed: () => Navigator.pop(context),
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 12,
+                  ),
+                ),
+                child: const Text('Done'),
+              ),
             ),
-            FilledButton(
-              onPressed: () {
-                Navigator.pop(context);
-                Navigator.of(context).pushReplacement(
-                  MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
-                );
-              },
-              child: const Text('My bookings'),
+            SizedBox(
+              width: 220,
+              child: FilledButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).pushReplacement(
+                    MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
+                  );
+                },
+                child: const Text('My bookings'),
+              ),
             ),
           ],
         );
@@ -246,14 +285,27 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     );
   }
 
+  String _bookingErrorText(Object error) {
+    if (error is FirebaseException && error.code == 'permission-denied') {
+      return 'Please sign in again, then book this slot.';
+    }
+    final message = error.toString();
+    if (message.contains('sign in again')) {
+      return 'Please sign in again, then book this slot.';
+    }
+    if (message.contains('just booked')) {
+      return 'This slot was just booked. Please choose another time.';
+    }
+    return message;
+  }
+
   Future<bool?> _showCustomerLoginSheet(BuildContext context) async {
     final nameController = TextEditingController();
-    final phoneController = TextEditingController();
     final emailController = TextEditingController();
-    final otpController = TextEditingController();
-    var usePhone = true;
+    final emailLinkController = TextEditingController();
+    var useEmail = true;
     var isSubmitting = false;
-    String? verificationId;
+    var linkSent = false;
 
     return showModalBottomSheet<bool>(
       context: context,
@@ -295,21 +347,21 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                     segments: const [
                       ButtonSegment(
                         value: true,
-                        icon: Icon(Icons.phone_outlined),
-                        label: Text('Phone'),
+                        icon: Icon(Icons.alternate_email),
+                        label: Text('Email'),
                       ),
                       ButtonSegment(
                         value: false,
-                        icon: Icon(Icons.mail_outline),
+                        icon: Icon(Icons.account_circle_outlined),
                         label: Text('Google'),
                       ),
                     ],
-                    selected: {usePhone},
+                    selected: {useEmail},
                     onSelectionChanged: (selection) {
                       setSheetState(() {
-                        usePhone = selection.first;
-                        verificationId = null;
-                        otpController.clear();
+                        useEmail = selection.first;
+                        linkSent = false;
+                        emailLinkController.clear();
                       });
                     },
                   ),
@@ -322,16 +374,27 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                     ),
                   ),
                   const SizedBox(height: 12),
-                  if (usePhone)
+                  if (useEmail) ...[
                     TextField(
-                      controller: phoneController,
-                      keyboardType: TextInputType.phone,
+                      controller: emailController,
+                      keyboardType: TextInputType.emailAddress,
                       decoration: const InputDecoration(
-                        labelText: 'Phone number',
-                        prefixIcon: Icon(Icons.phone_outlined),
+                        labelText: 'Email address',
+                        prefixIcon: Icon(Icons.alternate_email),
                       ),
-                    )
-                  else
+                    ),
+                    if (linkSent) ...[
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: emailLinkController,
+                        keyboardType: TextInputType.url,
+                        decoration: const InputDecoration(
+                          labelText: 'Paste email sign-in link',
+                          prefixIcon: Icon(Icons.mark_email_read_outlined),
+                        ),
+                      ),
+                    ],
+                  ] else
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(14),
@@ -353,7 +416,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 const Text(
-                                  'Use the Google account on this device',
+                                  'Google shortcut',
                                   style: TextStyle(
                                     color: AppColors.ink,
                                     fontWeight: FontWeight.w900,
@@ -361,7 +424,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
-                                  'No email typing is needed here. Android will show the Google account picker.',
+                                  'Use this only if the customer prefers Google. Email sign in works with Outlook, Yahoo, business email, and Gmail.',
                                   style: Theme.of(context).textTheme.bodyMedium,
                                 ),
                               ],
@@ -370,30 +433,17 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                         ],
                       ),
                     ),
-                  if (usePhone && verificationId != null) ...[
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: otpController,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: 'OTP code',
-                        prefixIcon: Icon(Icons.pin_outlined),
-                      ),
-                    ),
-                  ],
                   const SizedBox(height: 16),
                   FilledButton.icon(
                     onPressed: isSubmitting
                         ? null
                         : () async {
                             final name = nameController.text.trim();
-                            final contact = usePhone
-                                ? phoneController.text.trim()
-                                : emailController.text.trim();
-                            if (name.isEmpty || (usePhone && contact.isEmpty)) {
+                            final email = emailController.text.trim();
+                            if (name.isEmpty || (useEmail && email.isEmpty)) {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
-                                  content: Text('Enter name and login detail'),
+                                  content: Text('Enter name and email address'),
                                 ),
                               );
                               return;
@@ -401,46 +451,33 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                             final appState = AppStateScope.read(context);
                             setSheetState(() => isSubmitting = true);
                             try {
-                              if (usePhone) {
-                                if (appState.usesRealPhoneOtp &&
-                                    verificationId == null) {
-                                  final id = await appState
-                                      .startCustomerPhoneVerification(
-                                        phone: contact,
-                                      );
+                              if (useEmail) {
+                                if (!linkSent) {
+                                  await appState.sendEmailSignInLink(
+                                    email: email,
+                                  );
                                   if (!context.mounted) {
                                     return;
                                   }
-                                  if (id == null) {
-                                    await appState.loginCustomerWithPhone(
-                                      name: name,
-                                      phone: contact,
-                                    );
-                                    if (sheetContext.mounted) {
-                                      Navigator.pop(sheetContext, true);
-                                    }
-                                    return;
-                                  }
-                                  setSheetState(() => verificationId = id);
+                                  setSheetState(() => linkSent = true);
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     const SnackBar(
                                       content: Text(
-                                        'OTP sent. Enter the code to finish booking.',
+                                        'Sign-in email sent. Paste the link here to continue.',
                                       ),
                                     ),
                                   );
                                   return;
                                 }
-                                await appState.loginCustomerWithPhone(
+                                await appState.loginCustomerWithEmail(
                                   name: name,
-                                  phone: contact,
-                                  verificationId: verificationId,
-                                  smsCode: otpController.text,
+                                  email: email,
+                                  emailLink: emailLinkController.text,
                                 );
                               } else {
                                 await appState.loginCustomerWithGmail(
                                   name: name,
-                                  email: contact,
+                                  email: email,
                                 );
                               }
                               if (sheetContext.mounted) {
@@ -466,13 +503,16 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                             width: 18,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
-                        : Icon(usePhone ? Icons.phone : Icons.mail),
+                        : Icon(
+                            useEmail
+                                ? Icons.mark_email_unread_outlined
+                                : Icons.account_circle_outlined,
+                          ),
                     label: Text(
-                      usePhone
-                          ? verificationId == null &&
-                                    AppStateScope.read(context).usesRealPhoneOtp
-                                ? 'Send OTP'
-                                : 'Continue with phone'
+                      useEmail
+                          ? (linkSent
+                                ? 'Sign in with email link'
+                                : 'Email me a sign-in link')
                           : 'Continue with Google',
                     ),
                   ),
@@ -523,11 +563,7 @@ class _BookingSummary extends StatelessWidget {
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SoftIconBox(
-                      icon: _serviceIcon(service.category),
-                      color: accent,
-                      size: 48,
-                    ),
+                    SalonLogo(logoUrl: salon.logoUrl, color: accent, size: 52),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Column(
@@ -565,12 +601,12 @@ class _BookingSummary extends StatelessWidget {
                     AppPill(
                       icon: Icons.badge_outlined,
                       label: '$barberCount barbers',
-                      color: AppColors.blue,
+                      color: AppColors.primary,
                     ),
                     AppPill(
                       icon: Icons.login,
                       label: 'Login at checkout',
-                      color: AppColors.plum,
+                      color: AppColors.goldDeep,
                     ),
                   ],
                 ),
@@ -858,33 +894,5 @@ class _SlotCard extends StatelessWidget {
         ),
       ),
     );
-  }
-}
-
-Color _serviceColor(String category) {
-  switch (category.toLowerCase()) {
-    case 'beard':
-      return AppColors.coral;
-    case 'treatment':
-    case 'skin':
-      return AppColors.plum;
-    case 'color':
-      return AppColors.blue;
-    default:
-      return AppColors.primary;
-  }
-}
-
-IconData _serviceIcon(String category) {
-  switch (category.toLowerCase()) {
-    case 'beard':
-      return Icons.face_retouching_natural;
-    case 'treatment':
-    case 'skin':
-      return Icons.spa;
-    case 'color':
-      return Icons.palette_outlined;
-    default:
-      return Icons.content_cut;
   }
 }

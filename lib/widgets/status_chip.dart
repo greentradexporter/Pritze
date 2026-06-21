@@ -34,7 +34,7 @@ class StatusChip extends StatelessWidget {
       case BookingStatus.pending:
         return AppColors.amber;
       case BookingStatus.confirmed:
-        return AppColors.blue;
+        return AppColors.goldDeep;
       case BookingStatus.inProgress:
         return AppColors.primary;
       case BookingStatus.completed:

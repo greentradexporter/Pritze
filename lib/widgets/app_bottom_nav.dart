@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/app_models.dart';
@@ -19,13 +21,17 @@ class AppBottomNav extends StatelessWidget {
         if (index == selectedIndex) {
           return;
         }
-        if (index == 0 || index == 1) {
-          AppStateScope.read(context).selectRole(UserRole.customer);
-        }
+        final appState = AppStateScope.read(context);
         Navigator.of(context).pushAndRemoveUntil(
           MaterialPageRoute(builder: (_) => _screenFor(index)),
           (route) => false,
         );
+        final opensCustomerArea = index == 0 || index == 1;
+        if (opensCustomerArea &&
+            appState.activeRole != null &&
+            appState.activeRole != UserRole.customer) {
+          unawaited(appState.selectRole(UserRole.customer));
+        }
       },
       destinations: const [
         NavigationDestination(

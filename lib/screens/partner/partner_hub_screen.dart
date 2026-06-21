@@ -59,7 +59,7 @@ class PartnerHubScreen extends StatelessWidget {
             const SizedBox(height: 12),
             _PartnerCard(
               icon: Icons.badge,
-              color: AppColors.coral,
+              color: AppColors.primary,
               title: 'Barber',
               subtitle:
                   'Join a shop, view assigned customers, and update work status.',
