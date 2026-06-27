@@ -65,9 +65,9 @@ class SalonDetailScreen extends StatelessWidget {
                     Expanded(
                       child: OutlinedButton.icon(
                         onPressed: () {
-                          UrlLauncherUtils.openGoogleMaps(
+                          UrlLauncherUtils.openDirectionsLink(
                             context,
-                            salon.address,
+                            salon.directionsUrl,
                           );
                         },
                         icon: const Icon(Icons.directions),
@@ -76,60 +76,269 @@ class SalonDetailScreen extends StatelessWidget {
                     ),
                   ],
                 ),
-                const SizedBox(height: 24),
-                const SectionHeader(title: 'Services'),
+                const SizedBox(height: 20),
+                if (salon.photoUrls.isNotEmpty) ...[
+                  _SalonPhotoGallery(photoUrls: salon.photoUrls),
+                  const SizedBox(height: 20),
+                ],
+                Text(
+                  'How would you like to book?',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
                 const SizedBox(height: 10),
-                for (final service in salon.services) ...[
-                  _ServiceTile(
+                Row(
+                  children: [
+                    Expanded(
+                      child: _BookingPathCard(
+                        icon: Icons.design_services_outlined,
+                        title: 'Pick service',
+                        subtitle: '${salon.services.length} available',
+                        color: AppColors.primary,
+                        onTap: () => _showServicePickerSheet(context, salon),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _BookingPathCard(
+                        icon: Icons.badge_outlined,
+                        title: 'Pick barber',
+                        subtitle: '${barbers.length} available',
+                        color: AppColors.coral,
+                        onTap: () =>
+                            _showBarberPickerSheet(context, salon, barbers),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 22),
+                _CollapsibleSection(
+                  title: 'Services',
+                  subtitle: '${salon.services.length} services',
+                  icon: Icons.design_services_outlined,
+                  initiallyExpanded: true,
+                  children: [
+                    for (final service in salon.services) ...[
+                      _ServiceTile(
+                        service: service,
+                        availableBarbers: appState
+                            .barbersForService(salon.id, service.id)
+                            .length,
+                        onTap: () => _openService(context, salon, service),
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 12),
+                _CollapsibleSection(
+                  title: 'Barbers',
+                  subtitle: '${barbers.length} team members',
+                  icon: Icons.badge_outlined,
+                  children: [
+                    if (barbers.isEmpty)
+                      const EmptyState(
+                        icon: Icons.badge,
+                        title: 'No barbers yet',
+                        message: 'Owner can add staff from partner tools.',
+                      )
+                    else
+                      SizedBox(
+                        height: 158,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: barbers.length,
+                          separatorBuilder: (context, index) =>
+                              const SizedBox(width: 10),
+                          itemBuilder: (context, index) {
+                            final barber = barbers[index];
+                            return _BarberCard(
+                              barber: barber,
+                              onTap: () {
+                                _showBarberServiceSheet(context, salon, barber);
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openService(BuildContext context, Salon salon, SalonService service) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            SalonBookingScreen(salonId: salon.id, serviceId: service.id),
+      ),
+    );
+  }
+
+  Future<void> _showServicePickerSheet(BuildContext context, Salon salon) {
+    final appState = AppStateScope.read(context);
+    return showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (sheetContext) => FractionallySizedBox(
+        heightFactor: 0.78,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 2, 18, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Choose a service',
+                    style: Theme.of(context).textTheme.headlineSmall,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Pick a service first, then choose an available barber.',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView.separated(
+                padding: const EdgeInsets.all(18),
+                itemCount: salon.services.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 10),
+                itemBuilder: (context, index) {
+                  final service = salon.services[index];
+                  return _ServiceTile(
                     service: service,
                     availableBarbers: appState
                         .barbersForService(salon.id, service.id)
                         .length,
                     onTap: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => SalonBookingScreen(
-                            salonId: salon.id,
-                            serviceId: service.id,
-                          ),
-                        ),
-                      );
+                      Navigator.pop(sheetContext);
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        _openService(context, salon, service);
+                      });
                     },
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showBarberPickerSheet(
+    BuildContext context,
+    Salon salon,
+    List<Barber> barbers,
+  ) {
+    return showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (sheetContext) => FractionallySizedBox(
+        heightFactor: 0.72,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 2, 18, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Choose your barber',
+                    style: Theme.of(context).textTheme.headlineSmall,
                   ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Select a barber to see the services they handle.',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
                 ],
-                const SizedBox(height: 16),
-                const SectionHeader(title: 'Barbers in this shop'),
-                const SizedBox(height: 10),
-                if (barbers.isEmpty)
-                  const EmptyState(
-                    icon: Icons.badge,
-                    title: 'No barbers yet',
-                    message: 'Owner can add staff from partner tools.',
-                  )
-                else
-                  SizedBox(
-                    height: 158,
-                    child: ListView.separated(
-                      scrollDirection: Axis.horizontal,
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: barbers.isEmpty
+                  ? const EmptyState(
+                      icon: Icons.badge_outlined,
+                      title: 'No barbers available',
+                      message: 'Please choose a service instead.',
+                    )
+                  : ListView.separated(
+                      padding: const EdgeInsets.all(18),
                       itemCount: barbers.length,
-                      separatorBuilder: (context, index) =>
-                          const SizedBox(width: 10),
+                      separatorBuilder: (_, _) => const SizedBox(height: 10),
                       itemBuilder: (context, index) {
                         final barber = barbers[index];
-                        return _BarberCard(
-                          barber: barber,
+                        return GlassCard(
                           onTap: () {
-                            _showBarberServiceSheet(context, salon, barber);
+                            Navigator.pop(sheetContext);
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              _showBarberServiceSheet(context, salon, barber);
+                            });
                           },
+                          child: Row(
+                            children: [
+                              CircleAvatar(
+                                radius: 24,
+                                backgroundColor: AppColors.mint,
+                                foregroundColor: AppColors.primary,
+                                child: Text(
+                                  barber.name.characters.first,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      barber.name,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.titleMedium,
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '${barber.experienceYears} yrs · ${barber.speciality}',
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.bodyMedium,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const Icon(
+                                Icons.arrow_forward_ios_rounded,
+                                color: AppColors.primary,
+                                size: 17,
+                              ),
+                            ],
+                          ),
                         );
                       },
                     ),
-                  ),
-              ],
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -298,7 +507,7 @@ class _DetailHero extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       SalonLogo(
-                        logoUrl: salon.logoUrl,
+                        logoUrl: salon.coverImageUrl,
                         color: accent,
                         size: 50,
                       ),
@@ -366,6 +575,172 @@ class _DetailHero extends StatelessWidget {
               ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SalonPhotoGallery extends StatelessWidget {
+  final List<String> photoUrls;
+
+  const _SalonPhotoGallery({required this.photoUrls});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Salon photos', style: Theme.of(context).textTheme.titleLarge),
+        const SizedBox(height: 10),
+        SizedBox(
+          height: 154,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: photoUrls.length,
+            separatorBuilder: (_, _) => const SizedBox(width: 10),
+            itemBuilder: (context, index) {
+              final url = photoUrls[index];
+              return ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: Stack(
+                  children: [
+                    SizedBox(
+                      width: 220,
+                      height: 154,
+                      child: Image.network(
+                        url,
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stackTrace) => Container(
+                          color: AppColors.line,
+                          alignment: Alignment.center,
+                          child: const Icon(Icons.broken_image_outlined),
+                        ),
+                      ),
+                    ),
+                    if (index == 0)
+                      Positioned(
+                        left: 10,
+                        top: 10,
+                        child: AppPill(
+                          label: 'Cover',
+                          color: AppColors.primary,
+                          backgroundColor: Colors.white.withAlpha(232),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _BookingPathCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _BookingPathCard({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 126,
+      child: Material(
+        color: color.withAlpha(9),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(18),
+          side: BorderSide(color: color.withAlpha(42)),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SoftIconBox(icon: icon, color: color, size: 40),
+                const Spacer(),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppColors.ink,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                    ),
+                    Icon(Icons.arrow_forward_rounded, color: color, size: 18),
+                  ],
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CollapsibleSection extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final bool initiallyExpanded;
+  final List<Widget> children;
+
+  const _CollapsibleSection({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.children,
+    this.initiallyExpanded = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.line),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          initiallyExpanded: initiallyExpanded,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          leading: SoftIconBox(icon: icon, color: AppColors.primary, size: 40),
+          title: Text(title, style: Theme.of(context).textTheme.titleMedium),
+          subtitle: Text(subtitle),
+          children: children,
         ),
       ),
     );

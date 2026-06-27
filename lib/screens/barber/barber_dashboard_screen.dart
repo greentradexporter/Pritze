@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
@@ -6,7 +8,7 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/account_actions.dart';
-import '../../widgets/status_chip.dart';
+import '../../widgets/auth_login_panel.dart';
 
 class BarberDashboardScreen extends StatelessWidget {
   const BarberDashboardScreen({super.key});
@@ -22,26 +24,55 @@ class BarberDashboardScreen extends StatelessWidget {
         ? _BarberWorkView(barber: barber)
         : _BarberJoinView(request: request);
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Barber tools'),
-        actions: [
-          if (appState.barberAccount != null)
-            AccountOverflowMenu(
-              role: UserRole.barber,
-              canLogout: true,
-              onLoggedOut: () async {
-                if (context.mounted && Navigator.of(context).canPop()) {
-                  Navigator.of(context).pop();
-                }
-              },
-            ),
-          const SizedBox(width: 8),
-        ],
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Barber tools'),
+          actions: [
+            if (appState.barberAccount != null)
+              Builder(
+                builder: (tabContext) => AccountOverflowMenu(
+                  role: UserRole.barber,
+                  canLogout: true,
+                  onNotificationOpened: (destination) {
+                    if (destination == AppNotificationDestination.bookings) {
+                      DefaultTabController.of(tabContext).animateTo(0);
+                    }
+                  },
+                  onLoggedOut: () async {
+                    if (tabContext.mounted &&
+                        Navigator.of(tabContext).canPop()) {
+                      Navigator.of(tabContext).pop();
+                    }
+                  },
+                ),
+              ),
+            const SizedBox(width: 8),
+          ],
+          bottom: barber == null
+              ? null
+              : const TabBar(
+                  tabs: [
+                    Tab(icon: Icon(Icons.receipt_long), text: 'Appointments'),
+                    Tab(icon: Icon(Icons.currency_rupee), text: 'Earnings'),
+                  ],
+                ),
+        ),
+        body: appState.barberAccount == null
+            ? body
+            : barber == null
+            ? RefreshIndicator(onRefresh: appState.refresh, child: body)
+            : TabBarView(
+                children: [
+                  RefreshIndicator(onRefresh: appState.refresh, child: body),
+                  RefreshIndicator(
+                    onRefresh: appState.refresh,
+                    child: _BarberEarningsView(barber: barber),
+                  ),
+                ],
+              ),
       ),
-      body: appState.barberAccount == null
-          ? body
-          : RefreshIndicator(onRefresh: appState.refresh, child: body),
     );
   }
 }
@@ -54,23 +85,6 @@ class _BarberLoginGate extends StatefulWidget {
 }
 
 class _BarberLoginGateState extends State<_BarberLoginGate> {
-  final _nameController = TextEditingController();
-  final _phoneController = TextEditingController();
-  final _emailController = TextEditingController();
-  final _emailLinkController = TextEditingController();
-  bool _useEmail = true;
-  bool _isSubmitting = false;
-  bool _linkSent = false;
-
-  @override
-  void dispose() {
-    _nameController.dispose();
-    _phoneController.dispose();
-    _emailController.dispose();
-    _emailLinkController.dispose();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -84,205 +98,13 @@ class _BarberLoginGateState extends State<_BarberLoginGate> {
           icon: Icons.badge,
         ),
         const SizedBox(height: 22),
-        GlassCard(
-          child: Column(
-            children: [
-              SegmentedButton<bool>(
-                segments: const [
-                  ButtonSegment(
-                    value: true,
-                    icon: Icon(Icons.alternate_email),
-                    label: Text('Email'),
-                  ),
-                  ButtonSegment(
-                    value: false,
-                    icon: Icon(Icons.account_circle_outlined),
-                    label: Text('Google'),
-                  ),
-                ],
-                selected: {_useEmail},
-                onSelectionChanged: (selection) {
-                  setState(() {
-                    _useEmail = selection.first;
-                    _linkSent = false;
-                    _emailLinkController.clear();
-                  });
-                },
-              ),
-              const SizedBox(height: 14),
-              TextField(
-                controller: _nameController,
-                decoration: const InputDecoration(
-                  labelText: 'Barber name',
-                  prefixIcon: Icon(Icons.person_outline),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _phoneController,
-                keyboardType: TextInputType.phone,
-                decoration: const InputDecoration(
-                  labelText: 'Phone number for shop records',
-                  prefixIcon: Icon(Icons.phone_outlined),
-                ),
-              ),
-              const SizedBox(height: 12),
-              if (_useEmail) ...[
-                TextField(
-                  controller: _emailController,
-                  keyboardType: TextInputType.emailAddress,
-                  decoration: const InputDecoration(
-                    labelText: 'Email address',
-                    prefixIcon: Icon(Icons.alternate_email),
-                  ),
-                ),
-                if (_linkSent) ...[
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _emailLinkController,
-                    keyboardType: TextInputType.url,
-                    decoration: const InputDecoration(
-                      labelText: 'Paste email sign-in link',
-                      prefixIcon: Icon(Icons.mark_email_read_outlined),
-                    ),
-                  ),
-                ],
-              ] else
-                const _GoogleLoginNotice(
-                  title: 'Google shortcut',
-                  message:
-                      'Use this only if you prefer Google. Email sign in works with Outlook, Yahoo, business email, and Gmail.',
-                ),
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: _isSubmitting ? null : _login,
-                icon: Icon(
-                  _useEmail
-                      ? Icons.mark_email_unread_outlined
-                      : Icons.account_circle_outlined,
-                ),
-                label: Text(
-                  _useEmail
-                      ? (_linkSent
-                            ? 'Sign in with email link'
-                            : 'Email me a sign-in link')
-                      : 'Continue with Google',
-                ),
-              ),
-            ],
-          ),
+        const AuthLoginPanel(
+          role: UserRole.barber,
+          googleTitle: 'Nothing else to fill in',
+          googleMessage:
+              'Choose your Google account. Your name and Gmail address will be carried into the next step automatically.',
         ),
       ],
-    );
-  }
-
-  Future<void> _login() async {
-    final name = _nameController.text.trim();
-    final email = _emailController.text.trim();
-    final phone = _phoneController.text.trim();
-    final phoneDigits = phone.replaceAll(RegExp(r'\D'), '');
-    final localPhone = phoneDigits.length == 12 && phoneDigits.startsWith('91')
-        ? phoneDigits.substring(2)
-        : phoneDigits;
-    final hasValidPhone = localPhone.length == 10;
-    final hasValidEmail = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email);
-    if (name.isEmpty || !hasValidPhone || (_useEmail && !hasValidEmail)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Enter a name, 10-digit phone number, and valid email address',
-          ),
-        ),
-      );
-      return;
-    }
-    final appState = AppStateScope.read(context);
-    setState(() => _isSubmitting = true);
-    try {
-      if (_useEmail) {
-        if (!_linkSent) {
-          await appState.sendEmailSignInLink(email: email);
-          if (!mounted) {
-            return;
-          }
-          setState(() => _linkSent = true);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Sign-in email sent. Paste the link to continue.'),
-            ),
-          );
-          return;
-        }
-        await appState.loginBarberWithEmail(
-          name: name,
-          email: email,
-          phone: phone,
-          emailLink: _emailLinkController.text,
-        );
-      } else {
-        await appState.loginBarberWithGmail(
-          name: name,
-          email: email,
-          phone: phone,
-        );
-      }
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Login failed: $error')));
-    } finally {
-      if (mounted) {
-        setState(() => _isSubmitting = false);
-      }
-    }
-  }
-}
-
-class _GoogleLoginNotice extends StatelessWidget {
-  final String title;
-  final String message;
-
-  const _GoogleLoginNotice({required this.title, required this.message});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: AppColors.canvas,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.line),
-      ),
-      child: Row(
-        children: [
-          const SoftIconBox(
-            icon: Icons.account_circle_outlined,
-            color: AppColors.coral,
-            size: 42,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    color: AppColors.ink,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(message, style: Theme.of(context).textTheme.bodyMedium),
-              ],
-            ),
-          ),
-        ],
-      ),
     );
   }
 }
@@ -307,6 +129,7 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
   String _speciality = _barberSpecialities.first;
   final Set<String> _serviceIds = {};
   bool _profileLoaded = false;
+  bool _isWithdrawing = false;
 
   @override
   void didChangeDependencies() {
@@ -339,6 +162,8 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
+    final account = appState.barberAccount;
+    final hasAuthenticatedEmail = account?.contact.contains('@') == true;
     final salons = appState.salons;
     if (_salonId == null || salons.every((salon) => salon.id != _salonId)) {
       _salonId = salons.isEmpty ? null : salons.first.id;
@@ -376,6 +201,18 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
                   style: Theme.of(context).textTheme.bodyMedium,
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _isWithdrawing
+                  ? null
+                  : () => _withdrawRequest(context, widget.request!),
+              icon: const Icon(Icons.undo_rounded),
+              label: Text(_isWithdrawing ? 'Withdrawing…' : 'Withdraw request'),
+              style: OutlinedButton.styleFrom(foregroundColor: AppColors.coral),
             ),
           ),
         ],
@@ -428,6 +265,13 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
                     color: AppColors.coral,
                   ),
                 ],
+                if (widget.request?.status == JoinRequestStatus.withdrawn) ...[
+                  const SizedBox(height: 12),
+                  const AppPill(
+                    label: 'Previous request withdrawn',
+                    color: AppColors.muted,
+                  ),
+                ],
                 const SizedBox(height: 22),
                 const SectionHeader(title: 'Profile'),
                 const SizedBox(height: 10),
@@ -440,15 +284,19 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
                           labelText: 'Name',
                           prefixIcon: Icon(Icons.person_outline),
                         ),
-                        validator: _phone,
+                        validator: _required,
                       ),
                       const SizedBox(height: 12),
                       TextFormField(
                         controller: _emailController,
                         keyboardType: TextInputType.emailAddress,
-                        decoration: const InputDecoration(
+                        readOnly: hasAuthenticatedEmail,
+                        decoration: InputDecoration(
                           labelText: 'Email address',
-                          prefixIcon: Icon(Icons.alternate_email),
+                          helperText: hasAuthenticatedEmail
+                              ? 'Filled from your signed-in account'
+                              : null,
+                          prefixIcon: const Icon(Icons.alternate_email),
                         ),
                         validator: _email,
                       ),
@@ -460,7 +308,7 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
                           labelText: 'Phone number',
                           prefixIcon: Icon(Icons.phone_outlined),
                         ),
-                        validator: _required,
+                        validator: _phone,
                       ),
                       const SizedBox(height: 12),
                       DropdownButtonFormField<String>(
@@ -591,6 +439,106 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
       return 'Required';
     }
     return null;
+  }
+
+  Future<void> _withdrawRequest(
+    BuildContext context,
+    JoinRequest request,
+  ) async {
+    final appState = AppStateScope.read(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+        backgroundColor: AppColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 26, 22, 22),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Center(
+                  child: Container(
+                    width: 62,
+                    height: 62,
+                    decoration: BoxDecoration(
+                      color: AppColors.coral.withAlpha(22),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: const Icon(
+                      Icons.undo_rounded,
+                      color: AppColors.coral,
+                      size: 30,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                const Text(
+                  'Withdraw request?',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: AppColors.ink,
+                    fontSize: 24,
+                    height: 1.15,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'The salon will no longer be able to approve this request. You can submit a new one afterward.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: AppColors.muted,
+                    fontSize: 14,
+                    height: 1.45,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                SizedBox(
+                  height: 50,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    child: const Text('Keep request'),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: 50,
+                  child: FilledButton.icon(
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.coral,
+                    ),
+                    icon: const Icon(Icons.undo_rounded, size: 19),
+                    label: const Text('Yes, withdraw request'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+    setState(() => _isWithdrawing = true);
+    try {
+      await appState.withdrawJoinRequest(request.id);
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not withdraw request: $error')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isWithdrawing = false);
+      }
+    }
   }
 
   String? _phone(String? value) {
@@ -751,107 +699,406 @@ const _barberSpecialities = [
   'All-round grooming expert',
 ];
 
-class _BarberWorkView extends StatelessWidget {
+class _BarberWorkView extends StatefulWidget {
   final Barber barber;
 
   const _BarberWorkView({required this.barber});
 
   @override
+  State<_BarberWorkView> createState() => _BarberWorkViewState();
+}
+
+class _BarberWorkViewState extends State<_BarberWorkView> {
+  BarberBookingBucket _selectedBucket = BarberBookingBucket.upcoming;
+  Timer? _clock;
+
+  @override
+  void initState() {
+    super.initState();
+    _clock = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _clock?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final bookings = appState.bookingsForBarber(barber.id);
-    final activeBookings = bookings
-        .where((booking) => booking.status != BookingStatus.cancelled)
-        .toList();
-    final completed = bookings
-        .where((booking) => booking.status == BookingStatus.completed)
-        .length;
+    final now = DateTime.now();
+    final bookings = appState.bookingsForBarber(widget.barber.id);
+    final grouped = {
+      for (final bucket in BarberBookingBucket.values)
+        bucket: bookings.where((booking) {
+          return appState.barberBookingBucket(booking, now: now) == bucket;
+        }).toList(),
+    };
+    grouped[BarberBookingBucket.upcoming]!.sort(
+      (a, b) => a.start.compareTo(b.start),
+    );
+    for (final bucket in const [
+      BarberBookingBucket.active,
+      BarberBookingBucket.history,
+      BarberBookingBucket.cancelled,
+    ]) {
+      grouped[bucket]!.sort((a, b) => b.start.compareTo(a.start));
+    }
+    final visible = grouped[_selectedBucket]!;
 
     return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
       children: [
         AppHeroHeader(
-          eyebrow: 'Your chair',
-          title: barber.name,
+          eyebrow: 'Appointment ledger',
+          title: widget.barber.name,
           subtitle:
-              '${barber.speciality}. ${activeBookings.length} active jobs assigned today.',
-          icon: Icons.content_cut,
-        ),
-        const SizedBox(height: 12),
-        GlassCard(
-          color: AppColors.mint,
-          child: Row(
-            children: [
-              const SoftIconBox(
-                icon: Icons.description_outlined,
-                color: AppColors.primary,
-                size: 42,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  '${barber.experienceYears} yrs exp - ${barber.resumeSummary}',
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: AppColors.primaryDark,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-            ],
-          ),
+              '${widget.barber.speciality}. Track every upcoming, active, expired, completed, and cancelled appointment.',
+          icon: Icons.receipt_long,
         ),
         const SizedBox(height: 18),
         Row(
           children: [
             Expanded(
               child: _MiniMetric(
-                label: 'Assigned',
-                value: '${activeBookings.length}',
-                icon: Icons.event_note,
+                label: 'Upcoming',
+                value: '${grouped[BarberBookingBucket.upcoming]!.length}',
+                icon: Icons.upcoming,
                 color: AppColors.primary,
               ),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 8),
             Expanded(
               child: _MiniMetric(
-                label: 'Completed',
-                value: '$completed',
-                icon: Icons.done_all,
+                label: 'Active',
+                value: '${grouped[BarberBookingBucket.active]!.length}',
+                icon: Icons.content_cut,
+                color: AppColors.coral,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _MiniMetric(
+                label: 'History',
+                value: '${grouped[BarberBookingBucket.history]!.length}',
+                icon: Icons.history,
                 color: AppColors.success,
               ),
             ),
           ],
         ),
         const SizedBox(height: 22),
-        const SectionHeader(title: 'Schedule'),
+        SizedBox(
+          height: 42,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: BarberBookingBucket.values.length,
+            separatorBuilder: (_, _) => const SizedBox(width: 8),
+            itemBuilder: (context, index) {
+              final bucket = BarberBookingBucket.values[index];
+              return ChoiceChip(
+                selected: _selectedBucket == bucket,
+                onSelected: (_) => setState(() => _selectedBucket = bucket),
+                avatar: Icon(_bucketIcon(bucket), size: 17),
+                label: Text(
+                  '${_bucketLabel(bucket)} ${grouped[bucket]!.length}',
+                ),
+              );
+            },
+          ),
+        ),
         const SizedBox(height: 10),
-        if (bookings.isEmpty)
-          const EmptyState(
-            icon: Icons.event_note,
-            title: 'No assigned bookings',
-            message: 'When customers book your services, they appear here.',
+        if (visible.isEmpty)
+          EmptyState(
+            icon: _bucketIcon(_selectedBucket),
+            title: _emptyTitle(_selectedBucket),
+            message: _emptyMessage(_selectedBucket),
           )
         else
-          for (final booking in bookings) ...[
-            _BarberBookingCard(booking: booking),
+          for (final booking in visible) ...[
+            _BarberBookingCard(
+              booking: booking,
+              bucket: _selectedBucket,
+              outcome: appState.barberBookingOutcome(booking, now: now),
+            ),
             const SizedBox(height: 10),
           ],
       ],
+    );
+  }
+
+  String _bucketLabel(BarberBookingBucket bucket) => switch (bucket) {
+    BarberBookingBucket.upcoming => 'Upcoming',
+    BarberBookingBucket.active => 'Active',
+    BarberBookingBucket.history => 'History',
+    BarberBookingBucket.cancelled => 'Cancelled',
+  };
+
+  IconData _bucketIcon(BarberBookingBucket bucket) => switch (bucket) {
+    BarberBookingBucket.upcoming => Icons.upcoming,
+    BarberBookingBucket.active => Icons.content_cut,
+    BarberBookingBucket.history => Icons.history,
+    BarberBookingBucket.cancelled => Icons.cancel_outlined,
+  };
+
+  String _emptyTitle(BarberBookingBucket bucket) => switch (bucket) {
+    BarberBookingBucket.upcoming => 'No upcoming appointments',
+    BarberBookingBucket.active => 'No service in progress',
+    BarberBookingBucket.history => 'No previous appointments',
+    BarberBookingBucket.cancelled => 'No cancelled appointments',
+  };
+
+  String _emptyMessage(BarberBookingBucket bucket) => switch (bucket) {
+    BarberBookingBucket.upcoming =>
+      'Confirmed bookings and requests waiting for salon acceptance appear here.',
+    BarberBookingBucket.active =>
+      'An appointment moves here as soon as its service is started.',
+    BarberBookingBucket.history =>
+      'Completed, missed, and requests not accepted before their time appear here.',
+    BarberBookingBucket.cancelled =>
+      'Bookings cancelled or rejected by the salon or customer appear here.',
+  };
+}
+
+class _BarberEarningsView extends StatelessWidget {
+  final Barber barber;
+
+  const _BarberEarningsView({required this.barber});
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    final now = DateTime.now();
+    final completed =
+        appState
+            .bookingsForBarber(barber.id)
+            .where((booking) => booking.status == BookingStatus.completed)
+            .toList()
+          ..sort((a, b) => b.start.compareTo(a.start));
+    final total = appState.barberTotalEarnings(barber.id);
+    final today = appState.barberDailyEarnings(barber.id, now: now);
+    final month = appState.barberMonthlyEarnings(barber.id, now: now);
+
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
+      children: [
+        AppHeroHeader(
+          eyebrow: 'Earnings overview',
+          title: '₹$total earned in total',
+          subtitle:
+              'Only completed services assigned to ${barber.name} are included.',
+          icon: Icons.account_balance_wallet_outlined,
+        ),
+        const SizedBox(height: 18),
+        _EarningMetricCard(
+          label: 'Total earnings',
+          value: total,
+          detail: '${completed.length} completed services',
+          icon: Icons.savings_outlined,
+          color: AppColors.primary,
+          featured: true,
+        ),
+        const SizedBox(height: 10),
+        IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: _EarningMetricCard(
+                  label: 'Today',
+                  value: today,
+                  detail: _completedCountForDay(completed, now) == 1
+                      ? '1 service'
+                      : '${_completedCountForDay(completed, now)} services',
+                  icon: Icons.today_outlined,
+                  color: AppColors.success,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _EarningMetricCard(
+                  label: 'This month',
+                  value: month,
+                  detail:
+                      '${_completedCountForMonth(completed, now)} completed',
+                  icon: Icons.calendar_month_outlined,
+                  color: AppColors.goldDeep,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 24),
+        const SectionHeader(title: 'Completed-service earnings'),
+        const SizedBox(height: 10),
+        if (completed.isEmpty)
+          const EmptyState(
+            icon: Icons.currency_rupee,
+            title: 'No earnings yet',
+            message:
+                'Completed appointments will appear here with their captured service value.',
+          )
+        else
+          for (final booking in completed.take(20)) ...[
+            GlassCard(
+              child: Row(
+                children: [
+                  const SoftIconBox(
+                    icon: Icons.check_rounded,
+                    color: AppColors.success,
+                    size: 44,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          booking.serviceName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${booking.customerName} · ${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    '₹${appState.bookingEarning(booking)}',
+                    style: const TextStyle(
+                      color: AppColors.success,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+      ],
+    );
+  }
+
+  int _completedCountForDay(List<Booking> bookings, DateTime date) {
+    return bookings.where((booking) {
+      return booking.start.year == date.year &&
+          booking.start.month == date.month &&
+          booking.start.day == date.day;
+    }).length;
+  }
+
+  int _completedCountForMonth(List<Booking> bookings, DateTime date) {
+    return bookings.where((booking) {
+      return booking.start.year == date.year &&
+          booking.start.month == date.month;
+    }).length;
+  }
+}
+
+class _EarningMetricCard extends StatelessWidget {
+  final String label;
+  final int value;
+  final String detail;
+  final IconData icon;
+  final Color color;
+  final bool featured;
+
+  const _EarningMetricCard({
+    required this.label,
+    required this.value,
+    required this.detail,
+    required this.icon,
+    required this.color,
+    this.featured = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      color: color.withAlpha(featured ? 13 : 7),
+      padding: EdgeInsets.all(featured ? 18 : 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SoftIconBox(icon: icon, color: color, size: featured ? 46 : 40),
+          SizedBox(height: featured ? 18 : 13),
+          Text(
+            '₹$value',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: AppColors.ink,
+              fontSize: featured ? 31 : 23,
+              height: 1,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+          const SizedBox(height: 7),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.ink,
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            detail,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
     );
   }
 }
 
 class _BarberBookingCard extends StatelessWidget {
   final Booking booking;
+  final BarberBookingBucket bucket;
+  final String outcome;
 
-  const _BarberBookingCard({required this.booking});
+  const _BarberBookingCard({
+    required this.booking,
+    required this.bucket,
+    required this.outcome,
+  });
 
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final service = appState.getService(booking.salonId, booking.serviceId);
 
+    final outcomeColor = _outcomeColor();
+    final canStart =
+        booking.status == BookingStatus.confirmed &&
+        bucket == BarberBookingBucket.upcoming &&
+        !DateTime.now().isBefore(
+          booking.start.subtract(const Duration(minutes: 15)),
+        );
+    final canComplete = booking.status == BookingStatus.inProgress;
+
     return GlassCard(
+      color: outcomeColor.withAlpha(7),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -882,7 +1129,7 @@ class _BarberBookingCard extends StatelessWidget {
                   ],
                 ),
               ),
-              StatusChip(status: booking.status),
+              AppPill(label: outcome, color: outcomeColor),
             ],
           ),
           const SizedBox(height: 12),
@@ -898,65 +1145,54 @@ class _BarberBookingCard extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: booking.status == BookingStatus.inProgress
-                      ? null
-                      : () async {
-                          try {
-                            await appState.updateBookingStatus(
-                              booking.id,
-                              BookingStatus.inProgress,
-                            );
-                          } catch (error) {
-                            if (!context.mounted) {
-                              return;
-                            }
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('Status update failed: $error'),
-                              ),
-                            );
-                          }
-                        },
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('Start'),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: booking.status == BookingStatus.completed
-                      ? null
-                      : () async {
-                          try {
-                            await appState.updateBookingStatus(
-                              booking.id,
-                              BookingStatus.completed,
-                            );
-                          } catch (error) {
-                            if (!context.mounted) {
-                              return;
-                            }
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text('Status update failed: $error'),
-                              ),
-                            );
-                          }
-                        },
-                  icon: const Icon(Icons.done),
-                  label: const Text('Done'),
-                ),
-              ),
-            ],
-          ),
+          if (canStart || canComplete) ...[
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: canComplete
+                  ? FilledButton.icon(
+                      onPressed: () =>
+                          _updateStatus(context, BookingStatus.completed),
+                      icon: const Icon(Icons.done_all),
+                      label: const Text('Complete service'),
+                    )
+                  : FilledButton.tonalIcon(
+                      onPressed: () =>
+                          _updateStatus(context, BookingStatus.inProgress),
+                      icon: const Icon(Icons.play_arrow),
+                      label: const Text('Start service'),
+                    ),
+            ),
+          ],
         ],
       ),
     );
+  }
+
+  Color _outcomeColor() {
+    if (outcome == 'Not accepted' || outcome.startsWith('Missed')) {
+      return AppColors.coral;
+    }
+    return switch (booking.status) {
+      BookingStatus.pending => AppColors.amber,
+      BookingStatus.confirmed => AppColors.goldDeep,
+      BookingStatus.inProgress => AppColors.primary,
+      BookingStatus.completed => AppColors.success,
+      BookingStatus.cancelled => AppColors.coral,
+      BookingStatus.rejected => AppColors.coral,
+    };
+  }
+
+  Future<void> _updateStatus(BuildContext context, BookingStatus status) async {
+    try {
+      await AppStateScope.read(context).updateBookingStatus(booking.id, status);
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Status update failed: $error')));
+      }
+    }
   }
 }
 
@@ -976,24 +1212,24 @@ class _MiniMetric extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GlassCard(
-      padding: const EdgeInsets.all(14),
-      child: Row(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+      child: Column(
         children: [
-          SoftIconBox(icon: icon, color: color, size: 40),
-          const SizedBox(width: 10),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                value,
-                style: const TextStyle(
-                  color: AppColors.ink,
-                  fontSize: 22,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              Text(label, style: Theme.of(context).textTheme.bodyMedium),
-            ],
+          Icon(icon, color: color, size: 22),
+          const SizedBox(height: 6),
+          Text(
+            value,
+            style: const TextStyle(
+              color: AppColors.ink,
+              fontSize: 22,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
           ),
         ],
       ),

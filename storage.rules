@@ -1,0 +1,32 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function ownsSalon(salonId) {
+      return signedIn() &&
+        firestore.get(
+          /databases/(default)/documents/salons/$(salonId)
+        ).data.ownerUid == request.auth.uid;
+    }
+
+    function ownerSalonId(salonId) {
+      return signedIn() && salonId == 'salon-' + request.auth.uid;
+    }
+
+    match /salons/{salonId}/photos/{photoName} {
+      allow read: if true;
+      allow create, update: if (ownsSalon(salonId) || ownerSalonId(salonId)) &&
+        request.resource.size < 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+      allow delete: if ownsSalon(salonId) || ownerSalonId(salonId);
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

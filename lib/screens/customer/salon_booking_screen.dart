@@ -5,6 +5,7 @@ import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/auth_login_panel.dart';
 import '../../widgets/salon_logo.dart';
 import '../../widgets/status_chip.dart';
 import 'my_bookings_screen.dart';
@@ -224,62 +225,21 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
 
     await showDialog<void>(
       context: context,
-      builder: (context) {
-        return AlertDialog(
-          icon: const Icon(Icons.check_circle, color: AppColors.primary),
-          title: const Text('Booking request sent'),
-          titleTextStyle: Theme.of(context).textTheme.headlineSmall,
-          actionsOverflowDirection: VerticalDirection.down,
-          actionsAlignment: MainAxisAlignment.center,
-          actionsPadding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                salon?.name ?? 'Salon',
-                style: const TextStyle(fontWeight: FontWeight.w900),
-              ),
-              const SizedBox(height: 8),
-              Text(service?.name ?? 'Service'),
-              const SizedBox(height: 8),
-              Text(
-                '${appState.formatDate(booking.start)}, '
-                '${appState.formatTime(booking.start)}',
-              ),
-              const SizedBox(height: 8),
-              Text(barber?.name ?? 'Assigned barber'),
-              const SizedBox(height: 14),
-              const StatusChip(status: BookingStatus.pending),
-            ],
-          ),
-          actions: [
-            SizedBox(
-              width: 220,
-              child: OutlinedButton(
-                onPressed: () => Navigator.pop(context),
-                style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 12,
-                  ),
-                ),
-                child: const Text('Done'),
-              ),
-            ),
-            SizedBox(
-              width: 220,
-              child: FilledButton(
-                onPressed: () {
-                  Navigator.pop(context);
-                  Navigator.of(context).pushReplacement(
-                    MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
-                  );
-                },
-                child: const Text('My bookings'),
-              ),
-            ),
-          ],
+      builder: (dialogContext) {
+        return _BookingSuccessDialog(
+          salonName: salon?.name ?? 'Salon',
+          serviceName: service?.name ?? 'Service',
+          appointmentTime:
+              '${appState.formatDate(booking.start)}, '
+              '${appState.formatTime(booking.start)}',
+          barberName: barber?.name ?? 'Assigned barber',
+          onDone: () => Navigator.pop(dialogContext),
+          onMyBookings: () {
+            Navigator.pop(dialogContext);
+            Navigator.of(context).pushReplacement(
+              MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
+            );
+          },
         );
       },
     );
@@ -300,228 +260,246 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   }
 
   Future<bool?> _showCustomerLoginSheet(BuildContext context) async {
-    final nameController = TextEditingController();
-    final emailController = TextEditingController();
-    final emailLinkController = TextEditingController();
-    var useEmail = true;
-    var isSubmitting = false;
-    var linkSent = false;
-
     return showModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       builder: (sheetContext) {
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            return Padding(
-              padding: EdgeInsets.only(
-                left: 18,
-                right: 18,
-                top: 18,
-                bottom: MediaQuery.of(context).viewInsets.bottom + 18,
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 18,
+            right: 18,
+            top: 18,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 18,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  width: 42,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 18),
+                  decoration: BoxDecoration(
+                    color: AppColors.line,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+                Text(
+                  'Login to finish booking',
+                  style: Theme.of(context).textTheme.headlineMedium,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Use phone OTP, email verification, or Gmail. This final step creates your customer booking.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 16),
+                AuthLoginPanel(
+                  role: UserRole.customer,
+                  googleTitle: 'Gmail shortcut',
+                  googleMessage:
+                      'Choose your Google account. Your Gmail identity will be used for this booking automatically.',
+                  onLoggedIn: () {
+                    if (sheetContext.mounted) {
+                      Navigator.pop(sheetContext, true);
+                    }
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _BookingSuccessDialog extends StatelessWidget {
+  final String salonName;
+  final String serviceName;
+  final String appointmentTime;
+  final String barberName;
+  final VoidCallback onDone;
+  final VoidCallback onMyBookings;
+
+  const _BookingSuccessDialog({
+    required this.salonName,
+    required this.serviceName,
+    required this.appointmentTime,
+    required this.barberName,
+    required this.onDone,
+    required this.onMyBookings,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 22, vertical: 24),
+      backgroundColor: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(20, 22, 20, 18),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(28),
+          border: Border.all(color: AppColors.line),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withAlpha(24),
+              blurRadius: 28,
+              offset: const Offset(0, 14),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 70,
+                height: 70,
+                decoration: BoxDecoration(
+                  color: AppColors.success.withAlpha(14),
+                  shape: BoxShape.circle,
+                  border: Border.all(color: AppColors.success.withAlpha(38)),
+                ),
+                child: const Icon(
+                  Icons.check_rounded,
+                  color: AppColors.success,
+                  size: 38,
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Booking request sent',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'The salon will confirm your appointment soon.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: AppColors.muted,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 18),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: AppColors.champagne.withAlpha(58),
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(color: AppColors.line),
               ),
               child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    width: 42,
-                    height: 4,
-                    margin: const EdgeInsets.only(bottom: 18),
-                    decoration: BoxDecoration(
-                      color: AppColors.line,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
+                  _SuccessDetailRow(
+                    icon: Icons.storefront_outlined,
+                    label: salonName,
+                    isStrong: true,
                   ),
-                  Text(
-                    'Login to finish booking',
-                    style: Theme.of(context).textTheme.headlineMedium,
+                  _SuccessDetailRow(
+                    icon: Icons.spa_outlined,
+                    label: serviceName,
                   ),
-                  const SizedBox(height: 6),
-                  Text(
-                    'You have already selected salon, barber, and time. This final step creates your customer booking.',
-                    style: Theme.of(context).textTheme.bodyMedium,
+                  _SuccessDetailRow(
+                    icon: Icons.schedule,
+                    label: appointmentTime,
                   ),
-                  const SizedBox(height: 16),
-                  SegmentedButton<bool>(
-                    segments: const [
-                      ButtonSegment(
-                        value: true,
-                        icon: Icon(Icons.alternate_email),
-                        label: Text('Email'),
-                      ),
-                      ButtonSegment(
-                        value: false,
-                        icon: Icon(Icons.account_circle_outlined),
-                        label: Text('Google'),
-                      ),
-                    ],
-                    selected: {useEmail},
-                    onSelectionChanged: (selection) {
-                      setSheetState(() {
-                        useEmail = selection.first;
-                        linkSent = false;
-                        emailLinkController.clear();
-                      });
-                    },
+                  _SuccessDetailRow(
+                    icon: Icons.badge_outlined,
+                    label: barberName,
                   ),
-                  const SizedBox(height: 14),
-                  TextField(
-                    controller: nameController,
-                    decoration: const InputDecoration(
-                      labelText: 'Name',
-                      prefixIcon: Icon(Icons.person_outline),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  if (useEmail) ...[
-                    TextField(
-                      controller: emailController,
-                      keyboardType: TextInputType.emailAddress,
-                      decoration: const InputDecoration(
-                        labelText: 'Email address',
-                        prefixIcon: Icon(Icons.alternate_email),
-                      ),
-                    ),
-                    if (linkSent) ...[
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: emailLinkController,
-                        keyboardType: TextInputType.url,
-                        decoration: const InputDecoration(
-                          labelText: 'Paste email sign-in link',
-                          prefixIcon: Icon(Icons.mark_email_read_outlined),
-                        ),
-                      ),
-                    ],
-                  ] else
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        color: AppColors.canvas,
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(color: AppColors.line),
-                      ),
-                      child: Row(
-                        children: [
-                          const SoftIconBox(
-                            icon: Icons.account_circle_outlined,
-                            color: AppColors.primary,
-                            size: 42,
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  'Google shortcut',
-                                  style: TextStyle(
-                                    color: AppColors.ink,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  'Use this only if the customer prefers Google. Email sign in works with Outlook, Yahoo, business email, and Gmail.',
-                                  style: Theme.of(context).textTheme.bodyMedium,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  const SizedBox(height: 16),
-                  FilledButton.icon(
-                    onPressed: isSubmitting
-                        ? null
-                        : () async {
-                            final name = nameController.text.trim();
-                            final email = emailController.text.trim();
-                            if (name.isEmpty || (useEmail && email.isEmpty)) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text('Enter name and email address'),
-                                ),
-                              );
-                              return;
-                            }
-                            final appState = AppStateScope.read(context);
-                            setSheetState(() => isSubmitting = true);
-                            try {
-                              if (useEmail) {
-                                if (!linkSent) {
-                                  await appState.sendEmailSignInLink(
-                                    email: email,
-                                  );
-                                  if (!context.mounted) {
-                                    return;
-                                  }
-                                  setSheetState(() => linkSent = true);
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(
-                                      content: Text(
-                                        'Sign-in email sent. Paste the link here to continue.',
-                                      ),
-                                    ),
-                                  );
-                                  return;
-                                }
-                                await appState.loginCustomerWithEmail(
-                                  name: name,
-                                  email: email,
-                                  emailLink: emailLinkController.text,
-                                );
-                              } else {
-                                await appState.loginCustomerWithGmail(
-                                  name: name,
-                                  email: email,
-                                );
-                              }
-                              if (sheetContext.mounted) {
-                                Navigator.pop(sheetContext, true);
-                              }
-                            } catch (error) {
-                              if (context.mounted) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text('Login failed: $error'),
-                                  ),
-                                );
-                              }
-                            } finally {
-                              if (context.mounted) {
-                                setSheetState(() => isSubmitting = false);
-                              }
-                            }
-                          },
-                    icon: isSubmitting
-                        ? const SizedBox(
-                            height: 18,
-                            width: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : Icon(
-                            useEmail
-                                ? Icons.mark_email_unread_outlined
-                                : Icons.account_circle_outlined,
-                          ),
-                    label: Text(
-                      useEmail
-                          ? (linkSent
-                                ? 'Sign in with email link'
-                                : 'Email me a sign-in link')
-                          : 'Continue with Google',
-                    ),
+                  const SizedBox(height: 8),
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: StatusChip(status: BookingStatus.pending),
                   ),
                 ],
               ),
-            );
-          },
-        );
-      },
+            ),
+            const SizedBox(height: 20),
+            SizedBox(
+              height: 52,
+              child: FilledButton(
+                onPressed: onDone,
+                style: FilledButton.styleFrom(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                child: const Text('Done'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Center(
+              child: TextButton(
+                onPressed: onMyBookings,
+                style: TextButton.styleFrom(
+                  foregroundColor: AppColors.primaryDark,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                    decoration: TextDecoration.underline,
+                    decorationStyle: TextDecorationStyle.dotted,
+                    decorationThickness: 2,
+                  ),
+                ),
+                child: const Text('My bookings'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SuccessDetailRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool isStrong;
+
+  const _SuccessDetailRow({
+    required this.icon,
+    required this.label,
+    this.isStrong = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: AppColors.primary, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: AppColors.ink,
+                fontWeight: isStrong ? FontWeight.w900 : FontWeight.w700,
+                height: 1.25,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

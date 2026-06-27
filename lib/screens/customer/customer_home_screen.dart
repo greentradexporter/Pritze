@@ -12,6 +12,7 @@ import '../../widgets/service_icon.dart';
 import '../../widgets/trimtime_logo.dart';
 import 'salon_booking_screen.dart';
 import 'salon_detail_screen.dart';
+import 'my_bookings_screen.dart';
 
 class CustomerHomeScreen extends StatefulWidget {
   const CustomerHomeScreen({super.key});
@@ -248,7 +249,17 @@ class _BrandHeader extends StatelessWidget {
             ],
           ),
         ),
-        AccountOverflowMenu(role: UserRole.customer, canLogout: canLogout),
+        AccountOverflowMenu(
+          role: UserRole.customer,
+          canLogout: canLogout,
+          onNotificationOpened: (destination) {
+            if (destination == AppNotificationDestination.bookings) {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
+              );
+            }
+          },
+        ),
       ],
     );
   }
@@ -619,7 +630,7 @@ class _SalonCard extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         SalonLogo(
-                          logoUrl: salon.logoUrl,
+                          logoUrl: salon.coverImageUrl,
                           color: accent,
                           size: 46,
                         ),

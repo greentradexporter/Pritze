@@ -53,15 +53,22 @@ class UrlLauncherUtils {
     );
   }
 
-  static Future<void> openGoogleMaps(
+  static Future<void> openDirectionsLink(
     BuildContext context,
-    String address,
+    String directionsUrl,
   ) async {
-    final encodedAddress = Uri.encodeComponent(address);
-    await launchAction(
-      context,
-      'https://www.google.com/maps/search/?api=1&query=$encodedAddress',
-      'Could not open Google Maps.',
-    );
+    final trimmed = directionsUrl.trim();
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null ||
+        !uri.hasScheme ||
+        (uri.scheme != 'https' && uri.scheme != 'http')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Directions link has not been added by this salon.'),
+        ),
+      );
+      return;
+    }
+    await launchAction(context, trimmed, 'Could not open the directions link.');
   }
 }

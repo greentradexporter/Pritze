@@ -1,4 +1,17 @@
-enum BookingStatus { pending, confirmed, inProgress, completed, cancelled }
+enum BookingStatus {
+  pending,
+  confirmed,
+  inProgress,
+  completed,
+  cancelled,
+  rejected,
+}
+
+enum BarberBookingBucket { upcoming, active, history, cancelled }
+
+enum SalonBookingBucket { requests, upcoming, active, history, cancelled }
+
+enum CustomerBookingBucket { active, history, cancelled }
 
 extension BookingStatusLabel on BookingStatus {
   String get label {
@@ -13,11 +26,13 @@ extension BookingStatusLabel on BookingStatus {
         return 'Completed';
       case BookingStatus.cancelled:
         return 'Cancelled';
+      case BookingStatus.rejected:
+        return 'Rejected';
     }
   }
 }
 
-enum JoinRequestStatus { pending, approved, rejected }
+enum JoinRequestStatus { pending, approved, rejected, withdrawn }
 
 extension JoinRequestStatusLabel on JoinRequestStatus {
   String get label {
@@ -28,6 +43,8 @@ extension JoinRequestStatusLabel on JoinRequestStatus {
         return 'Approved';
       case JoinRequestStatus.rejected:
         return 'Rejected';
+      case JoinRequestStatus.withdrawn:
+        return 'Withdrawn';
     }
   }
 }
@@ -127,8 +144,10 @@ class Salon {
   final String name;
   final String ownerName;
   final String address;
+  final String directionsUrl;
   final String phone;
   final String logoUrl;
+  final List<String> photoUrls;
   final String distanceLabel;
   final double rating;
   final int reviewCount;
@@ -142,8 +161,10 @@ class Salon {
     required this.name,
     required this.ownerName,
     required this.address,
+    this.directionsUrl = '',
     required this.phone,
     required this.logoUrl,
+    this.photoUrls = const [],
     required this.distanceLabel,
     required this.rating,
     required this.reviewCount,
@@ -158,8 +179,10 @@ class Salon {
     String? name,
     String? ownerName,
     String? address,
+    String? directionsUrl,
     String? phone,
     String? logoUrl,
+    List<String>? photoUrls,
     String? distanceLabel,
     double? rating,
     int? reviewCount,
@@ -173,8 +196,10 @@ class Salon {
       name: name ?? this.name,
       ownerName: ownerName ?? this.ownerName,
       address: address ?? this.address,
+      directionsUrl: directionsUrl ?? this.directionsUrl,
       phone: phone ?? this.phone,
       logoUrl: logoUrl ?? this.logoUrl,
+      photoUrls: photoUrls ?? this.photoUrls,
       distanceLabel: distanceLabel ?? this.distanceLabel,
       rating: rating ?? this.rating,
       reviewCount: reviewCount ?? this.reviewCount,
@@ -183,6 +208,13 @@ class Salon {
       isOpen: isOpen ?? this.isOpen,
       services: services ?? this.services,
     );
+  }
+
+  String get coverImageUrl {
+    if (photoUrls.isNotEmpty) {
+      return photoUrls.first;
+    }
+    return logoUrl;
   }
 }
 

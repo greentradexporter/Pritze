@@ -47,3 +47,13 @@ app.*.map.json
 # Release app bundles
 *.aab
 *.apk
+
+# This app is distributed on Android; keep desktop generated scaffolding out.
+/linux/
+/macos/
+/windows/
+
+# Local signing/config secrets
+android/key.properties
+android/app/*.jks
+android/app/*.keystore

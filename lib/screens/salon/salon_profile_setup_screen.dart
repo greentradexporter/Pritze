@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../models/app_models.dart';
 import '../../models/service_catalog.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
-import '../../widgets/salon_logo.dart';
 import '../../widgets/service_icon.dart';
 
 class SalonProfileSetupScreen extends StatefulWidget {
@@ -21,12 +21,14 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
   final _salonNameController = TextEditingController();
   final _ownerNameController = TextEditingController();
   final _addressController = TextEditingController();
+  final _directionsUrlController = TextEditingController();
   final _phoneController = TextEditingController();
   final _openTimeController = TextEditingController();
   final _closeTimeController = TextEditingController();
-  String _logoUrl = '';
+  List<String> _photoUrls = [];
   bool _loaded = false;
   bool _isSaving = false;
+  bool _isUploadingPhotos = false;
 
   @override
   void didChangeDependencies() {
@@ -38,8 +40,9 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _salonNameController.text = salon.name;
     _ownerNameController.text = salon.ownerName;
     _addressController.text = salon.address;
+    _directionsUrlController.text = salon.directionsUrl;
     _phoneController.text = salon.phone;
-    _logoUrl = salon.logoUrl;
+    _photoUrls = [...salon.photoUrls];
     _openTimeController.text = salon.openTime;
     _closeTimeController.text = salon.closeTime;
     _loaded = true;
@@ -50,6 +53,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _salonNameController.dispose();
     _ownerNameController.dispose();
     _addressController.dispose();
+    _directionsUrlController.dispose();
     _phoneController.dispose();
     _openTimeController.dispose();
     _closeTimeController.dispose();
@@ -111,6 +115,20 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   ),
                   const SizedBox(height: 12),
                   TextFormField(
+                    controller: _directionsUrlController,
+                    keyboardType: TextInputType.url,
+                    autocorrect: false,
+                    decoration: const InputDecoration(
+                      labelText: 'Google Maps or directions link',
+                      hintText: 'https://maps.app.goo.gl/…',
+                      helperText:
+                          'Customers will open this link from Directions.',
+                      prefixIcon: Icon(Icons.map_outlined),
+                    ),
+                    validator: _optionalWebLink,
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
                     controller: _phoneController,
                     keyboardType: TextInputType.phone,
                     decoration: const InputDecoration(
@@ -118,31 +136,6 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                       prefixIcon: Icon(Icons.phone_outlined),
                     ),
                     validator: _required,
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      SalonLogo(logoUrl: _logoUrl, size: 58),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Shop logo',
-                              style: Theme.of(context).textTheme.titleMedium,
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              _logoUrl.isEmpty
-                                  ? 'Default shop mark shown to customers.'
-                                  : 'Bundled logo shown to customers.',
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
                   ),
                   const SizedBox(height: 12),
                   Row(
@@ -180,6 +173,21 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   ),
                 ],
               ),
+            ),
+            const SizedBox(height: 24),
+            SectionHeader(
+              title: 'Salon photos',
+              actionLabel: _photoUrls.isEmpty ? null : 'Add more',
+              onAction: _isUploadingPhotos
+                  ? null
+                  : () => _pickAndUploadSalonPhotos(context),
+            ),
+            const SizedBox(height: 10),
+            _SalonPhotoManager(
+              photoUrls: _photoUrls,
+              isUploading: _isUploadingPhotos,
+              onAddPhotos: () => _pickAndUploadSalonPhotos(context),
+              onRemovePhoto: (url) => _removeSalonPhoto(context, url),
             ),
             const SizedBox(height: 24),
             SectionHeader(
@@ -374,8 +382,10 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         name: _salonNameController.text,
         ownerName: _ownerNameController.text,
         address: _addressController.text,
+        directionsUrl: _directionsUrlController.text,
         phone: _phoneController.text,
-        logoUrl: _logoUrl,
+        logoUrl: '',
+        photoUrls: _photoUrls,
         openTime: _openTimeController.text,
         closeTime: _closeTimeController.text,
       );
@@ -397,6 +407,117 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         setState(() => _isSaving = false);
       }
     }
+  }
+
+  Future<void> _pickAndUploadSalonPhotos(BuildContext context) async {
+    if (!_formKey.currentState!.validate()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Save valid shop details before uploading photos.'),
+        ),
+      );
+      return;
+    }
+    setState(() => _isUploadingPhotos = true);
+    try {
+      final appState = AppStateScope.read(context);
+      await appState.updateOwnerSalon(
+        name: _salonNameController.text,
+        ownerName: _ownerNameController.text,
+        address: _addressController.text,
+        directionsUrl: _directionsUrlController.text,
+        phone: _phoneController.text,
+        logoUrl: '',
+        photoUrls: _photoUrls,
+        openTime: _openTimeController.text,
+        closeTime: _closeTimeController.text,
+      );
+      final photos = await ImagePicker().pickMultiImage(
+        imageQuality: 82,
+        maxWidth: 1600,
+        maxHeight: 1600,
+      );
+      if (photos.isEmpty) {
+        return;
+      }
+      final uploadedUrls = <String>[];
+      for (final photo in photos.take(8 - _photoUrls.length)) {
+        final bytes = await photo.readAsBytes();
+        final url = await appState.uploadOwnerSalonPhoto(
+          bytes: bytes,
+          fileName: photo.name,
+          contentType: photo.mimeType,
+        );
+        uploadedUrls.add(url);
+      }
+      if (!context.mounted) {
+        return;
+      }
+      setState(() {
+        _photoUrls = [...appState.ownerSalon.photoUrls];
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            uploadedUrls.length == 1
+                ? 'Salon photo uploaded'
+                : '${uploadedUrls.length} salon photos uploaded',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Photo upload failed: $error')));
+    } finally {
+      if (mounted) {
+        setState(() => _isUploadingPhotos = false);
+      }
+    }
+  }
+
+  Future<void> _removeSalonPhoto(BuildContext context, String photoUrl) async {
+    setState(() => _isUploadingPhotos = true);
+    try {
+      await AppStateScope.read(context).removeOwnerSalonPhoto(photoUrl);
+      if (!context.mounted) {
+        return;
+      }
+      setState(() {
+        _photoUrls = [...AppStateScope.read(context).ownerSalon.photoUrls];
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Salon photo removed')));
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not remove photo: $error')));
+    } finally {
+      if (mounted) {
+        setState(() => _isUploadingPhotos = false);
+      }
+    }
+  }
+
+  String? _optionalWebLink(String? value) {
+    final trimmed = value?.trim() ?? '';
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null ||
+        !uri.hasScheme ||
+        (uri.scheme != 'https' && uri.scheme != 'http')) {
+      return 'Paste a complete link beginning with https://';
+    }
+    return null;
   }
 
   void _showAddServiceDialog(BuildContext context) {
@@ -513,6 +634,205 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
           },
         );
       },
+    );
+  }
+}
+
+class _SalonPhotoManager extends StatelessWidget {
+  final List<String> photoUrls;
+  final bool isUploading;
+  final VoidCallback onAddPhotos;
+  final ValueChanged<String> onRemovePhoto;
+
+  const _SalonPhotoManager({
+    required this.photoUrls,
+    required this.isUploading,
+    required this.onAddPhotos,
+    required this.onRemovePhoto,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final remaining = 8 - photoUrls.length;
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SoftIconBox(
+                icon: Icons.add_photo_alternate_outlined,
+                color: AppColors.primary,
+                size: 46,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Show customers your shop',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      photoUrls.isEmpty
+                          ? 'Upload real salon photos. First photo becomes the cover image.'
+                          : '${photoUrls.length}/8 photos uploaded · first photo is the cover.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (photoUrls.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: AppColors.mint.withAlpha(55),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: AppColors.primary.withAlpha(35)),
+              ),
+              child: Column(
+                children: [
+                  Icon(
+                    Icons.photo_library_outlined,
+                    color: AppColors.primary.withAlpha(210),
+                    size: 34,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'No salon photos yet',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Add reception, chairs, interiors, or finished work photos.',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ],
+              ),
+            )
+          else
+            GridView.builder(
+              itemCount: photoUrls.length,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
+                childAspectRatio: 1.22,
+              ),
+              itemBuilder: (context, index) {
+                final url = photoUrls[index];
+                return _SalonPhotoTile(
+                  url: url,
+                  isCover: index == 0,
+                  canRemove: !isUploading,
+                  onRemove: () => onRemovePhoto(url),
+                );
+              },
+            ),
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: isUploading || remaining <= 0 ? null : onAddPhotos,
+              icon: isUploading
+                  ? const SizedBox(
+                      height: 18,
+                      width: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.cloud_upload_outlined),
+              label: Text(
+                isUploading
+                    ? 'Uploading photos...'
+                    : remaining <= 0
+                    ? 'Photo limit reached'
+                    : 'Upload salon photos',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SalonPhotoTile extends StatelessWidget {
+  final String url;
+  final bool isCover;
+  final bool canRemove;
+  final VoidCallback onRemove;
+
+  const _SalonPhotoTile({
+    required this.url,
+    required this.isCover,
+    required this.canRemove,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: Image.network(
+              url,
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) => Container(
+                color: AppColors.line,
+                child: const Icon(Icons.broken_image_outlined),
+              ),
+            ),
+          ),
+        ),
+        Positioned.fill(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: Colors.white.withAlpha(180), width: 2),
+              gradient: const LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Color(0x33000000), Color(0x00000000)],
+              ),
+            ),
+          ),
+        ),
+        if (isCover)
+          Positioned(
+            left: 8,
+            top: 8,
+            child: AppPill(
+              label: 'Cover',
+              color: AppColors.primary,
+              backgroundColor: Colors.white.withAlpha(232),
+            ),
+          ),
+        Positioned(
+          right: 6,
+          top: 6,
+          child: IconButton.filledTonal(
+            onPressed: canRemove ? onRemove : null,
+            icon: const Icon(Icons.close),
+            style: IconButton.styleFrom(
+              backgroundColor: Colors.white.withAlpha(238),
+              foregroundColor: AppColors.coral,
+              minimumSize: const Size(34, 34),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

@@ -1,10 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'screens/customer/customer_home_screen.dart';
 import 'services/firebase_bootstrap.dart';
 import 'state/app_state_scope.dart';
 import 'state/app_state.dart';
 import 'theme/app_theme.dart';
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -14,12 +18,16 @@ Future<void> main() async {
     runApp(FirebaseUnavailableApp(error: firebase.error));
     return;
   }
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
   runApp(
     AppStateProvider(
       createAppState: () => FirebaseAppState(
         firestore: firebase.firestore!,
+        functions: firebase.functions!,
         auth: firebase.auth!,
+        messaging: firebase.messaging!,
+        storage: firebase.storage!,
       ),
       child: const TrimtimeApp(),
     ),

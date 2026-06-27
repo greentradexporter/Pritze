@@ -1,0 +1,13 @@
+{
+  "name": "trimtime-functions",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.4.0",
+    "nodemailer": "^6.9.16"
+  }
+}

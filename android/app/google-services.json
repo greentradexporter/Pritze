@@ -30,6 +30,14 @@
           }
         },
         {
+          "client_id": "3474382418-h88q65hp634am4idp88c3ktkd1ffi68t.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.trimtime.app",
+            "certificate_hash": "37013ed20097290b14f6c69421753ff123f54b39"
+          }
+        },
+        {
           "client_id": "3474382418-g4avkshhj6tg4erhgul1r3m810j78rku.apps.googleusercontent.com",
           "client_type": 3
         }

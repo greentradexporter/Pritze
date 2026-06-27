@@ -41,6 +41,8 @@ class StatusChip extends StatelessWidget {
         return AppColors.success;
       case BookingStatus.cancelled:
         return AppColors.coral;
+      case BookingStatus.rejected:
+        return AppColors.coral;
     }
   }
 }

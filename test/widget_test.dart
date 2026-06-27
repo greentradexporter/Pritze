@@ -4,8 +4,11 @@ import 'package:nashik_salon_booking/main.dart';
 import 'package:nashik_salon_booking/models/app_models.dart';
 import 'package:nashik_salon_booking/models/service_catalog.dart';
 import 'package:nashik_salon_booking/screens/barber/barber_dashboard_screen.dart';
+import 'package:nashik_salon_booking/screens/customer/salon_detail_screen.dart';
+import 'package:nashik_salon_booking/screens/salon/salon_dashboard_screen.dart';
 import 'package:nashik_salon_booking/state/app_state.dart';
 import 'package:nashik_salon_booking/state/app_state_scope.dart';
+import 'package:nashik_salon_booking/widgets/account_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -37,6 +40,39 @@ void main() {
 
     expect(find.text('beard'), findsOneWidget);
     expect(find.text('Search results'), findsOneWidget);
+  });
+
+  testWidgets('salon detail offers direct barber picker without scrolling', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9888888801',
+      speciality: 'Haircut specialist',
+      experienceYears: 4,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [service.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonDetailScreen(salonId: state.ownerSalon.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pick service'), findsOneWidget);
+    expect(find.text('Pick barber'), findsOneWidget);
+    await tester.tap(find.text('Pick barber'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Choose your barber'), findsOneWidget);
+    expect(find.text('Ravi'), findsOneWidget);
   });
 
   testWidgets('barber speciality is chosen from a dropdown', (tester) async {
@@ -317,7 +353,6 @@ void main() {
       resumeSummary: 'Long-form treatments.',
       serviceIds: [service.id],
     );
-
     final slots = state.slotsForService(state.ownerSalon.id, service.id);
 
     expect(slots, isNotEmpty);
@@ -512,6 +547,7 @@ void main() {
       resumeSummary: 'Haircut specialist.',
       serviceIds: [service.id],
     );
+    final barber = state.barbersForSalon(state.ownerSalon.id).single;
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
     await state.loginCustomerWithEmail(
@@ -525,6 +561,250 @@ void main() {
     await state.removeOwnerService(service.id);
 
     expect(state.serviceRevenue(salonId)[service.id], service.price);
+    expect(state.totalCollection(salonId), service.price);
+    expect(state.barberTotalEarnings(barber.id), service.price);
+    expect(
+      state.barberDailyEarnings(barber.id, now: booking.start),
+      service.price,
+    );
+    expect(
+      state.barberMonthlyEarnings(barber.id, now: booking.start),
+      service.price,
+    );
+  });
+
+  testWidgets('barber has a connected earnings tab', (tester) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9888888865',
+      email: 'ravi@example.com',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircut specialist.',
+      serviceIds: [service.id],
+    );
+    final barber = state.barbersForSalon(state.ownerSalon.id).single;
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await state.loginCustomerWithEmail(
+      name: 'Customer',
+      email: 'earnings-customer@example.com',
+    );
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+    await state.updateBookingStatus(booking.id, BookingStatus.completed);
+    await state.signOutActiveUser();
+    await state.loginBarberWithEmail(name: 'Ravi', email: 'ravi@example.com');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: BarberDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(state.currentBarber?.id, barber.id);
+    expect(find.text('Appointments'), findsOneWidget);
+    expect(find.text('Earnings'), findsOneWidget);
+    await tester.tap(find.text('Earnings'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Total earnings'), findsOneWidget);
+    expect(find.text('Today'), findsOneWidget);
+    expect(find.text('This month'), findsOneWidget);
+    expect(find.text('₹${service.price}'), findsWidgets);
+  });
+
+  test('started cutting marks barber occupied until completion', () async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9888888867',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircut specialist.',
+      serviceIds: [service.id],
+    );
+    final barber = state.barbersForSalon(state.ownerSalon.id).single;
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await state.loginCustomerWithEmail(
+      name: 'Customer',
+      email: 'occupied@example.com',
+    );
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+
+    await state.updateBookingStatus(booking.id, BookingStatus.inProgress);
+    expect(state.currentBookingForBarber(barber.id)?.id, booking.id);
+
+    await state.updateBookingStatus(booking.id, BookingStatus.completed);
+    expect(state.currentBookingForBarber(barber.id), isNull);
+    expect(state.serviceRevenue(salonId)[service.id], service.price);
+  });
+
+  test('barber ledger classifies timed-out and rejected bookings', () async {
+    final state = AppState();
+    final now = DateTime(2030, 1, 2, 12);
+    final base = Booking(
+      id: 'ledger-booking',
+      salonId: 'salon',
+      serviceId: 'service',
+      barberId: 'barber',
+      customerName: 'Customer',
+      customerPhone: '9000000000',
+      start: now.add(const Duration(hours: 1)),
+      status: BookingStatus.pending,
+      createdAt: now,
+    );
+
+    expect(
+      state.barberBookingBucket(base, now: now),
+      BarberBookingBucket.upcoming,
+    );
+
+    final notAccepted = base.copyWith(
+      start: now.subtract(const Duration(minutes: 1)),
+    );
+    expect(
+      state.barberBookingBucket(notAccepted, now: now),
+      BarberBookingBucket.history,
+    );
+    expect(state.barberBookingOutcome(notAccepted, now: now), 'Not accepted');
+
+    final missed = base.copyWith(
+      start: now.subtract(const Duration(hours: 1)),
+      status: BookingStatus.confirmed,
+    );
+    expect(
+      state.barberBookingOutcome(missed, now: now),
+      'Missed · not completed',
+    );
+
+    final rejected = base.copyWith(status: BookingStatus.rejected);
+    expect(
+      state.barberBookingBucket(rejected, now: now),
+      BarberBookingBucket.cancelled,
+    );
+    expect(state.barberBookingOutcome(rejected, now: now), 'Rejected by salon');
+  });
+
+  test('owner booking desk separates requests, active, and history', () async {
+    final state = AppState();
+    final now = DateTime(2030, 1, 2, 12);
+    final base = Booking(
+      id: 'owner-booking',
+      salonId: 'salon',
+      serviceId: 'service',
+      barberId: 'barber',
+      customerName: 'Customer',
+      customerPhone: '9000000000',
+      start: now.add(const Duration(hours: 1)),
+      status: BookingStatus.pending,
+      createdAt: now,
+    );
+
+    expect(
+      state.salonBookingBucket(base, now: now),
+      SalonBookingBucket.requests,
+    );
+    expect(
+      state.salonBookingOutcome(base, now: now),
+      'Waiting for owner action',
+    );
+
+    final notAccepted = base.copyWith(
+      start: now.subtract(const Duration(minutes: 1)),
+    );
+    expect(
+      state.salonBookingBucket(notAccepted, now: now),
+      SalonBookingBucket.history,
+    );
+    expect(state.salonBookingOutcome(notAccepted, now: now), 'Not accepted');
+
+    final active = base.copyWith(
+      start: now.subtract(const Duration(minutes: 10)),
+      status: BookingStatus.confirmed,
+    );
+    expect(
+      state.salonBookingBucket(active, now: now),
+      SalonBookingBucket.active,
+    );
+
+    final missed = base.copyWith(
+      start: now.subtract(const Duration(hours: 1)),
+      status: BookingStatus.confirmed,
+    );
+    expect(state.salonBookingOutcome(missed, now: now), 'Missed · not started');
+
+    final rejected = base.copyWith(status: BookingStatus.rejected);
+    expect(
+      state.salonBookingBucket(rejected, now: now),
+      SalonBookingBucket.cancelled,
+    );
+  });
+
+  test('customer bookings separate active, history, and rejected outcomes', () {
+    final state = AppState();
+    final now = DateTime(2030, 1, 2, 12);
+    final base = Booking(
+      id: 'customer-booking',
+      salonId: 'salon',
+      serviceId: 'service',
+      barberId: 'barber',
+      customerName: 'Customer',
+      customerPhone: '9000000000',
+      start: now.add(const Duration(hours: 1)),
+      status: BookingStatus.pending,
+      createdAt: now,
+    );
+
+    expect(
+      state.customerBookingBucket(base, now: now),
+      CustomerBookingBucket.active,
+    );
+    expect(state.customerBookingOutcome(base, now: now), 'Waiting for salon');
+
+    final notAccepted = base.copyWith(
+      start: now.subtract(const Duration(minutes: 1)),
+    );
+    expect(
+      state.customerBookingBucket(notAccepted, now: now),
+      CustomerBookingBucket.history,
+    );
+    expect(
+      state.customerBookingOutcome(notAccepted, now: now),
+      'Not accepted by salon',
+    );
+
+    final missed = base.copyWith(
+      start: now.subtract(const Duration(hours: 1)),
+      status: BookingStatus.confirmed,
+    );
+    expect(
+      state.customerBookingBucket(missed, now: now),
+      CustomerBookingBucket.history,
+    );
+    expect(
+      state.customerBookingOutcome(missed, now: now),
+      'Missed · not completed',
+    );
+
+    final rejected = base.copyWith(status: BookingStatus.rejected);
+    expect(
+      state.customerBookingBucket(rejected, now: now),
+      CustomerBookingBucket.cancelled,
+    );
+    expect(
+      state.customerBookingOutcome(rejected, now: now),
+      'Rejected by salon',
+    );
   });
 
   test('barber speciality filters unrelated services', () {
@@ -606,7 +886,7 @@ void main() {
       name: 'Customer',
       email: 'customer@example.com',
     );
-    await state.createBooking(
+    final booking = await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
     await tester.pumpWidget(
@@ -614,12 +894,32 @@ void main() {
     );
 
     expect(find.byType(RefreshIndicator), findsOneWidget);
+    expect(unreadNotificationCount(state, UserRole.customer), 1);
     await tester.tap(find.byTooltip('Account menu'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Notifications'));
     await tester.pumpAndSettle();
 
     expect(find.text('Booking request sent'), findsOneWidget);
+    expect(unreadNotificationCount(state, UserRole.customer), 0);
+
+    await tester.tap(find.byTooltip('Delete notification'));
+    await tester.pumpAndSettle();
+    expect(find.text('No notifications yet'), findsOneWidget);
+    expect(notificationKeys(state, UserRole.customer), isEmpty);
+
+    await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
+    await tester.pumpAndSettle();
+    expect(find.text('Booking confirmed'), findsOneWidget);
+    expect(unreadNotificationCount(state, UserRole.customer), 1);
+  });
+
+  test('Google login derives a name when no name is entered', () async {
+    final state = AppState();
+
+    final customer = await state.loginCustomerWithGmail(name: '', email: '');
+
+    expect(customer.name, 'Google user');
   });
 
   testWidgets('barber notifications show join request updates', (tester) async {
@@ -650,6 +950,143 @@ void main() {
     expect(find.text('Join request pending'), findsOneWidget);
   });
 
+  testWidgets('barber Google login asks for no profile details upfront', (
+    tester,
+  ) async {
+    final state = AppState();
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: BarberDashboardScreen()),
+      ),
+    );
+
+    expect(find.text('Phone number'), findsOneWidget);
+    expect(find.text('Barber name'), findsNothing);
+    expect(find.text('Phone number for shop records'), findsNothing);
+
+    await tester.tap(find.text('Gmail'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Barber name'), findsNothing);
+    expect(find.text('Phone number for shop records'), findsNothing);
+    expect(find.text('Email address'), findsNothing);
+    expect(find.text('Nothing else to fill in'), findsOneWidget);
+    expect(find.text('Continue with Gmail'), findsOneWidget);
+  });
+
+  testWidgets('owner email login asks only for email', (tester) async {
+    final state = AppState();
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Phone number'), findsOneWidget);
+    await tester.tap(find.text('Email'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Email address'), findsOneWidget);
+    expect(find.text('Owner name'), findsNothing);
+    expect(find.text('Send email OTP'), findsOneWidget);
+  });
+
+  test('phone OTP login is available for every role in app state', () async {
+    final state = AppState();
+    final verificationId = await state.sendPhoneOtp(phone: '9876543210');
+    expect(verificationId, contains('+919876543210'));
+
+    final customer = await state.loginCustomerWithPhone(
+      phone: '9876543210',
+      verificationId: verificationId,
+      smsCode: '123456',
+    );
+    expect(customer.provider, LoginProvider.phone);
+
+    final owner = await state.loginOwnerWithPhone(
+      phone: '9876543211',
+      verificationId: verificationId,
+      smsCode: '123456',
+    );
+    expect(owner.provider, LoginProvider.phone);
+
+    final barber = await state.loginBarberWithPhone(
+      phone: '9876543212',
+      verificationId: verificationId,
+      smsCode: '123456',
+    );
+    expect(barber.provider, LoginProvider.phone);
+  });
+
+  testWidgets('barber Google account carries Gmail into join form', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService();
+    await state.loginBarberWithGmail(
+      name: 'Aman Barber',
+      email: 'aman@gmail.com',
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: BarberDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(state.barberAccount?.contact, 'aman@gmail.com');
+    expect(find.text('aman@gmail.com'), findsOneWidget);
+    final emailField = find.widgetWithText(TextFormField, 'Email address');
+    expect(emailField, findsOneWidget);
+    final editableEmail = tester.widget<EditableText>(
+      find.descendant(of: emailField, matching: find.byType(EditableText)),
+    );
+    expect(editableEmail.readOnly, isTrue);
+  });
+
+  testWidgets('barber can withdraw a pending salon request', (tester) async {
+    final state = await _stateWithSalonService();
+    await state.loginBarberWithEmail(
+      name: 'Aman',
+      email: 'aman@example.com',
+      phone: '9876543210',
+    );
+    await state.submitJoinRequest(
+      salonId: state.salons.single.id,
+      barberName: 'Aman',
+      barberPhone: '9876543210',
+      barberEmail: 'aman@example.com',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [state.salons.single.services.single.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: BarberDashboardScreen()),
+      ),
+    );
+    expect(find.text('Withdraw request'), findsOneWidget);
+
+    await tester.tap(find.text('Withdraw request'));
+    await tester.pumpAndSettle();
+    expect(find.text('Withdraw request?'), findsOneWidget);
+
+    await tester.tap(find.text('Yes, withdraw request'));
+    await tester.pumpAndSettle();
+
+    expect(state.currentJoinRequest?.status, JoinRequestStatus.withdrawn);
+    expect(state.pendingJoinRequests, isEmpty);
+    expect(find.text('Previous request withdrawn'), findsOneWidget);
+    expect(find.text('Send request'), findsOneWidget);
+  });
+
   test('haircut and waxing assets map to the correct supplied artwork', () {
     expect(
       serviceIconAssetForCategory('Haircut & Styling'),
@@ -669,10 +1106,12 @@ Future<AppState> _stateWithSalonService({bool signOut = true}) async {
     name: 'Pritze Cuts',
     ownerName: 'Owner',
     address: 'Nashik Road',
+    directionsUrl: 'https://maps.app.goo.gl/example',
     phone: '9888888888',
     openTime: '9:00 AM',
     closeTime: '8:00 PM',
   );
+  expect(state.ownerSalon.directionsUrl, 'https://maps.app.goo.gl/example');
   await state.addOwnerService(
     name: 'Haircut',
     category: 'Hair',

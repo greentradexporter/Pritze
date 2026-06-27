@@ -10,6 +10,22 @@ service cloud.firestore {
       return signedIn() && request.auth.uid == userId;
     }
 
+    function ownerSalonId(salonId) {
+      return signedIn() && salonId == 'salon-' + request.auth.uid;
+    }
+
+    function salonHasOwner() {
+      return resource.data.keys().hasAny(['ownerUid']) &&
+        resource.data.ownerUid is string &&
+        resource.data.ownerUid.size() > 0;
+    }
+
+    function ownerClaimsOwnSalon(salonId) {
+      return ownerSalonId(salonId) &&
+        !salonHasOwner() &&
+        request.resource.data.ownerUid == request.auth.uid;
+    }
+
     function barberClaimsOwnProfile() {
       return signedIn() &&
         resource.data.uid == null &&
@@ -29,9 +45,11 @@ service cloud.firestore {
 
     match /salons/{salonId} {
       allow read: if true;
-      allow create: if signedIn();
+      allow create: if signedIn() &&
+        request.resource.data.ownerUid == request.auth.uid;
       allow update, delete: if signedIn() &&
-        resource.data.ownerUid == request.auth.uid;
+        (resource.data.ownerUid == request.auth.uid ||
+         ownerClaimsOwnSalon(salonId));
     }
 
     match /barbers/{barberId} {
