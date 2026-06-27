@@ -1097,6 +1097,40 @@ void main() {
       'assets/service_icons/waxing.jpeg',
     );
   });
+
+  test(
+    'salon open badge follows operating hours, not only owner switch',
+    () async {
+      final state = await _stateWithSalonService(signOut: false);
+      await state.addOwnerBarber(
+        name: 'Aman',
+        phone: '9876543210',
+        email: 'aman@example.com',
+        speciality: 'Hair',
+        experienceYears: 3,
+        resumeSummary: 'Experienced barber.',
+        serviceIds: state.ownerSalon.services
+            .map((service) => service.id)
+            .toList(),
+      );
+
+      expect(
+        state.isSalonCurrentlyOpen(
+          state.ownerSalon.id,
+          now: DateTime(2026, 6, 27, 10),
+        ),
+        isTrue,
+      );
+      expect(
+        state.isSalonCurrentlyOpen(
+          state.ownerSalon.id,
+          now: DateTime(2026, 6, 27, 21),
+        ),
+        isFalse,
+      );
+      expect(state.isSalonBookable(state.ownerSalon.id), isTrue);
+    },
+  );
 }
 
 Future<AppState> _stateWithSalonService({bool signOut = true}) async {

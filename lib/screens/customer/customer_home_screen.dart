@@ -36,7 +36,9 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final bookableSalons = appState.bookableSalons;
-    final openSalons = bookableSalons.where((salon) => salon.isOpen).length;
+    final openSalons = bookableSalons
+        .where((salon) => appState.isSalonCurrentlyOpen(salon.id))
+        .length;
     final availableSlots = bookableSalons.fold<int>(
       0,
       (sum, salon) => sum + appState.availableSlotCountForSalon(salon.id),
@@ -155,7 +157,9 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
         .toList();
 
     salons.sort((a, b) {
-      final openCompare = (b.isOpen ? 1 : 0).compareTo(a.isOpen ? 1 : 0);
+      final aOpen = appState.isSalonCurrentlyOpen(a.id);
+      final bOpen = appState.isSalonCurrentlyOpen(b.id);
+      final openCompare = (bOpen ? 1 : 0).compareTo(aOpen ? 1 : 0);
       if (openCompare != 0) {
         return openCompare;
       }
@@ -589,6 +593,7 @@ class _SalonCard extends StatelessWidget {
         .map((s) => s.name)
         .join(', ');
     final barbers = appState.barbersForSalon(salon.id);
+    final isCurrentlyOpen = appState.isSalonCurrentlyOpen(salon.id);
     final nextSlot = _earliestSlotForServices(
       appState,
       salon.id,
@@ -614,7 +619,7 @@ class _SalonCard extends StatelessWidget {
             Container(
               width: 5,
               decoration: BoxDecoration(
-                color: salon.isOpen ? accent : AppColors.muted,
+                color: isCurrentlyOpen ? accent : AppColors.muted,
                 borderRadius: const BorderRadius.horizontal(
                   left: Radius.circular(18),
                 ),
@@ -660,8 +665,8 @@ class _SalonCard extends StatelessWidget {
                         ),
                         const SizedBox(width: 8),
                         _MiniStatus(
-                          label: salon.isOpen ? 'Open' : 'Closed',
-                          color: salon.isOpen ? accent : AppColors.muted,
+                          label: isCurrentlyOpen ? 'Open' : 'Closed',
+                          color: isCurrentlyOpen ? accent : AppColors.muted,
                         ),
                       ],
                     ),

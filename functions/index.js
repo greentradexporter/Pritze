@@ -32,7 +32,7 @@ exports.sendBookingPush = onCall({invoker: "public"}, async (request) => {
     .collection("bookings")
     .doc(bookingId)
     .get();
-  const booking = snapshot.data();
+  const booking = await hydrateBookingRecipients(snapshot.data());
   if (!booking) {
     throw new HttpsError("not-found", "Booking not found.");
   }
@@ -342,6 +342,34 @@ function bookingStatusRecipients(before, after) {
     return [after.customerUid, after.ownerUid, after.barberUid];
   }
   return [after.customerUid, after.ownerUid, after.barberUid];
+}
+
+async function hydrateBookingRecipients(booking) {
+  if (!booking) {
+    return null;
+  }
+  const hydrated = {...booking};
+  if (!hydrated.ownerUid && hydrated.salonId) {
+    const salonSnapshot = await admin.firestore()
+      .collection("salons")
+      .doc(hydrated.salonId)
+      .get();
+    const salon = salonSnapshot.data() || {};
+    if (typeof salon.ownerUid === "string" && salon.ownerUid.trim()) {
+      hydrated.ownerUid = salon.ownerUid.trim();
+    }
+  }
+  if (!hydrated.barberUid && hydrated.barberId) {
+    const barberSnapshot = await admin.firestore()
+      .collection("barbers")
+      .doc(hydrated.barberId)
+      .get();
+    const barber = barberSnapshot.data() || {};
+    if (typeof barber.uid === "string" && barber.uid.trim()) {
+      hydrated.barberUid = barber.uid.trim();
+    }
+  }
+  return hydrated;
 }
 
 function bookingNotificationData(bookingId, booking) {

@@ -476,7 +476,10 @@ class _DetailHero extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent = salon.isOpen ? AppColors.primary : AppColors.muted;
+    final isCurrentlyOpen = AppStateScope.watch(
+      context,
+    ).isSalonCurrentlyOpen(salon.id);
+    final accent = isCurrentlyOpen ? AppColors.primary : AppColors.muted;
 
     return Container(
       color: AppColors.canvas,
@@ -531,7 +534,7 @@ class _DetailHero extends StatelessWidget {
                                 ),
                                 const SizedBox(width: 8),
                                 AppPill(
-                                  label: salon.isOpen ? 'Open' : 'Closed',
+                                  label: isCurrentlyOpen ? 'Open' : 'Closed',
                                   color: accent,
                                   backgroundColor: accent.withAlpha(16),
                                 ),

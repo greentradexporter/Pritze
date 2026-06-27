@@ -282,6 +282,30 @@ class AppState extends ChangeNotifier {
     ).any((barber) => barber.serviceIds.any(serviceIds.contains));
   }
 
+  bool isSalonCurrentlyOpen(String salonId, {DateTime? now}) {
+    final salon = getSalon(salonId);
+    if (salon == null) {
+      return false;
+    }
+    return isSalonCurrentlyOpenByClock(salon, now: now);
+  }
+
+  bool isSalonCurrentlyOpenByClock(Salon salon, {DateTime? now}) {
+    if (!salon.isOpen) {
+      return false;
+    }
+    final openMinutes = _parseClockMinutes(salon.openTime);
+    final closeMinutes = _parseClockMinutes(salon.closeTime);
+    if (openMinutes == null ||
+        closeMinutes == null ||
+        closeMinutes <= openMinutes) {
+      return false;
+    }
+    final reference = now ?? DateTime.now();
+    final currentMinutes = reference.hour * 60 + reference.minute;
+    return currentMinutes >= openMinutes && currentMinutes < closeMinutes;
+  }
+
   List<Booking> bookingsForSalon(String salonId) {
     return _bookings.where((booking) => booking.salonId == salonId).toList()
       ..sort((a, b) => b.start.compareTo(a.start));
