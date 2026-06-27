@@ -914,6 +914,48 @@ void main() {
     expect(unreadNotificationCount(state, UserRole.customer), 1);
   });
 
+  testWidgets('owner notifications show customer booking requests', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9898989898',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.loginCustomerWithEmail(
+      name: 'Customer',
+      email: 'customer@example.com',
+    );
+    await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+    await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
+
+    expect(unreadNotificationCount(state, UserRole.owner), 1);
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Account menu'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Notifications'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('New booking request'), findsOneWidget);
+    expect(find.text('Booking request sent'), findsNothing);
+    expect(unreadNotificationCount(state, UserRole.owner), 0);
+  });
+
   test('Google login derives a name when no name is entered', () async {
     final state = AppState();
 

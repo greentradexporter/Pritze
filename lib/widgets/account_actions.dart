@@ -136,6 +136,8 @@ List<String> notificationKeys(AppState state, UserRole role) {
           _bookingNotificationKey(booking),
     ],
     UserRole.owner => [
+      for (final booking in state.bookingsForSalon(state.ownerSalonId))
+        _bookingNotificationKey(booking),
       for (final request in state.pendingJoinRequests)
         _joinNotificationKey(request),
     ],
@@ -260,6 +262,16 @@ class _NotificationSheet extends StatelessWidget {
       ];
     }
     return [
+      for (final booking in state.bookingsForSalon(state.ownerSalonId).take(20))
+        if (!state.hasDismissedNotification(
+          role,
+          _bookingNotificationKey(booking),
+        ))
+          _BookingNotification(
+            booking: booking,
+            role: role,
+            onOpen: () => _open(AppNotificationDestination.bookings),
+          ),
       for (final request in state.pendingJoinRequests.take(20))
         if (!state.hasDismissedNotification(
           role,
@@ -316,7 +328,7 @@ class _BookingNotification extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    _bookingTitle(booking.status),
+                    _bookingTitle(booking.status, role),
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                   const SizedBox(height: 4),
@@ -342,8 +354,9 @@ class _BookingNotification extends StatelessWidget {
     );
   }
 
-  String _bookingTitle(BookingStatus status) => switch (status) {
-    BookingStatus.pending => 'Booking request sent',
+  String _bookingTitle(BookingStatus status, UserRole role) => switch (status) {
+    BookingStatus.pending =>
+      role == UserRole.owner ? 'New booking request' : 'Booking request sent',
     BookingStatus.confirmed => 'Booking confirmed',
     BookingStatus.inProgress => 'Service started',
     BookingStatus.completed => 'Visit completed',

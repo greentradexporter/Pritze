@@ -746,10 +746,11 @@ class AppState extends ChangeNotifier {
     required String name,
     required String email,
   }) async {
+    final contact = email.trim();
     final account = UserAccount(
-      id: 'owner-${_accountCounter++}',
+      id: _stableAccountId(UserRole.owner, contact),
       name: name.trim().isEmpty ? 'Google user' : name.trim(),
-      contact: email.trim(),
+      contact: contact,
       provider: LoginProvider.google,
     );
     _activateRole(UserRole.owner, account);
@@ -761,10 +762,11 @@ class AppState extends ChangeNotifier {
     required String email,
     String? emailLink,
   }) async {
+    final contact = email.trim();
     final account = UserAccount(
-      id: 'owner-${_accountCounter++}',
+      id: _stableAccountId(UserRole.owner, contact),
       name: name.trim(),
-      contact: email.trim(),
+      contact: contact,
       provider: LoginProvider.email,
     );
     _activateRole(UserRole.owner, account);
@@ -776,10 +778,11 @@ class AppState extends ChangeNotifier {
     required String verificationId,
     required String smsCode,
   }) async {
+    final contact = normalizePhone(phone);
     final account = UserAccount(
-      id: 'owner-${_accountCounter++}',
+      id: _stableAccountId(UserRole.owner, contact),
       name: 'Phone user',
-      contact: normalizePhone(phone),
+      contact: contact,
       provider: LoginProvider.phone,
     );
     _activateRole(UserRole.owner, account);
@@ -1359,6 +1362,18 @@ class AppState extends ChangeNotifier {
     unawaited(_persistActiveRole());
     unawaited(_restoreNotificationPreferences(role));
     notifyListeners();
+  }
+
+  String _stableAccountId(UserRole role, String contact) {
+    final safeContact = contact
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+        .replaceAll(RegExp(r'^-+|-+$'), '');
+    if (safeContact.isEmpty) {
+      return '${role.name}-${_accountCounter++}';
+    }
+    return '${role.name}-$safeContact';
   }
 
   Future<void> _restoreNotificationPreferences(UserRole role) async {
