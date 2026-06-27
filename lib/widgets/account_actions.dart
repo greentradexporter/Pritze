@@ -354,15 +354,27 @@ class _BookingNotification extends StatelessWidget {
     );
   }
 
-  String _bookingTitle(BookingStatus status, UserRole role) => switch (status) {
-    BookingStatus.pending =>
-      role == UserRole.owner ? 'New booking request' : 'Booking request sent',
-    BookingStatus.confirmed => 'Booking confirmed',
-    BookingStatus.inProgress => 'Service started',
-    BookingStatus.completed => 'Visit completed',
-    BookingStatus.cancelled => 'Booking cancelled',
-    BookingStatus.rejected => 'Booking rejected',
-  };
+  String _bookingTitle(BookingStatus status, UserRole role) {
+    if (role == UserRole.barber) {
+      return switch (status) {
+        BookingStatus.pending => 'You have a new booking request',
+        BookingStatus.confirmed => 'You are booked for this time',
+        BookingStatus.inProgress => 'Service started',
+        BookingStatus.completed => 'Booking completed',
+        BookingStatus.cancelled => 'Your booking was cancelled',
+        BookingStatus.rejected => 'Booking was rejected',
+      };
+    }
+    return switch (status) {
+      BookingStatus.pending =>
+        role == UserRole.owner ? 'New booking request' : 'Booking request sent',
+      BookingStatus.confirmed => 'Booking confirmed',
+      BookingStatus.inProgress => 'Service started',
+      BookingStatus.completed => 'Visit completed',
+      BookingStatus.cancelled => 'Booking cancelled',
+      BookingStatus.rejected => 'Booking rejected',
+    };
+  }
 }
 
 class _JoinNotification extends StatelessWidget {

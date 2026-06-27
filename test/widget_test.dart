@@ -1009,9 +1009,10 @@ void main() {
       name: 'Customer',
       email: 'customer@example.com',
     );
-    await state.createBooking(
+    final booking = await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
+    await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
     await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
 
     expect(unreadNotificationCount(state, UserRole.barber), 2);
@@ -1028,8 +1029,14 @@ void main() {
     await tester.tap(find.text('Notifications'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Booking request sent'), findsOneWidget);
+    expect(find.text('You are booked for this time'), findsOneWidget);
     expect(unreadNotificationCount(state, UserRole.barber), 0);
+
+    await state.updateBookingStatus(booking.id, BookingStatus.cancelled);
+    await tester.pumpAndSettle();
+    expect(unreadNotificationCount(state, UserRole.barber), 1);
+
+    expect(find.text('Your booking was cancelled'), findsOneWidget);
   });
 
   testWidgets('barber Google login asks for no profile details upfront', (
