@@ -992,6 +992,46 @@ void main() {
     expect(find.text('Join request pending'), findsOneWidget);
   });
 
+  testWidgets('barber notifications show assigned bookings', (tester) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Aman',
+      phone: '9876543210',
+      email: 'aman@example.com',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.loginCustomerWithEmail(
+      name: 'Customer',
+      email: 'customer@example.com',
+    );
+    await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+    await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
+
+    expect(unreadNotificationCount(state, UserRole.barber), 2);
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: BarberDashboardScreen()),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Account menu'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Notifications'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Booking request sent'), findsOneWidget);
+    expect(unreadNotificationCount(state, UserRole.barber), 0);
+  });
+
   testWidgets('barber Google login asks for no profile details upfront', (
     tester,
   ) async {
