@@ -41,7 +41,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _ownerNameController.text = salon.ownerName;
     _addressController.text = salon.address;
     _directionsUrlController.text = salon.directionsUrl;
-    _phoneController.text = salon.phone;
+    _phoneController.text = salon.phone.contains('@') ? '' : salon.phone;
     _photoUrls = [...salon.photoUrls];
     _openTimeController.text = salon.openTime;
     _closeTimeController.text = salon.closeTime;
@@ -143,9 +143,15 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                       Expanded(
                         child: TextFormField(
                           controller: _openTimeController,
+                          readOnly: true,
+                          onTap: () => _pickSalonTime(
+                            controller: _openTimeController,
+                            fallback: const TimeOfDay(hour: 9, minute: 0),
+                          ),
                           decoration: const InputDecoration(
                             labelText: 'Opening',
-                            prefixIcon: Icon(Icons.schedule),
+                            prefixIcon: Icon(Icons.wb_sunny_outlined),
+                            suffixIcon: Icon(Icons.keyboard_arrow_down),
                           ),
                           validator: _time,
                         ),
@@ -154,11 +160,17 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                       Expanded(
                         child: TextFormField(
                           controller: _closeTimeController,
+                          readOnly: true,
+                          onTap: () => _pickSalonTime(
+                            controller: _closeTimeController,
+                            fallback: const TimeOfDay(hour: 20, minute: 0),
+                          ),
                           decoration: const InputDecoration(
                             labelText: 'Closing',
-                            prefixIcon: Icon(Icons.schedule),
+                            prefixIcon: Icon(Icons.nights_stay_outlined),
+                            suffixIcon: Icon(Icons.keyboard_arrow_down),
                           ),
-                          validator: _time,
+                          validator: _closingTime,
                         ),
                       ),
                     ],
@@ -207,7 +219,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                       'Choose and import only the service categories offered by this shop.',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: AppColors.ink,
-                        fontWeight: FontWeight.w800,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ),
@@ -372,6 +384,72 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     return null;
   }
 
+  String? _closingTime(String? value) {
+    final error = _time(value);
+    if (error != null) {
+      return error;
+    }
+    final opening = _minutesForTime(_openTimeController.text);
+    final closing = _minutesForTime(value!);
+    if (opening != null && closing != null && closing <= opening) {
+      return 'Must be after opening';
+    }
+    return null;
+  }
+
+  Future<void> _pickSalonTime({
+    required TextEditingController controller,
+    required TimeOfDay fallback,
+  }) async {
+    final selected = await showTimePicker(
+      context: context,
+      initialTime: _timeOfDay(controller.text) ?? fallback,
+      helpText: controller == _openTimeController
+          ? 'SELECT OPENING TIME'
+          : 'SELECT CLOSING TIME',
+    );
+    if (selected == null || !mounted) {
+      return;
+    }
+    setState(() => controller.text = selected.format(context));
+  }
+
+  TimeOfDay? _timeOfDay(String value) {
+    final minutes = _minutesForTime(value);
+    return minutes == null
+        ? null
+        : TimeOfDay(hour: minutes ~/ 60, minute: minutes % 60);
+  }
+
+  int? _minutesForTime(String value) {
+    final normalized = value.trim().toUpperCase().replaceAll('.', '');
+    final match = RegExp(
+      r'^(\d{1,2})(?::(\d{2}))?\s*([AP]M)?$',
+    ).firstMatch(normalized);
+    if (match == null) {
+      return null;
+    }
+    var hour = int.tryParse(match.group(1) ?? '');
+    final minute = int.tryParse(match.group(2) ?? '0');
+    final period = match.group(3);
+    if (hour == null || minute == null || minute > 59) {
+      return null;
+    }
+    if (period != null) {
+      if (hour < 1 || hour > 12) {
+        return null;
+      }
+      if (period == 'AM') {
+        hour = hour == 12 ? 0 : hour;
+      } else if (hour != 12) {
+        hour += 12;
+      }
+    } else if (hour > 23) {
+      return null;
+    }
+    return hour * 60 + minute;
+  }
+
   Future<void> _saveProfile(BuildContext context) async {
     if (!_formKey.currentState!.validate()) {
       return;
@@ -525,6 +603,8 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     final priceController = TextEditingController();
     final durationController = TextEditingController(text: '30');
     var category = 'Hair';
+    var isAvailable = true;
+    var instantBookingEnabled = true;
     var isSaving = false;
     const categories = serviceCategoryLabels;
 
@@ -565,7 +645,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                     TextField(
                       controller: priceController,
                       keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(labelText: 'Price'),
+                      decoration: const InputDecoration(labelText: 'Price (₹)'),
                     ),
                     const SizedBox(height: 10),
                     TextField(
@@ -574,6 +654,33 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                       decoration: const InputDecoration(
                         labelText: 'Duration minutes',
                       ),
+                    ),
+                    const SizedBox(height: 6),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Available to customers'),
+                      subtitle: const Text(
+                        'Show this service and allow scheduled bookings.',
+                      ),
+                      value: isAvailable,
+                      onChanged: (value) {
+                        setDialogState(() => isAvailable = value);
+                      },
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Allow instant booking'),
+                      subtitle: const Text(
+                        'Customers can request this service immediately.',
+                      ),
+                      value: instantBookingEnabled,
+                      onChanged: isAvailable
+                          ? (value) {
+                              setDialogState(
+                                () => instantBookingEnabled = value,
+                              );
+                            }
+                          : null,
                     ),
                   ],
                 ),
@@ -609,6 +716,8 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                               category: category,
                               price: price,
                               durationMinutes: duration,
+                              isAvailable: isAvailable,
+                              instantBookingEnabled: instantBookingEnabled,
                             );
                             if (context.mounted) {
                               Navigator.pop(context);
@@ -693,7 +802,7 @@ class _SalonPhotoManager extends StatelessWidget {
               padding: const EdgeInsets.all(18),
               decoration: BoxDecoration(
                 color: AppColors.mint.withAlpha(55),
-                borderRadius: BorderRadius.circular(16),
+                borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: AppColors.primary.withAlpha(35)),
               ),
               child: Column(
@@ -784,7 +893,7 @@ class _SalonPhotoTile extends StatelessWidget {
       children: [
         Positioned.fill(
           child: ClipRRect(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(8),
             child: Image.network(
               url,
               fit: BoxFit.cover,
@@ -798,13 +907,8 @@ class _SalonPhotoTile extends StatelessWidget {
         Positioned.fill(
           child: DecoratedBox(
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(8),
               border: Border.all(color: Colors.white.withAlpha(180), width: 2),
-              gradient: const LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Color(0x33000000), Color(0x00000000)],
-              ),
             ),
           ),
         ),
@@ -866,6 +970,33 @@ class _ServiceCard extends StatelessWidget {
                   '${service.category} - ${service.durationMinutes} min',
                   style: Theme.of(context).textTheme.bodyMedium,
                 ),
+                const SizedBox(height: 7),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    AppPill(
+                      icon: service.isAvailable
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                      label: service.isAvailable ? 'Available' : 'Hidden',
+                      color: service.isAvailable
+                          ? AppColors.success
+                          : AppColors.muted,
+                    ),
+                    AppPill(
+                      icon: Icons.bolt_outlined,
+                      label:
+                          service.isAvailable && service.instantBookingEnabled
+                          ? 'Instant on'
+                          : 'Instant off',
+                      color:
+                          service.isAvailable && service.instantBookingEnabled
+                          ? AppColors.coral
+                          : AppColors.muted,
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -874,29 +1005,277 @@ class _ServiceCard extends StatelessWidget {
             '₹${service.price}',
             style: const TextStyle(
               color: AppColors.ink,
-              fontWeight: FontWeight.w900,
+              fontWeight: FontWeight.w600,
             ),
           ),
-          IconButton(
-            onPressed: () async {
-              try {
-                await AppStateScope.read(
-                  context,
-                ).removeOwnerService(service.id);
-              } catch (error) {
-                if (!context.mounted) {
-                  return;
-                }
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Remove failed: $error')),
-                );
+          PopupMenuButton<String>(
+            tooltip: 'Service actions',
+            onSelected: (action) {
+              switch (action) {
+                case 'availability':
+                  _updateServiceControls(
+                    context,
+                    isAvailable: !service.isAvailable,
+                  );
+                case 'instant':
+                  _updateServiceControls(
+                    context,
+                    instantBookingEnabled: !service.instantBookingEnabled,
+                  );
+                case 'edit':
+                  _showEditServiceDialog(context);
+                case 'remove':
+                  _removeService(context);
               }
             },
-            icon: const Icon(Icons.delete_outline),
-            tooltip: 'Remove service',
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: 'availability',
+                child: ListTile(
+                  leading: Icon(
+                    service.isAvailable
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined,
+                  ),
+                  title: Text(
+                    service.isAvailable
+                        ? 'Hide from customers'
+                        : 'Make available',
+                  ),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: 'instant',
+                enabled: service.isAvailable,
+                child: ListTile(
+                  leading: const Icon(Icons.bolt_outlined),
+                  title: Text(
+                    service.instantBookingEnabled
+                        ? 'Disable instant'
+                        : 'Enable instant',
+                  ),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: 'edit',
+                child: ListTile(
+                  leading: Icon(Icons.edit_outlined),
+                  title: Text('Edit service'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: 'remove',
+                child: ListTile(
+                  leading: Icon(Icons.delete_outline),
+                  title: Text('Remove service'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _updateServiceControls(
+    BuildContext context, {
+    bool? isAvailable,
+    bool? instantBookingEnabled,
+  }) async {
+    try {
+      await AppStateScope.read(context).updateOwnerService(
+        serviceId: service.id,
+        name: service.name,
+        category: service.category,
+        price: service.price,
+        durationMinutes: service.durationMinutes,
+        isAvailable: isAvailable,
+        instantBookingEnabled: instantBookingEnabled,
+      );
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Update failed: $error')));
+    }
+  }
+
+  Future<void> _removeService(BuildContext context) async {
+    try {
+      await AppStateScope.read(context).removeOwnerService(service.id);
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Remove failed: $error')));
+    }
+  }
+
+  void _showEditServiceDialog(BuildContext context) {
+    final nameController = TextEditingController(text: service.name);
+    final priceController = TextEditingController(text: '${service.price}');
+    final durationController = TextEditingController(
+      text: '${service.durationMinutes}',
+    );
+    var category = service.category;
+    var isAvailable = service.isAvailable;
+    var instantBookingEnabled = service.instantBookingEnabled;
+    var isSaving = false;
+
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Edit service'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(
+                        labelText: 'Service name',
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    DropdownButtonFormField<String>(
+                      initialValue: serviceCategoryLabels.contains(category)
+                          ? category
+                          : serviceCategoryLabels.first,
+                      decoration: const InputDecoration(
+                        labelText: 'Service type',
+                      ),
+                      items: [
+                        for (final item in serviceCategoryLabels)
+                          DropdownMenuItem(value: item, child: Text(item)),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setDialogState(() => category = value);
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: priceController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Price (₹)'),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: durationController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Duration minutes',
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Available to customers'),
+                      subtitle: const Text(
+                        'Show this service and allow scheduled bookings.',
+                      ),
+                      value: isAvailable,
+                      onChanged: (value) {
+                        setDialogState(() => isAvailable = value);
+                      },
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Allow instant booking'),
+                      subtitle: const Text(
+                        'Customers can request this service immediately.',
+                      ),
+                      value: instantBookingEnabled,
+                      onChanged: isAvailable
+                          ? (value) {
+                              setDialogState(
+                                () => instantBookingEnabled = value,
+                              );
+                            }
+                          : null,
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: isSaving
+                      ? null
+                      : () async {
+                          final price = int.tryParse(priceController.text) ?? 0;
+                          final duration =
+                              int.tryParse(durationController.text) ?? 0;
+                          if (nameController.text.trim().isEmpty ||
+                              price <= 0 ||
+                              duration <= 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'Enter a service name, price, and duration greater than zero.',
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+                          setDialogState(() => isSaving = true);
+                          try {
+                            await AppStateScope.read(
+                              context,
+                            ).updateOwnerService(
+                              serviceId: service.id,
+                              name: nameController.text,
+                              category: category,
+                              price: price,
+                              durationMinutes: duration,
+                              isAvailable: isAvailable,
+                              instantBookingEnabled: instantBookingEnabled,
+                            );
+                            if (context.mounted) {
+                              Navigator.pop(context);
+                            }
+                          } catch (error) {
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Service update failed: $error',
+                                  ),
+                                ),
+                              );
+                            }
+                          } finally {
+                            if (context.mounted) {
+                              setDialogState(() => isSaving = false);
+                            }
+                          }
+                        },
+                  child: Text(isSaving ? 'Saving...' : 'Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    ).whenComplete(() {
+      nameController.dispose();
+      priceController.dispose();
+      durationController.dispose();
+    });
   }
 }

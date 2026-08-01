@@ -7,6 +7,7 @@ import '../screens/customer/customer_home_screen.dart';
 import '../screens/customer/my_bookings_screen.dart';
 import '../screens/partner/partner_hub_screen.dart';
 import '../state/app_state_scope.dart';
+import '../theme/app_theme.dart';
 
 class AppBottomNav extends StatelessWidget {
   final int selectedIndex;
@@ -15,41 +16,47 @@ class AppBottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return NavigationBar(
-      selectedIndex: selectedIndex,
-      onDestinationSelected: (index) {
-        if (index == selectedIndex) {
-          return;
-        }
-        final appState = AppStateScope.read(context);
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => _screenFor(index)),
-          (route) => false,
-        );
-        final opensCustomerArea = index == 0 || index == 1;
-        if (opensCustomerArea &&
-            appState.activeRole != null &&
-            appState.activeRole != UserRole.customer) {
-          unawaited(appState.selectRole(UserRole.customer));
-        }
-      },
-      destinations: const [
-        NavigationDestination(
-          icon: Icon(Icons.explore_outlined),
-          selectedIcon: Icon(Icons.explore),
-          label: 'Discover',
-        ),
-        NavigationDestination(
-          icon: Icon(Icons.receipt_long_outlined),
-          selectedIcon: Icon(Icons.receipt_long),
-          label: 'Bookings',
-        ),
-        NavigationDestination(
-          icon: Icon(Icons.business_center_outlined),
-          selectedIcon: Icon(Icons.business_center),
-          label: 'Partner',
-        ),
-      ],
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(top: BorderSide(color: AppColors.line)),
+      ),
+      child: NavigationBar(
+        selectedIndex: selectedIndex,
+        onDestinationSelected: (index) {
+          if (index == selectedIndex) {
+            return;
+          }
+          final appState = AppStateScope.read(context);
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute(builder: (_) => _screenFor(index)),
+            (route) => false,
+          );
+          final opensCustomerArea = index == 0 || index == 1;
+          if (opensCustomerArea &&
+              appState.activeRole != null &&
+              appState.activeRole != UserRole.customer) {
+            unawaited(appState.selectRole(UserRole.customer));
+          }
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.explore_outlined),
+            selectedIcon: Icon(Icons.explore),
+            label: 'Discover',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.receipt_long_outlined),
+            selectedIcon: Icon(Icons.receipt_long),
+            label: 'Bookings',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.business_center_outlined),
+            selectedIcon: Icon(Icons.business_center),
+            label: 'Partner',
+          ),
+        ],
+      ),
     );
   }
 

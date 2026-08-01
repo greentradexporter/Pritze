@@ -7,9 +7,11 @@ import '../../models/service_catalog.dart';
 import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/auth_login_panel.dart';
+import '../../widgets/booking_status_timeline.dart';
 import '../../widgets/status_chip.dart';
 import 'salon_profile_setup_screen.dart';
 
@@ -24,58 +26,88 @@ class SalonDashboardScreen extends StatelessWidget {
     if (appState.ownerAccount == null) {
       return const _OwnerLoginGate();
     }
+    final activeInstantBooking = _activeInstantBooking(
+      appState.bookingsForSalon(salon.id),
+    );
 
     return DefaultTabController(
       length: 3,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Owner tools'),
-          actions: [
-            IconButton.filledTonal(
-              icon: const Icon(Icons.edit_outlined),
-              tooltip: 'Salon listing',
-              onPressed: () {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => const SalonProfileSetupScreen(),
-                  ),
-                );
-              },
+      child: Builder(
+        builder: (dashboardContext) => Scaffold(
+          appBar: AppBar(
+            title: Text(
+              salon.name.trim().isEmpty ? 'Salon dashboard' : salon.name,
             ),
-            AccountOverflowMenu(
-              role: UserRole.owner,
-              canLogout: true,
-              onNotificationOpened: (destination) {
-                final controller = DefaultTabController.of(context);
-                controller.animateTo(
-                  destination == AppNotificationDestination.team ? 2 : 0,
-                );
-              },
-              onLoggedOut: () async {
-                if (context.mounted && Navigator.of(context).canPop()) {
-                  Navigator.of(context).pop();
-                }
-              },
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.edit_outlined),
+                tooltip: 'Salon listing',
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const SalonProfileSetupScreen(),
+                    ),
+                  );
+                },
+              ),
+              AccountOverflowMenu(
+                role: UserRole.owner,
+                canLogout: true,
+                onNotificationOpened: (destination) {
+                  final controller = DefaultTabController.of(dashboardContext);
+                  controller.animateTo(
+                    destination == AppNotificationDestination.team ? 2 : 0,
+                  );
+                },
+                onLoggedOut: () async {
+                  if (context.mounted && Navigator.of(context).canPop()) {
+                    Navigator.of(context).pop();
+                  }
+                },
+              ),
+              const SizedBox(width: 8),
+            ],
+            bottom: const TabBar(
+              tabs: [
+                Tab(text: 'Overview'),
+                Tab(text: 'Bookings'),
+                Tab(text: 'Team'),
+              ],
             ),
-            const SizedBox(width: 8),
-          ],
-          bottom: const TabBar(
-            tabs: [
-              Tab(text: 'Overview'),
-              Tab(text: 'Bookings'),
-              Tab(text: 'Team'),
+          ),
+          bottomNavigationBar: activeInstantBooking == null
+              ? null
+              : BookingArrivalBottomPanel(
+                  booking: activeInstantBooking,
+                  audience: BookingTimerAudience.salon,
+                  onTap: () =>
+                      DefaultTabController.of(dashboardContext).animateTo(1),
+                ),
+          body: TabBarView(
+            children: [
+              _OwnerRefresh(child: _OwnerOverview(salon: salon)),
+              _OwnerRefresh(child: _OwnerBookings(salonId: salon.id)),
+              _OwnerRefresh(child: _OwnerStaff(salon: salon)),
             ],
           ),
         ),
-        body: TabBarView(
-          children: [
-            _OwnerRefresh(child: _OwnerOverview(salon: salon)),
-            _OwnerRefresh(child: _OwnerBookings(salonId: salon.id)),
-            _OwnerRefresh(child: _OwnerStaff(salon: salon)),
-          ],
-        ),
       ),
     );
+  }
+
+  Booking? _activeInstantBooking(List<Booking> bookings) {
+    final active =
+        bookings
+            .where(
+              (booking) =>
+                  booking.isInstant &&
+                  booking.status != BookingStatus.cancelled &&
+                  booking.status != BookingStatus.rejected &&
+                  booking.status != BookingStatus.completed,
+            )
+            .toList()
+          ..sort((a, b) => a.start.compareTo(b.start));
+    return active.firstOrNull;
   }
 }
 
@@ -120,10 +152,12 @@ class _OwnerOverview extends StatelessWidget {
               '${appState.todayBookingCount(salon.id)} appointments today. Track staff, revenue, and booking status.',
           icon: Icons.insights,
         ),
-        if (!appState.isSalonBookable(salon.id)) ...[
+        if (!appState.isSalonSetupComplete(salon.id)) ...[
           const SizedBox(height: 14),
           _OwnerSetupBanner(salon: salon),
         ],
+        const SizedBox(height: 14),
+        _InstantBookingControl(salon: salon),
         if (pendingRequests.isNotEmpty) ...[
           const SizedBox(height: 18),
           SectionHeader(title: 'Barber requests (${pendingRequests.length})'),
@@ -260,7 +294,7 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
       children: [
         const Text(
           'Booking desk',
-          style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 6),
         Text(
@@ -373,6 +407,74 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
   };
 }
 
+class _InstantBookingControl extends StatelessWidget {
+  final Salon salon;
+
+  const _InstantBookingControl({required this.salon});
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    final enabled = appState.isInstantBookingEnabled(salon.id);
+    final isOpen = appState.isSalonCurrentlyOpen(salon.id);
+    final color = enabled ? AppColors.primary : AppColors.muted;
+    final status = enabled
+        ? (isOpen ? 'On now' : 'On for opening')
+        : 'Paused today';
+
+    return GlassCard(
+      color: enabled ? AppColors.champagne.withAlpha(92) : Colors.white,
+      child: Row(
+        children: [
+          SoftIconBox(icon: Icons.bolt_outlined, color: color, size: 46),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Instant bookings',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    AppPill(label: status, color: color),
+                    AppPill(
+                      label: isOpen ? 'Open' : 'Closed',
+                      color: isOpen ? AppColors.primary : AppColors.muted,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          Switch(
+            value: enabled,
+            activeThumbColor: AppColors.primary,
+            onChanged: appState.isSaving
+                ? null
+                : (value) async {
+                    try {
+                      await appState.setOwnerInstantBookingEnabled(value);
+                    } catch (error) {
+                      if (!context.mounted) {
+                        return;
+                      }
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Update failed: $error')),
+                      );
+                    }
+                  },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _OwnerBookingMetric extends StatelessWidget {
   final String value;
   final String label;
@@ -390,7 +492,7 @@ class _OwnerBookingMetric extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
       decoration: BoxDecoration(
         color: color.withAlpha(10),
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: color.withAlpha(32)),
       ),
       child: Column(
@@ -399,8 +501,8 @@ class _OwnerBookingMetric extends StatelessWidget {
             value,
             style: TextStyle(
               color: color,
-              fontSize: 22,
-              fontWeight: FontWeight.w900,
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
             ),
           ),
           const SizedBox(height: 2),
@@ -410,7 +512,7 @@ class _OwnerBookingMetric extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
             style: Theme.of(
               context,
-            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w800),
+            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
           ),
         ],
       ),
@@ -475,7 +577,7 @@ class _ChairCard extends StatelessWidget {
                 foregroundColor: color,
                 child: Text(
                   barber.name.characters.first,
-                  style: const TextStyle(fontWeight: FontWeight.w900),
+                  style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
               const SizedBox(width: 12),
@@ -513,7 +615,7 @@ class _ChairCard extends StatelessWidget {
                     'No upcoming booking. Available for new customers.',
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: AppColors.primaryDark,
-                      fontWeight: FontWeight.w700,
+                      fontWeight: FontWeight.w500,
                     ),
                   ),
                 ),
@@ -587,7 +689,7 @@ class _BarberWorkloadCard extends StatelessWidget {
                 foregroundColor: statusColor,
                 child: Text(
                   barber.name.characters.first.toUpperCase(),
-                  style: const TextStyle(fontWeight: FontWeight.w900),
+                  style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
               const SizedBox(width: 12),
@@ -623,7 +725,7 @@ class _BarberWorkloadCard extends StatelessWidget {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: AppColors.coral.withAlpha(10),
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: AppColors.coral.withAlpha(45)),
               ),
               child: Text(
@@ -631,7 +733,7 @@ class _BarberWorkloadCard extends StatelessWidget {
                 '${currentService?.name ?? current.serviceName}',
                 style: const TextStyle(
                   color: AppColors.ink,
-                  fontWeight: FontWeight.w800,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
             ),
@@ -687,7 +789,7 @@ class _WorkloadMetric extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
       decoration: BoxDecoration(
         color: color.withAlpha(10),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: color.withAlpha(30)),
       ),
       child: Column(
@@ -696,8 +798,8 @@ class _WorkloadMetric extends StatelessWidget {
             value,
             style: TextStyle(
               color: color,
-              fontSize: 20,
-              fontWeight: FontWeight.w900,
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
             ),
           ),
           const SizedBox(height: 2),
@@ -707,7 +809,7 @@ class _WorkloadMetric extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
             style: Theme.of(
               context,
-            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w700),
+            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w500),
           ),
         ],
       ),
@@ -734,6 +836,11 @@ class _OwnerBookingCard extends StatelessWidget {
     final service = appState.getService(booking.salonId, booking.serviceId);
     final barber = appState.getBarber(booking.barberId);
     final end = booking.start.add(Duration(minutes: booking.durationMinutes));
+    final timeLabel = booking.isInstant
+        ? booking.status == BookingStatus.pending
+              ? 'Instant request · ${booking.customerArrivalMinutes} min customer ETA · ${booking.salonArrivalMinutes} min salon window'
+              : 'Arrive by ${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}'
+        : '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}';
     final isPastStart = !now.isBefore(booking.start);
     final isPastEnd = !now.isBefore(end);
     final canAcceptOrReject =
@@ -772,10 +879,7 @@ class _OwnerBookingCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      service?.name ??
-                          (booking.serviceName.isEmpty
-                              ? 'Service'
-                              : booking.serviceName),
+                      'Ordered service: ${booking.resolvedServiceName(service)}',
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ],
@@ -787,22 +891,56 @@ class _OwnerBookingCard extends StatelessWidget {
                   StatusChip(status: booking.status),
                   const SizedBox(height: 6),
                   AppPill(label: outcome, color: _statusColor(booking.status)),
+                  if (booking.isInstant) ...[
+                    const SizedBox(height: 6),
+                    const AppPill(
+                      icon: Icons.bolt_outlined,
+                      label: 'Instant',
+                      color: AppColors.coral,
+                    ),
+                  ],
                 ],
               ),
             ],
           ),
           const SizedBox(height: 14),
           _SmallDetail(icon: Icons.badge, label: barber?.name ?? 'Barber'),
-          _SmallDetail(
-            icon: Icons.schedule,
-            label:
-                '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}',
-          ),
+          _SmallDetail(icon: Icons.schedule, label: timeLabel),
+          if (booking.isInstant &&
+              (booking.status == BookingStatus.pending ||
+                  booking.status == BookingStatus.confirmed))
+            _SmallDetail(
+              icon: Icons.hourglass_bottom_outlined,
+              label:
+                  'Customer arrival timer: ${appState.countdownTo(booking.start, now: now)}',
+            ),
           _SmallDetail(icon: Icons.phone, label: booking.customerPhone),
+          if (booking.customerPhone.trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: OutlinedButton.icon(
+                onPressed: () => UrlLauncherUtils.makePhoneCall(
+                  context,
+                  booking.customerPhone,
+                ),
+                icon: const Icon(Icons.call_outlined),
+                label: const Text('Call customer'),
+              ),
+            ),
+          if (booking.cancellationReason.isNotEmpty)
+            _SmallDetail(
+              icon: Icons.info_outline,
+              label: 'Cancellation reason: ${booking.cancellationReason}',
+            ),
           _SmallDetail(
             icon: Icons.timer_outlined,
             label:
                 '${booking.durationMinutes} min · ends ${appState.formatTime(end)}',
+          ),
+          _SmallDetail(
+            icon: Icons.payments_outlined,
+            label:
+                'Service ₹${booking.resolvedServicePrice(service)} · booking fee ₹${booking.bookingFee}',
           ),
           const SizedBox(height: 14),
           if (canAcceptOrReject || canStart || canCancel || canComplete)
@@ -857,7 +995,7 @@ class _OwnerBookingCard extends StatelessWidget {
                   : 'No action needed right now.',
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                 color: AppColors.muted,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w500,
               ),
             ),
         ],
@@ -904,6 +1042,14 @@ class _OwnerStaff extends StatelessWidget {
           children: [
             Expanded(
               child: FilledButton.icon(
+                onPressed: () => _showAddBarberDialog(context),
+                icon: const Icon(Icons.person_add_alt),
+                label: const Text('Add barber'),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton.icon(
                 onPressed: () {
                   Navigator.of(context).push(
                     MaterialPageRoute(
@@ -911,16 +1057,8 @@ class _OwnerStaff extends StatelessWidget {
                     ),
                   );
                 },
-                icon: const Icon(Icons.edit),
+                icon: const Icon(Icons.edit_outlined),
                 label: const Text('Edit salon'),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: OutlinedButton.icon(
-                onPressed: () => _showAddBarberDialog(context),
-                icon: const Icon(Icons.person_add_alt),
-                label: const Text('Add barber'),
               ),
             ),
           ],
@@ -1133,7 +1271,7 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                     Container(
                       decoration: BoxDecoration(
                         border: Border.all(color: AppColors.line),
-                        borderRadius: BorderRadius.circular(14),
+                        borderRadius: BorderRadius.circular(8),
                       ),
                       child: Column(
                         children: [
@@ -1335,8 +1473,8 @@ class _JoinRequestCardState extends State<_JoinRequestCard> {
                 child: Text(
                   request.barberName.characters.first.toUpperCase(),
                   style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w900,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
@@ -1369,7 +1507,7 @@ class _JoinRequestCardState extends State<_JoinRequestCard> {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: Colors.white.withAlpha(210),
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(8),
               border: Border.all(color: AppColors.line),
             ),
             child: Column(
@@ -1490,7 +1628,7 @@ class _StaffCard extends StatelessWidget {
             foregroundColor: AppColors.primary,
             child: Text(
               barber.name.characters.first,
-              style: const TextStyle(fontWeight: FontWeight.w900),
+              style: const TextStyle(fontWeight: FontWeight.w600),
             ),
           ),
           const SizedBox(width: 12),
@@ -1518,8 +1656,8 @@ class _StaffCard extends StatelessWidget {
                     color: barber.uid == null
                         ? AppColors.amber
                         : AppColors.success,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w800,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ],
@@ -1586,23 +1724,19 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Owner sign in')),
+      appBar: AppBar(),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
+        padding: const EdgeInsets.fromLTRB(18, 6, 18, 28),
         children: [
-          const AppHeroHeader(
-            eyebrow: 'Separate owner account',
-            title: 'Sign in to register or manage your shop',
-            subtitle:
-                'After login, you can add shop name, address, timings, services, staff, and booking controls.',
-            icon: Icons.admin_panel_settings,
+          Text('Sign in', style: Theme.of(context).textTheme.headlineMedium),
+          const SizedBox(height: 4),
+          Text(
+            'Manage your salon, services, staff, timings, and bookings.',
+            style: Theme.of(context).textTheme.bodySmall,
           ),
-          const SizedBox(height: 22),
+          const SizedBox(height: 16),
           AuthLoginPanel(
             role: UserRole.owner,
-            googleTitle: 'Gmail shortcut',
-            googleMessage:
-                'Choose your Google account. Your name and Gmail address will be carried into owner tools automatically.',
             onLoggedIn: () {
               Navigator.of(context).pushReplacement(
                 MaterialPageRoute(
@@ -1628,7 +1762,10 @@ class _OwnerSetupBanner extends StatelessWidget {
     final hasDetails = appState.hasSalonDetails(salon.id);
     final hasServices = salon.services.isNotEmpty;
     final hasBarber = appState.barbersForSalon(salon.id).isNotEmpty;
-    final hasAssignedBarber = appState.isSalonBookable(salon.id);
+    final serviceIds = salon.services.map((service) => service.id).toSet();
+    final hasAssignedBarber = appState
+        .barbersForSalon(salon.id)
+        .any((barber) => barber.serviceIds.any(serviceIds.contains));
 
     return GlassCard(
       color: AppColors.mint,
@@ -1648,11 +1785,11 @@ class _OwnerSetupBanner extends StatelessWidget {
                   'Complete setup before customer bookings go live',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     color: AppColors.primaryDark,
-                    fontWeight: FontWeight.w900,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
-              TextButton(
+              IconButton(
                 onPressed: () {
                   Navigator.of(context).push(
                     MaterialPageRoute(
@@ -1660,7 +1797,8 @@ class _OwnerSetupBanner extends StatelessWidget {
                     ),
                   );
                 },
-                child: const Text('Register'),
+                icon: const Icon(Icons.arrow_forward),
+                tooltip: 'Complete salon setup',
               ),
             ],
           ),
@@ -1701,7 +1839,7 @@ class _SetupCheckRow extends StatelessWidget {
               label,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                 color: AppColors.primaryDark,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w500,
               ),
             ),
           ),
@@ -1740,8 +1878,8 @@ class _MetricCard extends StatelessWidget {
                 value,
                 style: const TextStyle(
                   color: AppColors.ink,
-                  fontSize: 24,
-                  fontWeight: FontWeight.w900,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
               Text(
@@ -1775,7 +1913,7 @@ class _ProgressRow extends StatelessWidget {
               label,
               style: const TextStyle(
                 color: AppColors.ink,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w600,
               ),
             ),
           ),
@@ -1783,7 +1921,7 @@ class _ProgressRow extends StatelessWidget {
             value,
             style: const TextStyle(
               color: AppColors.primary,
-              fontWeight: FontWeight.w900,
+              fontWeight: FontWeight.w600,
             ),
           ),
         ],
@@ -1840,7 +1978,11 @@ class _StatusButton extends StatelessWidget {
         ? null
         : () async {
             try {
-              await appState.updateBookingStatus(booking.id, status);
+              await appState.updateBookingStatus(
+                booking.id,
+                status,
+                cancelledBy: status == BookingStatus.cancelled ? 'salon' : null,
+              );
               if (context.mounted && status == BookingStatus.completed) {
                 final service = appState.getService(
                   booking.salonId,

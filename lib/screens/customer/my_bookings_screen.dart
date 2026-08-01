@@ -3,11 +3,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
+import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/booking_status_timeline.dart';
 import '../../widgets/status_chip.dart';
 import 'salon_booking_screen.dart';
 
@@ -43,6 +45,7 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
     final appState = AppStateScope.watch(context);
     final now = DateTime.now();
     final allBookings = appState.customerBookings;
+    final activeInstantBooking = appState.activeInstantBooking;
     final counts = {
       for (final bucket in CustomerBookingBucket.values)
         bucket: allBookings
@@ -74,7 +77,18 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
           const SizedBox(width: 8),
         ],
       ),
-      bottomNavigationBar: const AppBottomNav(selectedIndex: 1),
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (activeInstantBooking != null)
+            BookingArrivalBottomPanel(
+              booking: activeInstantBooking,
+              audience: BookingTimerAudience.customer,
+              onTap: () {},
+            ),
+          const AppBottomNav(selectedIndex: 1),
+        ],
+      ),
       body: RefreshIndicator(
         onRefresh: appState.refresh,
         child: allBookings.isEmpty
@@ -110,6 +124,12 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
                           value: '${counts[CustomerBookingBucket.active] ?? 0}',
                           label: 'Active',
                           color: AppColors.primary,
+                          selected:
+                              _selectedBucket == CustomerBookingBucket.active,
+                          onTap: () => setState(
+                            () =>
+                                _selectedBucket = CustomerBookingBucket.active,
+                          ),
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -119,6 +139,12 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
                               '${counts[CustomerBookingBucket.history] ?? 0}',
                           label: 'History',
                           color: AppColors.success,
+                          selected:
+                              _selectedBucket == CustomerBookingBucket.history,
+                          onTap: () => setState(
+                            () =>
+                                _selectedBucket = CustomerBookingBucket.history,
+                          ),
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -128,29 +154,16 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
                               '${counts[CustomerBookingBucket.cancelled] ?? 0}',
                           label: 'Closed',
                           color: AppColors.coral,
+                          selected:
+                              _selectedBucket ==
+                              CustomerBookingBucket.cancelled,
+                          onTap: () => setState(
+                            () => _selectedBucket =
+                                CustomerBookingBucket.cancelled,
+                          ),
                         ),
                       ),
                     ],
-                  ),
-                  const SizedBox(height: 14),
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: [
-                        for (final bucket in CustomerBookingBucket.values) ...[
-                          ChoiceChip(
-                            selected: _selectedBucket == bucket,
-                            avatar: Icon(_bucketIcon(bucket), size: 18),
-                            label: Text(
-                              '${_bucketLabel(bucket)} (${counts[bucket] ?? 0})',
-                            ),
-                            onSelected: (_) =>
-                                setState(() => _selectedBucket = bucket),
-                          ),
-                          const SizedBox(width: 8),
-                        ],
-                      ],
-                    ),
                   ),
                   const SizedBox(height: 18),
                   SectionHeader(title: _bucketLabel(_selectedBucket)),
@@ -212,42 +225,57 @@ class _BookingMetric extends StatelessWidget {
   final String value;
   final String label;
   final Color color;
+  final bool selected;
+  final VoidCallback onTap;
 
   const _BookingMetric({
     required this.value,
     required this.label,
     required this.color,
+    required this.selected,
+    required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
-      decoration: BoxDecoration(
-        color: color.withAlpha(10),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: color.withAlpha(32)),
-      ),
-      child: Column(
-        children: [
-          Text(
-            value,
-            style: TextStyle(
-              color: color,
-              fontSize: 22,
-              fontWeight: FontWeight.w900,
+    return Material(
+      color: selected ? color.withAlpha(20) : color.withAlpha(7),
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: selected ? color : color.withAlpha(32),
+              width: selected ? 1.5 : 1,
             ),
           ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(
-              context,
-            ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w800),
+          child: Column(
+            children: [
+              Text(
+                value,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: selected ? color : AppColors.muted,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -273,6 +301,11 @@ class _BookingCard extends StatelessWidget {
     final service = appState.getService(booking.salonId, booking.serviceId);
     final barber = appState.getBarber(booking.barberId);
     final end = booking.start.add(Duration(minutes: booking.durationMinutes));
+    final timeLabel = booking.isInstant
+        ? booking.status == BookingStatus.pending
+              ? 'Instant request · waiting for salon'
+              : 'Arrive by ${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}'
+        : '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}';
     final canCancel =
         bucket == CustomerBookingBucket.active &&
         now.isBefore(booking.start) &&
@@ -304,10 +337,7 @@ class _BookingCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 5),
                     Text(
-                      service?.name ??
-                          (booking.serviceName.isEmpty
-                              ? 'Service'
-                              : booking.serviceName),
+                      'Ordered service: ${booking.resolvedServiceName(service)}',
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ],
@@ -319,16 +349,31 @@ class _BookingCard extends StatelessWidget {
                   StatusChip(status: booking.status),
                   const SizedBox(height: 6),
                   AppPill(label: outcome, color: _statusColor(booking.status)),
+                  if (booking.isInstant) ...[
+                    const SizedBox(height: 6),
+                    const AppPill(
+                      icon: Icons.bolt_outlined,
+                      label: 'Instant',
+                      color: AppColors.coral,
+                    ),
+                  ],
                 ],
               ),
             ],
           ),
           const SizedBox(height: 16),
-          _DetailRow(
-            icon: Icons.schedule,
-            label:
-                '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}',
-          ),
+          _DetailRow(icon: Icons.schedule, label: timeLabel),
+          if (((!booking.isInstant &&
+                      booking.status == BookingStatus.pending) ||
+                  booking.status == BookingStatus.confirmed) &&
+              now.isBefore(booking.start)) ...[
+            const SizedBox(height: 9),
+            _DetailRow(
+              icon: Icons.hourglass_bottom_outlined,
+              label:
+                  'Starts in ${appState.countdownTo(booking.start, now: now)}',
+            ),
+          ],
           const SizedBox(height: 9),
           _DetailRow(
             icon: Icons.badge,
@@ -339,6 +384,24 @@ class _BookingCard extends StatelessWidget {
             icon: Icons.timer_outlined,
             label:
                 '${booking.durationMinutes} min · ends ${appState.formatTime(end)}',
+          ),
+          const SizedBox(height: 9),
+          _DetailRow(
+            icon: Icons.payments_outlined,
+            label:
+                'Service ₹${booking.resolvedServicePrice(service)} · booking fee ₹${booking.bookingFee}',
+          ),
+          if (booking.cancellationReason.isNotEmpty) ...[
+            const SizedBox(height: 9),
+            _DetailRow(
+              icon: Icons.info_outline,
+              label: 'Cancellation reason: ${booking.cancellationReason}',
+            ),
+          ],
+          const SizedBox(height: 16),
+          BookingStatusTimeline(
+            key: ValueKey('booking-timeline-${booking.id}'),
+            status: booking.status,
           ),
           if (canCancel || canReschedule || canLeaveFeedback) ...[
             const SizedBox(height: 16),
@@ -361,21 +424,7 @@ class _BookingCard extends StatelessWidget {
                   ),
                 if (canCancel)
                   OutlinedButton.icon(
-                    onPressed: () async {
-                      try {
-                        await appState.updateBookingStatus(
-                          booking.id,
-                          BookingStatus.cancelled,
-                        );
-                      } catch (error) {
-                        if (!context.mounted) {
-                          return;
-                        }
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text('Cancel failed: $error')),
-                        );
-                      }
-                    },
+                    onPressed: () => _cancelBooking(context, booking),
                     icon: const Icon(Icons.cancel_outlined),
                     label: const Text('Cancel'),
                   ),
@@ -391,7 +440,7 @@ class _BookingCard extends StatelessWidget {
     try {
       await AppStateScope.read(
         context,
-      ).updateBookingStatus(booking.id, BookingStatus.cancelled);
+      ).cancelBooking(booking.id, reason: 'Rescheduling this appointment');
       if (!context.mounted) {
         return;
       }
@@ -414,6 +463,107 @@ class _BookingCard extends StatelessWidget {
     }
   }
 
+  Future<void> _cancelBooking(BuildContext context, Booking booking) async {
+    final reason = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        String? selectedReason;
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: EdgeInsets.fromLTRB(
+                  18,
+                  0,
+                  18,
+                  MediaQuery.viewInsetsOf(context).bottom + 18,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Why are you cancelling?',
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Choose one reason. This helps the salon understand what happened.',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 10),
+                    RadioGroup<String>(
+                      groupValue: selectedReason,
+                      onChanged: (value) {
+                        setSheetState(() => selectedReason = value);
+                      },
+                      child: Column(
+                        children: [
+                          for (final option in customerCancellationReasons)
+                            RadioListTile<String>(
+                              contentPadding: EdgeInsets.zero,
+                              value: option,
+                              title: Text(option),
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    FilledButton(
+                      onPressed: selectedReason == null
+                          ? null
+                          : () => Navigator.pop(sheetContext, selectedReason),
+                      child: const Text('Continue'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    if (reason == null || !context.mounted) {
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Cancel this booking?'),
+        content: Text(
+          'Reason: $reason\n\nThe salon will be notified and this action cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Keep booking'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Yes, cancel'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) {
+      return;
+    }
+    try {
+      await AppStateScope.read(
+        context,
+      ).cancelBooking(booking.id, reason: reason);
+    } catch (error) {
+      if (!context.mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Cancel failed: $error')));
+    }
+  }
+
   void _showFeedbackDialog(BuildContext context, Booking booking) {
     final pageContext = context;
     final controller = TextEditingController();
@@ -431,7 +581,7 @@ class _BookingCard extends StatelessWidget {
               ),
               backgroundColor: AppColors.surface,
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(28),
+                borderRadius: BorderRadius.circular(8),
               ),
               clipBehavior: Clip.antiAlias,
               child: ConstrainedBox(
@@ -464,7 +614,7 @@ class _BookingCard extends StatelessWidget {
                           margin: const EdgeInsets.only(top: 2, bottom: 16),
                           decoration: BoxDecoration(
                             color: AppColors.champagne,
-                            borderRadius: BorderRadius.circular(20),
+                            borderRadius: BorderRadius.circular(8),
                           ),
                           child: const Icon(
                             Icons.reviews_rounded,
@@ -477,9 +627,9 @@ class _BookingCard extends StatelessWidget {
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             color: AppColors.ink,
-                            fontSize: 23,
+                            fontSize: 18,
                             height: 1.15,
-                            fontWeight: FontWeight.w900,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                         const SizedBox(height: 8),
@@ -488,7 +638,7 @@ class _BookingCard extends StatelessWidget {
                           textAlign: TextAlign.center,
                           style: TextStyle(
                             color: AppColors.muted,
-                            fontSize: 13,
+                            fontSize: 14,
                             height: 1.45,
                           ),
                         ),
@@ -500,7 +650,7 @@ class _BookingCard extends StatelessWidget {
                           ),
                           decoration: BoxDecoration(
                             color: AppColors.canvas,
-                            borderRadius: BorderRadius.circular(18),
+                            borderRadius: BorderRadius.circular(8),
                             border: Border.all(color: AppColors.line),
                           ),
                           child: Column(
@@ -543,8 +693,8 @@ class _BookingCard extends StatelessWidget {
                                   textAlign: TextAlign.center,
                                   style: const TextStyle(
                                     color: AppColors.goldDeep,
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w800,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
                               ),
@@ -639,7 +789,7 @@ class _DetailRow extends StatelessWidget {
             label,
             style: const TextStyle(
               color: AppColors.ink,
-              fontWeight: FontWeight.w700,
+              fontWeight: FontWeight.w500,
             ),
           ),
         ),

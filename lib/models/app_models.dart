@@ -113,6 +113,8 @@ class SalonService {
   final String category;
   final int price;
   final int durationMinutes;
+  final bool isAvailable;
+  final bool instantBookingEnabled;
 
   const SalonService({
     required this.id,
@@ -120,6 +122,8 @@ class SalonService {
     required this.category,
     required this.price,
     required this.durationMinutes,
+    this.isAvailable = true,
+    this.instantBookingEnabled = true,
   });
 
   SalonService copyWith({
@@ -128,6 +132,8 @@ class SalonService {
     String? category,
     int? price,
     int? durationMinutes,
+    bool? isAvailable,
+    bool? instantBookingEnabled,
   }) {
     return SalonService(
       id: id ?? this.id,
@@ -135,6 +141,9 @@ class SalonService {
       category: category ?? this.category,
       price: price ?? this.price,
       durationMinutes: durationMinutes ?? this.durationMinutes,
+      isAvailable: isAvailable ?? this.isAvailable,
+      instantBookingEnabled:
+          instantBookingEnabled ?? this.instantBookingEnabled,
     );
   }
 }
@@ -154,6 +163,8 @@ class Salon {
   final String openTime;
   final String closeTime;
   final bool isOpen;
+  final bool instantBookingsEnabled;
+  final String? instantBookingsPausedDate;
   final List<SalonService> services;
 
   const Salon({
@@ -171,6 +182,8 @@ class Salon {
     required this.openTime,
     required this.closeTime,
     required this.isOpen,
+    this.instantBookingsEnabled = true,
+    this.instantBookingsPausedDate,
     required this.services,
   });
 
@@ -189,6 +202,8 @@ class Salon {
     String? openTime,
     String? closeTime,
     bool? isOpen,
+    bool? instantBookingsEnabled,
+    String? instantBookingsPausedDate,
     List<SalonService>? services,
   }) {
     return Salon(
@@ -206,6 +221,10 @@ class Salon {
       openTime: openTime ?? this.openTime,
       closeTime: closeTime ?? this.closeTime,
       isOpen: isOpen ?? this.isOpen,
+      instantBookingsEnabled:
+          instantBookingsEnabled ?? this.instantBookingsEnabled,
+      instantBookingsPausedDate:
+          instantBookingsPausedDate ?? this.instantBookingsPausedDate,
       services: services ?? this.services,
     );
   }
@@ -216,6 +235,9 @@ class Salon {
     }
     return logoUrl;
   }
+
+  List<SalonService> get availableServices =>
+      services.where((service) => service.isAvailable).toList(growable: false);
 }
 
 class Barber {
@@ -302,8 +324,16 @@ class Booking {
   final int durationMinutes;
   final String serviceName;
   final int servicePrice;
+  final int bookingFee;
+  final bool paymentRequired;
+  final String paymentStatus;
   final BookingStatus status;
   final DateTime createdAt;
+  final bool isInstant;
+  final DateTime? acceptedAt;
+  final int arrivalMinutes;
+  final String cancellationReason;
+  final String cancelledBy;
 
   const Booking({
     required this.id,
@@ -317,9 +347,42 @@ class Booking {
     this.durationMinutes = 30,
     this.serviceName = '',
     this.servicePrice = 0,
+    this.bookingFee = 0,
+    this.paymentRequired = false,
+    this.paymentStatus = 'not_required',
     required this.status,
     required this.createdAt,
+    this.isInstant = false,
+    this.acceptedAt,
+    this.arrivalMinutes = 0,
+    this.cancellationReason = '',
+    this.cancelledBy = '',
   });
+
+  int get customerArrivalMinutes {
+    if (arrivalMinutes > 0) {
+      return arrivalMinutes;
+    }
+    return isInstant ? 15 : 0;
+  }
+
+  int get salonArrivalMinutes => customerArrivalMinutes + 5;
+
+  String resolvedServiceName([SalonService? currentService]) {
+    final orderedName = serviceName.trim();
+    if (orderedName.isNotEmpty) {
+      return orderedName;
+    }
+    final fallbackName = currentService?.name.trim() ?? '';
+    return fallbackName.isEmpty ? 'Service' : fallbackName;
+  }
+
+  int resolvedServicePrice([SalonService? currentService]) {
+    if (servicePrice > 0) {
+      return servicePrice;
+    }
+    return currentService?.price ?? 0;
+  }
 
   Booking copyWith({
     String? id,
@@ -333,8 +396,16 @@ class Booking {
     int? durationMinutes,
     String? serviceName,
     int? servicePrice,
+    int? bookingFee,
+    bool? paymentRequired,
+    String? paymentStatus,
     BookingStatus? status,
     DateTime? createdAt,
+    bool? isInstant,
+    DateTime? acceptedAt,
+    int? arrivalMinutes,
+    String? cancellationReason,
+    String? cancelledBy,
   }) {
     return Booking(
       id: id ?? this.id,
@@ -348,8 +419,16 @@ class Booking {
       durationMinutes: durationMinutes ?? this.durationMinutes,
       serviceName: serviceName ?? this.serviceName,
       servicePrice: servicePrice ?? this.servicePrice,
+      bookingFee: bookingFee ?? this.bookingFee,
+      paymentRequired: paymentRequired ?? this.paymentRequired,
+      paymentStatus: paymentStatus ?? this.paymentStatus,
       status: status ?? this.status,
       createdAt: createdAt ?? this.createdAt,
+      isInstant: isInstant ?? this.isInstant,
+      acceptedAt: acceptedAt ?? this.acceptedAt,
+      arrivalMinutes: arrivalMinutes ?? this.arrivalMinutes,
+      cancellationReason: cancellationReason ?? this.cancellationReason,
+      cancelledBy: cancelledBy ?? this.cancelledBy,
     );
   }
 }

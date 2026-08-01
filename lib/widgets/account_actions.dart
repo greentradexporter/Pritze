@@ -4,10 +4,11 @@ import '../models/app_models.dart';
 import '../state/app_state.dart';
 import '../state/app_state_scope.dart';
 import '../theme/app_theme.dart';
+import '../utils/url_launcher_utils.dart';
 import 'app_ui.dart';
 import 'status_chip.dart';
 
-enum _AccountAction { notifications, logout }
+enum _AccountAction { notifications, support, logout }
 
 enum AppNotificationDestination { bookings, overview, team }
 
@@ -35,6 +36,22 @@ class AccountOverflowMenu extends StatelessWidget {
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final count = unreadNotificationCount(appState, role);
+    final account = switch (role) {
+      UserRole.customer => appState.customerAccount,
+      UserRole.owner => appState.ownerAccount,
+      UserRole.barber => appState.barberAccount,
+    };
+    final fallbackName = switch (role) {
+      UserRole.customer => 'Customer',
+      UserRole.owner => appState.ownerSalonOrNull?.ownerName ?? 'Salon owner',
+      UserRole.barber => appState.currentBarber?.name ?? 'Barber',
+    };
+    final accountName =
+        account?.name.trim().isNotEmpty == true &&
+            account?.name.trim() != 'Phone user'
+        ? account!.name.trim()
+        : fallbackName;
+    final accountContact = account?.contact.trim() ?? '';
     return PopupMenuButton<_AccountAction>(
       tooltip: 'Account menu',
       icon: Badge(
@@ -54,6 +71,8 @@ class AccountOverflowMenu extends StatelessWidget {
               role,
               onNotificationOpened: onNotificationOpened,
             );
+          case _AccountAction.support:
+            await showSupportSheet(context);
           case _AccountAction.logout:
             final didLogout = await confirmAndLogout(context);
             if (didLogout && onLoggedOut != null) {
@@ -62,12 +81,42 @@ class AccountOverflowMenu extends StatelessWidget {
         }
       },
       itemBuilder: (context) => [
+        PopupMenuItem<_AccountAction>(
+          enabled: false,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const CircleAvatar(
+              child: Icon(Icons.person_outline, size: 20),
+            ),
+            title: Text(
+              accountName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: accountContact.isEmpty
+                ? null
+                : Text(
+                    accountContact,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+          ),
+        ),
+        const PopupMenuDivider(),
         const PopupMenuItem(
           value: _AccountAction.notifications,
           child: ListTile(
             contentPadding: EdgeInsets.zero,
             leading: Icon(Icons.notifications_outlined),
             title: Text('Notifications'),
+          ),
+        ),
+        const PopupMenuItem(
+          value: _AccountAction.support,
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.support_agent_outlined),
+            title: Text('Support'),
           ),
         ),
         if (canLogout)
@@ -112,6 +161,66 @@ Future<bool> confirmAndLogout(BuildContext context) async {
   }
   await AppStateScope.read(context).signOutActiveUser();
   return true;
+}
+
+Future<void> showSupportSheet(BuildContext context) {
+  return showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    useSafeArea: true,
+    builder: (context) {
+      final state = AppStateScope.watch(context);
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(18, 4, 18, 18),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Support', style: Theme.of(context).textTheme.headlineSmall),
+            const SizedBox(height: 12),
+            GlassCard(
+              child: Row(
+                children: [
+                  const SoftIconBox(
+                    icon: Icons.support_agent_outlined,
+                    color: AppColors.primary,
+                    size: 46,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Pritze support',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          state.supportPhone,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton.filledTonal(
+                    onPressed: () {
+                      UrlLauncherUtils.makePhoneCall(
+                        context,
+                        state.supportPhone,
+                      );
+                    },
+                    icon: const Icon(Icons.call),
+                    tooltip: 'Call support',
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    },
+  );
 }
 
 int unreadNotificationCount(AppState state, UserRole role) {
@@ -333,7 +442,7 @@ class _BookingNotification extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    '${service?.name ?? booking.serviceName} at ${salon?.name ?? 'your salon'} · '
+                    '${booking.resolvedServiceName(service)} at ${salon?.name ?? 'your salon'} · '
                     '${state.formatDate(booking.start)}, ${state.formatTime(booking.start)}',
                     style: Theme.of(context).textTheme.bodyMedium,
                   ),
@@ -355,6 +464,14 @@ class _BookingNotification extends StatelessWidget {
   }
 
   String _bookingTitle(BookingStatus status, UserRole role) {
+    if (booking.isInstant && status == BookingStatus.pending) {
+      return role == UserRole.owner
+          ? 'New instant booking request'
+          : 'Instant booking request sent';
+    }
+    if (booking.isInstant && status == BookingStatus.confirmed) {
+      return 'Instant booking accepted';
+    }
     if (role == UserRole.barber) {
       return switch (status) {
         BookingStatus.pending => 'You have a new booking request',

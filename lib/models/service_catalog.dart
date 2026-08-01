@@ -489,7 +489,7 @@ Color serviceColorForCategory(String category) {
     return AppColors.leaf;
   }
   if (normalized.contains('spa') || normalized.contains('massage')) {
-    return AppColors.charcoal;
+    return AppColors.plum;
   }
   if (normalized.contains('mani') ||
       normalized.contains('pedi') ||

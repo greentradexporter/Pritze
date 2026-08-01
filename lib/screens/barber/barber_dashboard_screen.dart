@@ -8,7 +8,7 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/account_actions.dart';
-import '../../widgets/auth_login_panel.dart';
+import '../../widgets/booking_status_timeline.dart';
 
 class BarberDashboardScreen extends StatelessWidget {
   const BarberDashboardScreen({super.key});
@@ -23,57 +23,83 @@ class BarberDashboardScreen extends StatelessWidget {
         : barber != null
         ? _BarberWorkView(barber: barber)
         : _BarberJoinView(request: request);
+    final activeInstantBooking = barber == null
+        ? null
+        : _activeInstantBooking(appState.bookingsForBarber(barber.id));
 
     return DefaultTabController(
       length: 2,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Barber tools'),
-          actions: [
-            if (appState.barberAccount != null)
-              Builder(
-                builder: (tabContext) => AccountOverflowMenu(
+      child: Builder(
+        builder: (dashboardContext) => Scaffold(
+          appBar: AppBar(
+            title: const Text('Barber tools'),
+            actions: [
+              if (appState.barberAccount != null)
+                AccountOverflowMenu(
                   role: UserRole.barber,
                   canLogout: true,
                   onNotificationOpened: (destination) {
                     if (destination == AppNotificationDestination.bookings) {
-                      DefaultTabController.of(tabContext).animateTo(0);
+                      DefaultTabController.of(dashboardContext).animateTo(0);
                     }
                   },
                   onLoggedOut: () async {
-                    if (tabContext.mounted &&
-                        Navigator.of(tabContext).canPop()) {
-                      Navigator.of(tabContext).pop();
+                    if (dashboardContext.mounted &&
+                        Navigator.of(dashboardContext).canPop()) {
+                      Navigator.of(dashboardContext).pop();
                     }
                   },
                 ),
-              ),
-            const SizedBox(width: 8),
-          ],
-          bottom: barber == null
+              const SizedBox(width: 8),
+            ],
+            bottom: barber == null
+                ? null
+                : const TabBar(
+                    tabs: [
+                      Tab(icon: Icon(Icons.receipt_long), text: 'Appointments'),
+                      Tab(icon: Icon(Icons.currency_rupee), text: 'Earnings'),
+                    ],
+                  ),
+          ),
+          bottomNavigationBar: activeInstantBooking == null
               ? null
-              : const TabBar(
-                  tabs: [
-                    Tab(icon: Icon(Icons.receipt_long), text: 'Appointments'),
-                    Tab(icon: Icon(Icons.currency_rupee), text: 'Earnings'),
+              : BookingArrivalBottomPanel(
+                  booking: activeInstantBooking,
+                  audience: BookingTimerAudience.barber,
+                  onTap: () =>
+                      DefaultTabController.of(dashboardContext).animateTo(0),
+                ),
+          body: appState.barberAccount == null
+              ? body
+              : barber == null
+              ? RefreshIndicator(onRefresh: appState.refresh, child: body)
+              : TabBarView(
+                  children: [
+                    RefreshIndicator(onRefresh: appState.refresh, child: body),
+                    RefreshIndicator(
+                      onRefresh: appState.refresh,
+                      child: _BarberEarningsView(barber: barber),
+                    ),
                   ],
                 ),
         ),
-        body: appState.barberAccount == null
-            ? body
-            : barber == null
-            ? RefreshIndicator(onRefresh: appState.refresh, child: body)
-            : TabBarView(
-                children: [
-                  RefreshIndicator(onRefresh: appState.refresh, child: body),
-                  RefreshIndicator(
-                    onRefresh: appState.refresh,
-                    child: _BarberEarningsView(barber: barber),
-                  ),
-                ],
-              ),
       ),
     );
+  }
+
+  Booking? _activeInstantBooking(List<Booking> bookings) {
+    final active =
+        bookings
+            .where(
+              (booking) =>
+                  booking.isInstant &&
+                  booking.status != BookingStatus.cancelled &&
+                  booking.status != BookingStatus.rejected &&
+                  booking.status != BookingStatus.completed,
+            )
+            .toList()
+          ..sort((a, b) => a.start.compareTo(b.start));
+    return active.firstOrNull;
   }
 }
 
@@ -91,18 +117,33 @@ class _BarberLoginGateState extends State<_BarberLoginGate> {
       padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
       children: [
         const AppHeroHeader(
-          eyebrow: 'Barber login',
-          title: 'Sign in before joining a salon',
+          eyebrow: 'Team access',
+          title: 'Barbers are added by the salon owner',
           subtitle:
-              'Your account is used to connect join requests, approvals, and assigned bookings.',
+              'Ask the salon owner to add your profile from Owner tools. A separate barber login is not used in this version.',
           icon: Icons.badge,
         ),
         const SizedBox(height: 22),
-        const AuthLoginPanel(
-          role: UserRole.barber,
-          googleTitle: 'Nothing else to fill in',
-          googleMessage:
-              'Choose your Google account. Your name and Gmail address will be carried into the next step automatically.',
+        const GlassCard(
+          child: Row(
+            children: [
+              SoftIconBox(
+                icon: Icons.person_add_alt_1,
+                color: AppColors.primary,
+                size: 46,
+              ),
+              SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'Owner tools include Add barber for staff setup and service assignment.',
+                  style: TextStyle(
+                    color: AppColors.ink,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ],
     );
@@ -451,7 +492,7 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
       builder: (dialogContext) => Dialog(
         insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
         backgroundColor: AppColors.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 400),
           child: Padding(
@@ -466,7 +507,7 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
                     height: 62,
                     decoration: BoxDecoration(
                       color: AppColors.coral.withAlpha(22),
-                      borderRadius: BorderRadius.circular(20),
+                      borderRadius: BorderRadius.circular(8),
                     ),
                     child: const Icon(
                       Icons.undo_rounded,
@@ -481,9 +522,9 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: AppColors.ink,
-                    fontSize: 24,
+                    fontSize: 18,
                     height: 1.15,
-                    fontWeight: FontWeight.w900,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -629,7 +670,7 @@ class _ServiceDropdownState extends State<_ServiceDropdown> {
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: AppColors.line),
       ),
       child: Column(
@@ -961,7 +1002,12 @@ class _BarberEarningsView extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          booking.serviceName,
+                          booking.resolvedServiceName(
+                            appState.getService(
+                              booking.salonId,
+                              booking.serviceId,
+                            ),
+                          ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.titleMedium,
@@ -982,7 +1028,7 @@ class _BarberEarningsView extends StatelessWidget {
                     style: const TextStyle(
                       color: AppColors.success,
                       fontSize: 17,
-                      fontWeight: FontWeight.w900,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ],
@@ -1043,9 +1089,9 @@ class _EarningMetricCard extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: AppColors.ink,
-              fontSize: featured ? 31 : 23,
+              fontSize: 18,
               height: 1,
-              fontWeight: FontWeight.w900,
+              fontWeight: FontWeight.w600,
             ),
           ),
           const SizedBox(height: 7),
@@ -1056,7 +1102,7 @@ class _EarningMetricCard extends StatelessWidget {
             style: const TextStyle(
               color: AppColors.ink,
               fontSize: 14,
-              fontWeight: FontWeight.w800,
+              fontWeight: FontWeight.w600,
             ),
           ),
           const SizedBox(height: 3),
@@ -1089,6 +1135,11 @@ class _BarberBookingCard extends StatelessWidget {
     final service = appState.getService(booking.salonId, booking.serviceId);
 
     final outcomeColor = _outcomeColor();
+    final timeLabel = booking.isInstant
+        ? booking.status == BookingStatus.pending
+              ? 'Customer ETA ${booking.customerArrivalMinutes} min · salon window ${booking.salonArrivalMinutes} min'
+              : 'Arrive by ${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}'
+        : '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}';
     final canStart =
         booking.status == BookingStatus.confirmed &&
         bucket == BarberBookingBucket.upcoming &&
@@ -1120,18 +1171,50 @@ class _BarberBookingCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      service?.name ??
-                          (booking.serviceName.isEmpty
-                              ? 'Service'
-                              : booking.serviceName),
+                      booking.resolvedServiceName(service),
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                   ],
                 ),
               ),
-              AppPill(label: outcome, color: outcomeColor),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  AppPill(label: outcome, color: outcomeColor),
+                  if (booking.isInstant) ...[
+                    const SizedBox(height: 6),
+                    const AppPill(
+                      icon: Icons.bolt_outlined,
+                      label: 'Instant',
+                      color: AppColors.coral,
+                    ),
+                  ],
+                ],
+              ),
             ],
           ),
+          if (booking.isInstant &&
+              (booking.status == BookingStatus.pending ||
+                  booking.status == BookingStatus.confirmed)) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Customer countdown: ${appState.countdownTo(booking.start)}',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: AppColors.primaryDark,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+          if (booking.cancellationReason.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Cancellation reason: ${booking.cancellationReason}',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: AppColors.coral,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           Row(
             children: [
@@ -1139,8 +1222,8 @@ class _BarberBookingCard extends StatelessWidget {
               const SizedBox(width: 7),
               Expanded(
                 child: Text(
-                  '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}',
-                  style: const TextStyle(fontWeight: FontWeight.w700),
+                  timeLabel,
+                  style: const TextStyle(fontWeight: FontWeight.w500),
                 ),
               ),
             ],
@@ -1221,8 +1304,8 @@ class _MiniMetric extends StatelessWidget {
             value,
             style: const TextStyle(
               color: AppColors.ink,
-              fontSize: 22,
-              fontWeight: FontWeight.w900,
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
             ),
           ),
           Text(

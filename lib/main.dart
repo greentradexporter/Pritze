@@ -1,14 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
+import 'models/app_models.dart';
 import 'screens/customer/customer_home_screen.dart';
+import 'screens/salon/salon_dashboard_screen.dart';
 import 'services/firebase_bootstrap.dart';
 import 'state/app_state_scope.dart';
 import 'state/app_state.dart';
 import 'theme/app_theme.dart';
-
-@pragma('vm:entry-point')
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {}
+import 'widgets/trimtime_logo.dart';
+import 'widgets/customer_booking_confirmation_gate.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,7 +19,7 @@ Future<void> main() async {
     runApp(FirebaseUnavailableApp(error: firebase.error));
     return;
   }
-  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
   runApp(
     AppStateProvider(
@@ -42,8 +43,58 @@ class TrimtimeApp extends StatelessWidget {
     return MaterialApp(
       title: 'Pritze',
       theme: AppTheme.build(),
-      home: const CustomerHomeScreen(),
+      home: const AppEntryScreen(),
       debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+class AppEntryScreen extends StatelessWidget {
+  const AppEntryScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    if (appState.isRestoringSession) {
+      return const _SessionRestoreScreen();
+    }
+    return switch (appState.activeRole) {
+      UserRole.owner => const SalonDashboardScreen(),
+      UserRole.barber => const CustomerHomeScreen(),
+      UserRole.customer || null => const CustomerBookingConfirmationGate(
+        child: CustomerHomeScreen(),
+      ),
+    };
+  }
+}
+
+class _SessionRestoreScreen extends StatelessWidget {
+  const _SessionRestoreScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TrimtimeLogo(size: 60, shadow: false),
+              SizedBox(height: 20),
+              SizedBox(
+                height: 22,
+                width: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              SizedBox(height: 12),
+              Text(
+                'Opening Pritze',
+                style: TextStyle(fontWeight: FontWeight.w500),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

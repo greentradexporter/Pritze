@@ -5,7 +5,6 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/app_ui.dart';
-import '../barber/barber_dashboard_screen.dart';
 import '../customer/customer_home_screen.dart';
 import '../salon/salon_dashboard_screen.dart';
 
@@ -24,7 +23,7 @@ class PartnerHubScreen extends StatelessWidget {
               eyebrow: 'Partner space',
               title: 'Run the shop side from one place',
               subtitle:
-                  'Owners manage listings and teams. Barbers join salons and track the day.',
+                  'Owners manage listings, services, staff, and booking status.',
               icon: Icons.business_center,
             ),
             const SizedBox(height: 22),
@@ -56,23 +55,6 @@ class PartnerHubScreen extends StatelessWidget {
                 );
               },
             ),
-            const SizedBox(height: 12),
-            _PartnerCard(
-              icon: Icons.badge,
-              color: AppColors.primary,
-              title: 'Barber',
-              subtitle:
-                  'Join a shop, view assigned customers, and update work status.',
-              primaryLabel: 'Open barber tools',
-              onTap: () {
-                AppStateScope.read(context).selectRole(UserRole.barber);
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => const BarberDashboardScreen(),
-                  ),
-                );
-              },
-            ),
           ],
         ),
       ),
@@ -100,7 +82,6 @@ class _PartnerCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GlassCard(
-      onTap: onTap,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -124,16 +105,14 @@ class _PartnerCard extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              Text(
-                primaryLabel,
-                style: TextStyle(color: color, fontWeight: FontWeight.w900),
-              ),
-              const SizedBox(width: 6),
-              Icon(Icons.arrow_forward, size: 18, color: color),
-            ],
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: onTap,
+              icon: const Icon(Icons.arrow_forward),
+              label: Text(primaryLabel),
+            ),
           ),
         ],
       ),

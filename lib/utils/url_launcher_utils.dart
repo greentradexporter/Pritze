@@ -7,16 +7,23 @@ class UrlLauncherUtils {
     String urlString,
     String errorMessage,
   ) async {
-    final Uri url = Uri.parse(urlString);
+    final Uri? url = Uri.tryParse(urlString);
+    if (url == null) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(errorMessage)));
+      }
+      return;
+    }
     try {
-      if (await canLaunchUrl(url)) {
-        await launchUrl(url, mode: LaunchMode.externalApplication);
-      } else {
-        if (context.mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text(errorMessage)));
-        }
+      final launched =
+          await launchUrl(url, mode: LaunchMode.externalApplication) ||
+          await launchUrl(url, mode: LaunchMode.platformDefault);
+      if (!launched && context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(errorMessage)));
       }
     } catch (e) {
       if (context.mounted) {
@@ -57,7 +64,10 @@ class UrlLauncherUtils {
     BuildContext context,
     String directionsUrl,
   ) async {
-    final trimmed = directionsUrl.trim();
+    var trimmed = directionsUrl.trim();
+    if (trimmed.isNotEmpty && !trimmed.contains('://')) {
+      trimmed = 'https://$trimmed';
+    }
     final uri = Uri.tryParse(trimmed);
     if (uri == null ||
         !uri.hasScheme ||

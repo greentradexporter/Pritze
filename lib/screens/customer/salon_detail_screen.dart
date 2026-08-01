@@ -1,13 +1,11 @@
 import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
-import '../../models/service_catalog.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/salon_logo.dart';
-import '../../widgets/service_icon.dart';
 import 'salon_booking_screen.dart';
 
 class SalonDetailScreen extends StatelessWidget {
@@ -31,13 +29,26 @@ class SalonDetailScreen extends StatelessWidget {
       );
     }
 
-    final barbers = appState.barbersForSalon(salon.id);
+    final services = salon.availableServices;
+    final availableServiceIds = services.map((service) => service.id).toSet();
+    final barbers = appState
+        .barbersForSalon(salon.id)
+        .where((barber) => barber.serviceIds.any(availableServiceIds.contains))
+        .toList();
+    final instantServices = services
+        .where(
+          (service) => appState.isInstantBookingAvailable(
+            salon.id,
+            serviceId: service.id,
+          ),
+        )
+        .toList();
 
     return Scaffold(
       body: CustomScrollView(
         slivers: [
           SliverAppBar(
-            expandedHeight: 284,
+            expandedHeight: 236,
             pinned: true,
             backgroundColor: AppColors.canvas,
             surfaceTintColor: Colors.transparent,
@@ -76,6 +87,21 @@ class SalonDetailScreen extends StatelessWidget {
                     ),
                   ],
                 ),
+                if (instantServices.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: () => _showServicePickerSheet(
+                        context,
+                        salon,
+                        instantOnly: true,
+                      ),
+                      icon: const Icon(Icons.bolt_outlined),
+                      label: const Text('Book instantly'),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 20),
                 if (salon.photoUrls.isNotEmpty) ...[
                   _SalonPhotoGallery(photoUrls: salon.photoUrls),
@@ -92,7 +118,7 @@ class SalonDetailScreen extends StatelessWidget {
                       child: _BookingPathCard(
                         icon: Icons.design_services_outlined,
                         title: 'Pick service',
-                        subtitle: '${salon.services.length} available',
+                        subtitle: '${services.length} available',
                         color: AppColors.primary,
                         onTap: () => _showServicePickerSheet(context, salon),
                       ),
@@ -113,11 +139,11 @@ class SalonDetailScreen extends StatelessWidget {
                 const SizedBox(height: 22),
                 _CollapsibleSection(
                   title: 'Services',
-                  subtitle: '${salon.services.length} services',
+                  subtitle: '${services.length} services',
                   icon: Icons.design_services_outlined,
                   initiallyExpanded: true,
                   children: [
-                    for (final service in salon.services) ...[
+                    for (final service in services) ...[
                       _ServiceTile(
                         service: service,
                         availableBarbers: appState
@@ -179,8 +205,22 @@ class SalonDetailScreen extends StatelessWidget {
     );
   }
 
-  Future<void> _showServicePickerSheet(BuildContext context, Salon salon) {
+  Future<void> _showServicePickerSheet(
+    BuildContext context,
+    Salon salon, {
+    bool instantOnly = false,
+  }) {
     final appState = AppStateScope.read(context);
+    final services = instantOnly
+        ? salon.availableServices
+              .where(
+                (service) => appState.isInstantBookingAvailable(
+                  salon.id,
+                  serviceId: service.id,
+                ),
+              )
+              .toList()
+        : salon.availableServices;
     return showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -197,12 +237,16 @@ class SalonDetailScreen extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Choose a service',
+                    instantOnly
+                        ? 'Choose an instant service'
+                        : 'Choose a service',
                     style: Theme.of(context).textTheme.headlineSmall,
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Pick a service first, then choose an available barber.',
+                    instantOnly
+                        ? 'These services can be requested right now.'
+                        : 'Pick a service first, then choose an available barber.',
                     style: Theme.of(context).textTheme.bodyMedium,
                   ),
                 ],
@@ -212,10 +256,10 @@ class SalonDetailScreen extends StatelessWidget {
             Expanded(
               child: ListView.separated(
                 padding: const EdgeInsets.all(18),
-                itemCount: salon.services.length,
+                itemCount: services.length,
                 separatorBuilder: (_, _) => const SizedBox(height: 10),
                 itemBuilder: (context, index) {
-                  final service = salon.services[index];
+                  final service = services[index];
                   return _ServiceTile(
                     service: service,
                     availableBarbers: appState
@@ -299,7 +343,7 @@ class SalonDetailScreen extends StatelessWidget {
                                 child: Text(
                                   barber.name.characters.first,
                                   style: const TextStyle(
-                                    fontWeight: FontWeight.w900,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
                               ),
@@ -348,7 +392,7 @@ class SalonDetailScreen extends StatelessWidget {
     Salon salon,
     Barber barber,
   ) {
-    final services = salon.services
+    final services = salon.availableServices
         .where((service) => barber.serviceIds.contains(service.id))
         .toList();
 
@@ -372,7 +416,7 @@ class SalonDetailScreen extends StatelessWidget {
                       foregroundColor: AppColors.primary,
                       child: Text(
                         barber.name.characters.first,
-                        style: const TextStyle(fontWeight: FontWeight.w900),
+                        style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -452,7 +496,7 @@ class SalonDetailScreen extends StatelessWidget {
                             style: const TextStyle(
                               color: AppColors.ink,
                               fontSize: 16,
-                              fontWeight: FontWeight.w900,
+                              fontWeight: FontWeight.w600,
                             ),
                           ),
                         ],
@@ -476,31 +520,24 @@ class _DetailHero extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isCurrentlyOpen = AppStateScope.watch(
-      context,
-    ).isSalonCurrentlyOpen(salon.id);
+    final appState = AppStateScope.watch(context);
+    final isCurrentlyOpen = appState.isSalonCurrentlyOpen(salon.id);
     final accent = isCurrentlyOpen ? AppColors.primary : AppColors.muted;
+    final barberCount = appState.barbersForSalon(salon.id).length;
 
     return Container(
       color: AppColors.canvas,
       child: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(18, 72, 18, 12),
+          padding: const EdgeInsets.fromLTRB(16, 66, 16, 10),
           child: Align(
             alignment: Alignment.bottomCenter,
             child: Container(
-              padding: const EdgeInsets.all(14),
+              padding: const EdgeInsets.all(13),
               decoration: BoxDecoration(
                 color: Colors.white,
-                borderRadius: BorderRadius.circular(18),
+                borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: AppColors.line),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Color(0x0F0F172A),
-                    blurRadius: 18,
-                    offset: Offset(0, 10),
-                  ),
-                ],
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -526,24 +563,39 @@ class _DetailHero extends StatelessWidget {
                                     salon.name,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .headlineMedium
-                                        ?.copyWith(fontSize: 22),
+                                    style: Theme.of(
+                                      context,
+                                    ).textTheme.headlineMedium,
                                   ),
                                 ),
                                 const SizedBox(width: 8),
-                                AppPill(
-                                  label: isCurrentlyOpen ? 'Open' : 'Closed',
-                                  color: accent,
-                                  backgroundColor: accent.withAlpha(16),
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(
+                                      Icons.star_rounded,
+                                      color: AppColors.amber,
+                                      size: 18,
+                                    ),
+                                    const SizedBox(width: 3),
+                                    Text(
+                                      '${salon.rating}',
+                                      style: const TextStyle(
+                                        color: AppColors.ink,
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ],
                             ),
                             const SizedBox(height: 5),
                             Text(
-                              'Full address will be shown after the listing is verified.',
-                              maxLines: 2,
+                              salon.address.trim().isEmpty
+                                  ? 'Nearby salon'
+                                  : salon.address,
+                              maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: Theme.of(context).textTheme.bodyMedium,
                             ),
@@ -552,25 +604,28 @@ class _DetailHero extends StatelessWidget {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 14),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
+                  const SizedBox(height: 11),
+                  Row(
                     children: [
-                      AppPill(
-                        icon: Icons.star,
-                        label: '${salon.rating} (${salon.reviewCount})',
-                        color: AppColors.amber,
-                      ),
-                      AppPill(
-                        icon: Icons.near_me_outlined,
-                        label: salon.distanceLabel,
+                      _DetailFact(
+                        icon: Icons.schedule_outlined,
+                        label: _compactTimeRange(salon),
                         color: AppColors.primary,
                       ),
-                      AppPill(
-                        icon: Icons.schedule,
-                        label: '${salon.openTime} - ${salon.closeTime}',
-                        color: accent,
+                      const SizedBox(width: 14),
+                      _DetailFact(
+                        icon: Icons.content_cut,
+                        label: '$barberCount barbers',
+                        color: AppColors.muted,
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: _DetailFact(
+                          icon: Icons.near_me_outlined,
+                          label: salon.distanceLabel,
+                          color: AppColors.muted,
+                          expanded: true,
+                        ),
                       ),
                     ],
                   ),
@@ -580,6 +635,38 @@ class _DetailHero extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _DetailFact extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final bool expanded;
+
+  const _DetailFact({
+    required this.icon,
+    required this.label,
+    required this.color,
+    this.expanded = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final labelText = Text(
+      label,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: AppColors.ink, fontSize: 14),
+    );
+    return Row(
+      mainAxisSize: expanded ? MainAxisSize.max : MainAxisSize.min,
+      children: [
+        Icon(icon, color: color, size: 16),
+        const SizedBox(width: 5),
+        if (expanded) Expanded(child: labelText) else labelText,
+      ],
     );
   }
 }
@@ -605,7 +692,7 @@ class _SalonPhotoGallery extends StatelessWidget {
             itemBuilder: (context, index) {
               final url = photoUrls[index];
               return ClipRRect(
-                borderRadius: BorderRadius.circular(18),
+                borderRadius: BorderRadius.circular(8),
                 child: Stack(
                   children: [
                     SizedBox(
@@ -664,7 +751,7 @@ class _BookingPathCard extends StatelessWidget {
       child: Material(
         color: color.withAlpha(9),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(18),
+          borderRadius: BorderRadius.circular(8),
           side: BorderSide(color: color.withAlpha(42)),
         ),
         clipBehavior: Clip.antiAlias,
@@ -686,8 +773,8 @@ class _BookingPathCard extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                           color: AppColors.ink,
-                          fontSize: 15,
-                          fontWeight: FontWeight.w900,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
                     ),
@@ -730,7 +817,7 @@ class _CollapsibleSection extends StatelessWidget {
     return Container(
       decoration: BoxDecoration(
         color: AppColors.surface,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: AppColors.line),
       ),
       clipBehavior: Clip.antiAlias,
@@ -740,7 +827,7 @@ class _CollapsibleSection extends StatelessWidget {
           initiallyExpanded: initiallyExpanded,
           tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
           childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-          leading: SoftIconBox(icon: icon, color: AppColors.primary, size: 40),
+          leading: Icon(icon, color: AppColors.primary, size: 22),
           title: Text(title, style: Theme.of(context).textTheme.titleMedium),
           subtitle: Text(subtitle),
           children: children,
@@ -763,56 +850,54 @@ class _ServiceTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GlassCard(
-      onTap: onTap,
-      child: Row(
-        children: [
-          ServiceImageIcon(
-            category: service.category,
-            color: serviceColorForCategory(service.category),
-            size: 50,
+    return Material(
+      color: AppColors.surface,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 11),
+          decoration: const BoxDecoration(
+            border: Border(bottom: BorderSide(color: AppColors.line)),
           ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  service.name,
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  '${service.durationMinutes} min - $availableBarbers barbers available',
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 10),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
+          child: Row(
             children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      service.name,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '${service.durationMinutes} min · $availableBarbers barbers available',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
               Text(
                 '₹${service.price}',
                 style: const TextStyle(
                   color: AppColors.ink,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w900,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
                 ),
-              ),
-              const SizedBox(height: 6),
-              const Icon(
-                Icons.arrow_forward,
-                color: AppColors.primary,
-                size: 18,
               ),
             ],
           ),
-        ],
+        ),
       ),
     );
   }
+}
+
+String _compactTimeRange(Salon salon) {
+  String compact(String value) =>
+      value.replaceAll(':00', '').replaceAll(' ', '');
+  return '${compact(salon.openTime)}-${compact(salon.closeTime)}';
 }
 
 class _BarberCard extends StatelessWidget {
@@ -839,7 +924,7 @@ class _BarberCard extends StatelessWidget {
                   foregroundColor: AppColors.primary,
                   child: Text(
                     barber.name.characters.first,
-                    style: const TextStyle(fontWeight: FontWeight.w900),
+                    style: const TextStyle(fontWeight: FontWeight.w600),
                   ),
                 ),
                 const Spacer(),

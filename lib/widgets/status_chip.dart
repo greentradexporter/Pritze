@@ -22,8 +22,8 @@ class StatusChip extends StatelessWidget {
         status.label,
         style: TextStyle(
           color: color,
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
+          fontSize: 14,
+          fontWeight: FontWeight.w500,
         ),
       ),
     );

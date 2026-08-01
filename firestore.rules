@@ -43,6 +43,11 @@ service cloud.firestore {
       allow create: if signedIn() && request.auth.uid == userId;
     }
 
+    match /appConfig/{configId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
     match /salons/{salonId} {
       allow read: if true;
       allow create: if signedIn() &&
@@ -67,6 +72,16 @@ service cloud.firestore {
     match /slotLocks/{slotLockId} {
       allow read: if true;
       allow create, update: if signedIn();
+      allow delete: if false;
+    }
+
+    match /activeInstantBookings/{userId} {
+      allow read, create, update: if userOwnsProfile(userId);
+      allow delete: if false;
+    }
+
+    match /activeCustomerBookings/{userId} {
+      allow read, create, update: if userOwnsProfile(userId);
       allow delete: if false;
     }
 

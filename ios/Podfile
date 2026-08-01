@@ -1,5 +1,4 @@
-# Uncomment this line to define a global platform for your project
-# platform :ios, '13.0'
+platform :ios, '15.0'
 
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
@@ -39,5 +38,30 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+
+    target.build_configurations.each do |config|
+      config.build_settings.each do |key, value|
+        next unless value.respond_to?(:gsub)
+
+        config.build_settings[key] = value.gsub(
+          'DT_TOOLCHAIN_DIR',
+          'TOOLCHAIN_DIR'
+        )
+      end
+    end
+  end
+
+  support_files_pattern = File.join(
+    installer.sandbox.root,
+    'Target Support Files',
+    '**',
+    '*'
+  )
+  Dir.glob(support_files_pattern).each do |support_file_path|
+    next unless File.file?(support_file_path)
+
+    support_file = File.read(support_file_path)
+    updated = support_file.gsub('DT_TOOLCHAIN_DIR', 'TOOLCHAIN_DIR')
+    File.write(support_file_path, updated) if updated != support_file
   end
 end

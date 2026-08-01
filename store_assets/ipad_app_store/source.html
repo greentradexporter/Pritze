@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=2064, initial-scale=1">
+  <title>Pritze iPad App Store Screenshots</title>
+  <style>
+    :root {
+      --ink: #241f18;
+      --muted: #6e665b;
+      --gold: #a86f00;
+      --gold-dark: #765000;
+      --champagne: #f7f1e5;
+      --line: #ded7ca;
+      --white: #ffffff;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      background: var(--white);
+      height: 2752px;
+      margin: 0;
+      overflow: hidden;
+      width: 2064px;
+    }
+
+    body {
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+    }
+
+    .poster {
+      display: none;
+      height: 2752px;
+      overflow: hidden;
+      padding: 92px 96px 96px;
+      position: relative;
+      width: 2064px;
+    }
+
+    .poster.active { display: block; }
+
+    .poster::after {
+      background: var(--champagne);
+      bottom: 0;
+      content: "";
+      height: 440px;
+      left: 0;
+      position: absolute;
+      width: 100%;
+      z-index: 0;
+    }
+
+    .brand {
+      align-items: center;
+      display: flex;
+      gap: 18px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .brand img {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      height: 74px;
+      width: 74px;
+    }
+
+    .brand span {
+      font-size: 36px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    .copy {
+      margin-top: 72px;
+      max-width: 1700px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .eyebrow {
+      color: var(--gold-dark);
+      font-size: 26px;
+      font-weight: 650;
+      letter-spacing: 0;
+      margin: 0 0 14px;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      font-size: 78px;
+      font-weight: 650;
+      letter-spacing: 0;
+      line-height: 1.08;
+      margin: 0;
+    }
+
+    .subhead {
+      color: var(--muted);
+      font-size: 34px;
+      letter-spacing: 0;
+      line-height: 1.35;
+      margin: 22px 0 0;
+    }
+
+    .rule {
+      background: var(--gold);
+      height: 8px;
+      margin-top: 34px;
+      width: 132px;
+    }
+
+    .showcase {
+      align-items: end;
+      bottom: 92px;
+      display: grid;
+      gap: 44px;
+      grid-template-columns: 1fr 1fr;
+      left: 96px;
+      position: absolute;
+      right: 96px;
+      top: 620px;
+      z-index: 1;
+    }
+
+    .device {
+      background: var(--white);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 28px 70px rgba(36, 31, 24, 0.12);
+      height: 2010px;
+      overflow: hidden;
+      padding: 18px;
+      position: relative;
+    }
+
+    .device:first-child { transform: translateY(-64px); }
+
+    .device img {
+      display: block;
+      height: 100%;
+      object-fit: contain;
+      object-position: center top;
+      width: 100%;
+    }
+
+    .device::before {
+      background: var(--gold);
+      content: "";
+      height: 7px;
+      left: 18px;
+      position: absolute;
+      right: 18px;
+      top: 18px;
+      z-index: 2;
+    }
+  </style>
+</head>
+<body>
+  <section class="poster" data-screen="1">
+    <div class="brand"><img src="../../hosting/pritze-icon.png" alt=""><span>Pritze</span></div>
+    <div class="copy">
+      <p class="eyebrow">Discover</p>
+      <h1>Find your next salon</h1>
+      <p class="subhead">Browse services, prices and availability near you.</p>
+      <div class="rule"></div>
+    </div>
+    <div class="showcase">
+      <div class="device"><img src="../ios_app_store/01-discover.png" alt=""></div>
+      <div class="device"><img src="../ios_app_store/02-salon-detail.png" alt=""></div>
+    </div>
+  </section>
+
+  <section class="poster" data-screen="2">
+    <div class="brand"><img src="../../hosting/pritze-icon.png" alt=""><span>Pritze</span></div>
+    <div class="copy">
+      <p class="eyebrow">Compare</p>
+      <h1>Everything before you book</h1>
+      <p class="subhead">See timings, barbers, services and instant availability.</p>
+      <div class="rule"></div>
+    </div>
+    <div class="showcase">
+      <div class="device"><img src="../ios_app_store/02-salon-detail.png" alt=""></div>
+      <div class="device"><img src="../ios_app_store/03-booking.png" alt=""></div>
+    </div>
+  </section>
+
+  <section class="poster" data-screen="3">
+    <div class="brand"><img src="../../hosting/pritze-icon.png" alt=""><span>Pritze</span></div>
+    <div class="copy">
+      <p class="eyebrow">Book</p>
+      <h1>Reserve a slot in a few taps</h1>
+      <p class="subhead">Choose a barber or request an instant booking.</p>
+      <div class="rule"></div>
+    </div>
+    <div class="showcase">
+      <div class="device"><img src="../ios_app_store/03-booking.png" alt=""></div>
+      <div class="device"><img src="../ios_app_store/01-discover.png" alt=""></div>
+    </div>
+  </section>
+
+  <section class="poster" data-screen="4">
+    <div class="brand"><img src="../../hosting/pritze-icon.png" alt=""><span>Pritze</span></div>
+    <div class="copy">
+      <p class="eyebrow">Partner</p>
+      <h1>Built for salon teams</h1>
+      <p class="subhead">Manage requests, services, staff and daily availability.</p>
+      <div class="rule"></div>
+    </div>
+    <div class="showcase">
+      <div class="device"><img src="../ios_app_store/04-owner-dashboard.png" alt=""></div>
+      <div class="device"><img src="../ios_app_store/02-salon-detail.png" alt=""></div>
+    </div>
+  </section>
+
+  <script>
+    const requested = new URLSearchParams(location.search).get('screen') || '1';
+    document.querySelector(`[data-screen="${requested}"]`)?.classList.add('active');
+  </script>
+</body>
+</html>

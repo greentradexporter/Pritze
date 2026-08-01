@@ -23,7 +23,7 @@ class ServiceImageIcon extends StatelessWidget {
       width: size,
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: accent.withAlpha(34)),
         boxShadow: const [
           BoxShadow(
@@ -34,7 +34,7 @@ class ServiceImageIcon extends StatelessWidget {
         ],
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(13),
+        borderRadius: BorderRadius.circular(7),
         child: Image.asset(
           serviceIconAssetForCategory(category),
           fit: BoxFit.contain,
