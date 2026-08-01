@@ -47,6 +47,7 @@ app.*.map.json
 # Release app bundles
 *.aab
 *.apk
+*.ipa
 
 # This app is distributed on Android; keep desktop generated scaffolding out.
 /linux/
