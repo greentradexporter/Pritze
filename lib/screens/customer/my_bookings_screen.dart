@@ -45,7 +45,6 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
     final appState = AppStateScope.watch(context);
     final now = DateTime.now();
     final allBookings = appState.customerBookings;
-    final activeInstantBooking = appState.activeInstantBooking;
     final counts = {
       for (final bucket in CustomerBookingBucket.values)
         bucket: allBookings
@@ -69,26 +68,9 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Bookings'),
-        actions: [
-          AccountOverflowMenu(
-            role: UserRole.customer,
-            canLogout: appState.hasActiveCustomerSession,
-          ),
-          const SizedBox(width: 8),
-        ],
+        actions: [const CustomerNotificationButton(), const SizedBox(width: 8)],
       ),
-      bottomNavigationBar: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (activeInstantBooking != null)
-            BookingArrivalBottomPanel(
-              booking: activeInstantBooking,
-              audience: BookingTimerAudience.customer,
-              onTap: () {},
-            ),
-          const AppBottomNav(selectedIndex: 1),
-        ],
-      ),
+      bottomNavigationBar: const AppBottomNav(selectedIndex: 1),
       body: RefreshIndicator(
         onRefresh: appState.refresh,
         child: allBookings.isEmpty
@@ -304,14 +286,19 @@ class _BookingCard extends StatelessWidget {
     final timeLabel = booking.isInstant
         ? booking.status == BookingStatus.pending
               ? 'Instant request · waiting for salon'
+              : booking.status == BookingStatus.inProgress
+              ? 'Service started · appointment in progress'
               : 'Arrive by ${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}'
         : '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}';
     final canCancel =
         bucket == CustomerBookingBucket.active &&
-        now.isBefore(booking.start) &&
         (booking.status == BookingStatus.pending ||
-            booking.status == BookingStatus.confirmed);
-    final canReschedule = canCancel;
+            booking.status == BookingStatus.confirmed) &&
+        (booking.isInstant || now.isBefore(booking.start));
+    final canReschedule =
+        !booking.isInstant &&
+        booking.status == BookingStatus.confirmed &&
+        now.isBefore(booking.start.subtract(const Duration(hours: 2)));
     final canLeaveFeedback = booking.status == BookingStatus.completed;
 
     return GlassCard(
@@ -363,8 +350,8 @@ class _BookingCard extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           _DetailRow(icon: Icons.schedule, label: timeLabel),
-          if (((!booking.isInstant &&
-                      booking.status == BookingStatus.pending) ||
+          if (!booking.isInstant &&
+              (booking.status == BookingStatus.pending ||
                   booking.status == BookingStatus.confirmed) &&
               now.isBefore(booking.start)) ...[
             const SizedBox(height: 9),
@@ -377,8 +364,23 @@ class _BookingCard extends StatelessWidget {
           const SizedBox(height: 9),
           _DetailRow(
             icon: Icons.badge,
-            label: barber?.name ?? 'Assigned barber',
+            label:
+                barber?.name ??
+                (booking.isInstant
+                    ? 'Any available barber'
+                    : 'Assigned barber'),
           ),
+          if (!booking.isInstant &&
+              booking.status == BookingStatus.confirmed &&
+              now.isBefore(booking.start)) ...[
+            const SizedBox(height: 9),
+            _DetailRow(
+              icon: Icons.event_repeat_outlined,
+              label: canReschedule
+                  ? 'Rescheduling is available until 2 hours before the appointment.'
+                  : 'The 2-hour rescheduling window has closed.',
+            ),
+          ],
           const SizedBox(height: 9),
           _DetailRow(
             icon: Icons.timer_outlined,
@@ -402,6 +404,7 @@ class _BookingCard extends StatelessWidget {
           BookingStatusTimeline(
             key: ValueKey('booking-timeline-${booking.id}'),
             status: booking.status,
+            isInstant: booking.isInstant,
           ),
           if (canCancel || canReschedule || canLeaveFeedback) ...[
             const SizedBox(height: 16),
@@ -437,30 +440,16 @@ class _BookingCard extends StatelessWidget {
   }
 
   Future<void> _reschedule(BuildContext context, Booking booking) async {
-    try {
-      await AppStateScope.read(
-        context,
-      ).cancelBooking(booking.id, reason: 'Rescheduling this appointment');
-      if (!context.mounted) {
-        return;
-      }
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => SalonBookingScreen(
-            salonId: booking.salonId,
-            serviceId: booking.serviceId,
-            initialBarberId: booking.barberId,
-          ),
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SalonBookingScreen(
+          salonId: booking.salonId,
+          serviceId: booking.serviceId,
+          initialBarberId: booking.barberId,
+          rescheduleBookingId: booking.id,
         ),
-      );
-    } catch (error) {
-      if (!context.mounted) {
-        return;
-      }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Reschedule failed: $error')));
-    }
+      ),
+    );
   }
 
   Future<void> _cancelBooking(BuildContext context, Booking booking) async {
@@ -568,6 +557,7 @@ class _BookingCard extends StatelessWidget {
     final pageContext = context;
     final controller = TextEditingController();
     var rating = 5;
+    var isSubmitting = false;
     const ratingLabels = ['Poor', 'Fair', 'Good', 'Very good', 'Excellent'];
     showDialog<void>(
       context: context,
@@ -723,18 +713,62 @@ class _BookingCard extends StatelessWidget {
                         SizedBox(
                           height: 52,
                           child: FilledButton.icon(
-                            onPressed: () {
-                              Navigator.pop(context);
-                              ScaffoldMessenger.of(pageContext).showSnackBar(
-                                SnackBar(
-                                  content: Text(
-                                    'Thanks for the $rating-star feedback.',
-                                  ),
-                                ),
-                              );
-                            },
-                            icon: const Icon(Icons.send_rounded, size: 19),
-                            label: const Text('Submit feedback'),
+                            onPressed: isSubmitting
+                                ? null
+                                : () async {
+                                    setDialogState(() => isSubmitting = true);
+                                    try {
+                                      await AppStateScope.read(
+                                        pageContext,
+                                      ).submitSalonFeedback(
+                                        bookingId: booking.id,
+                                        rating: rating,
+                                        note: controller.text,
+                                      );
+                                      if (!context.mounted ||
+                                          !pageContext.mounted) {
+                                        return;
+                                      }
+                                      Navigator.pop(context);
+                                      ScaffoldMessenger.of(
+                                        pageContext,
+                                      ).showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            'Thanks for the $rating-star feedback.',
+                                          ),
+                                        ),
+                                      );
+                                    } catch (error) {
+                                      if (!context.mounted) return;
+                                      setDialogState(
+                                        () => isSubmitting = false,
+                                      );
+                                      ScaffoldMessenger.of(
+                                        pageContext,
+                                      ).showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            'Feedback failed: $error',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                  },
+                            icon: isSubmitting
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.send_rounded, size: 19),
+                            label: Text(
+                              isSubmitting
+                                  ? 'Submitting...'
+                                  : 'Submit feedback',
+                            ),
                           ),
                         ),
                         const SizedBox(height: 6),

@@ -4,7 +4,6 @@ const test = require("node:test");
 const {
   bookingRecipientRoles,
   bookingStatusRecipients,
-  excludeActor,
 } = require("./booking_notification_logic");
 
 const booking = {
@@ -13,11 +12,11 @@ const booking = {
   barberUid: "barber-1",
 };
 
-test("accept and reject notify customer and assigned barber", () => {
+test("booking changes notify customer, owner, and assigned barber", () => {
   for (const status of ["confirmed", "rejected"]) {
     assert.deepEqual(
       bookingStatusRecipients({}, {...booking, status}),
-      ["customer-1", "barber-1"],
+      ["customer-1", "owner-1", "barber-1"],
     );
   }
 });
@@ -29,7 +28,7 @@ test("customer cancellation notifies salon owner and assigned barber", () => {
       status: "cancelled",
       cancelledBy: "customer",
     }),
-    ["owner-1", "barber-1"],
+    ["customer-1", "owner-1", "barber-1"],
   );
 });
 
@@ -40,14 +39,7 @@ test("salon cancellation notifies customer and assigned barber", () => {
       status: "cancelled",
       cancelledBy: "salon",
     }),
-    ["customer-1", "barber-1"],
-  );
-});
-
-test("actor is not sent their own status push", () => {
-  assert.deepEqual(
-    excludeActor(["customer-1", "owner-1", "barber-1"], "owner-1"),
-    ["customer-1", "barber-1"],
+    ["customer-1", "owner-1", "barber-1"],
   );
 });
 

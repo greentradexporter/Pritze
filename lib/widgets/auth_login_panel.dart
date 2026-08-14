@@ -2,8 +2,10 @@ import 'dart:async';
 
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/app_models.dart';
+import '../services/android_phone_hint.dart';
 import '../state/app_state.dart';
 import '../state/app_state_scope.dart';
 import 'app_ui.dart';
@@ -42,14 +44,36 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
   AuthLoginMethod _method = AuthLoginMethod.phone;
   bool _isSubmitting = false;
   bool _phoneOtpSent = false;
+  bool _customerNameRequired = false;
+  bool _customerGooglePhoneRequired = false;
+  String? _phoneValidationMessage;
   bool _emailOtpSent = false;
   String _verificationId = '';
   Timer? _resendTimer;
   int _resendSeconds = 0;
+  AppState? _subscribedAppState;
+  StreamSubscription<String>? _autoVerificationSubscription;
+  bool _isAutoCompletingPhoneOtp = false;
+  bool _isPickingPhoneNumber = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final appState = AppStateScope.maybeRead(context);
+    if (identical(appState, _subscribedAppState)) {
+      return;
+    }
+    unawaited(_autoVerificationSubscription?.cancel());
+    _subscribedAppState = appState;
+    _autoVerificationSubscription = appState?.autoVerifiedPhoneNumbers.listen(
+      _handleAutoVerifiedPhone,
+    );
+  }
 
   @override
   void dispose() {
     _resendTimer?.cancel();
+    unawaited(_autoVerificationSubscription?.cancel());
     _nameController.dispose();
     _phoneController.dispose();
     _otpController.dispose();
@@ -65,12 +89,12 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
 
   @override
   Widget build(BuildContext context) {
-    final phoneOnly = widget.role == UserRole.customer;
+    final customerLogin = widget.role == UserRole.customer;
     final content = AutofillGroup(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (!phoneOnly) ...[
+          if (!customerLogin) ...[
             SegmentedButton<AuthLoginMethod>(
               segments: const [
                 ButtonSegment(
@@ -94,32 +118,29 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
             const SizedBox(height: 14),
           ],
           if (_method == AuthLoginMethod.phone) ...[
-            if (phoneOnly) ...[
-              TextField(
-                key: const ValueKey('customer-name-field'),
-                controller: _nameController,
-                focusNode: _nameFocusNode,
-                textCapitalization: TextCapitalization.words,
-                textInputAction: TextInputAction.next,
-                readOnly: _phoneOtpSent,
-                autofillHints: const [AutofillHints.name],
-                onSubmitted: (_) => _phoneFocusNode.requestFocus(),
-                decoration: const InputDecoration(
-                  labelText: 'Your name',
-                  hintText: 'Enter your full name',
-                  prefixIcon: Icon(Icons.person_outline),
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
             TextField(
               key: const ValueKey('phone-login-field'),
               controller: _phoneController,
               focusNode: _phoneFocusNode,
               keyboardType: TextInputType.phone,
+              inputFormatters: [
+                IndianMobileNumberFormatter(
+                  onTooLong: () => _setPhoneValidation(
+                    'Indian mobile numbers contain exactly 10 digits.',
+                  ),
+                ),
+              ],
+              onChanged: (value) {
+                if (value.length == 10 && _phoneValidationMessage != null) {
+                  setState(() => _phoneValidationMessage = null);
+                }
+              },
               textInputAction: TextInputAction.next,
               readOnly: _phoneOtpSent,
-              autofillHints: const [AutofillHints.telephoneNumber],
+              autofillHints: const [
+                AutofillHints.telephoneNumberDevice,
+                AutofillHints.telephoneNumber,
+              ],
               onSubmitted: (_) {
                 if (!_phoneOtpSent && !_isSubmitting) {
                   _submit();
@@ -127,12 +148,64 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
               },
               decoration: InputDecoration(
                 labelText: 'Phone number',
-                hintText: 'Enter mobile number',
-                helperText: widget.phoneHelperText ?? 'We will send an OTP.',
+                hintText: '10-digit mobile number',
+                helperText: _customerNameRequired
+                    ? 'Phone verified. Enter your name once to create the account.'
+                    : _customerGooglePhoneRequired
+                    ? 'Add your mobile number. No phone OTP is required.'
+                    : widget.phoneHelperText ?? 'We will send an OTP.',
+                errorText: _phoneValidationMessage,
+                prefixText: '+91 ',
                 prefixIcon: const Icon(Icons.phone_android_outlined),
               ),
             ),
-            if (_phoneOtpSent) ...[
+            if (!_phoneOtpSent && !_customerNameRequired) ...[
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  key: const ValueKey('suggest-phone-number-button'),
+                  onPressed: _isSubmitting || _isPickingPhoneNumber
+                      ? null
+                      : _pickDevicePhoneNumber,
+                  icon: _isPickingPhoneNumber
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.sim_card_outlined, size: 18),
+                  label: const Text('Use number from this phone'),
+                ),
+              ),
+            ],
+            if (customerLogin && _customerNameRequired) ...[
+              const SizedBox(height: 12),
+              TextField(
+                key: const ValueKey('customer-name-field'),
+                controller: _nameController,
+                focusNode: _nameFocusNode,
+                textCapitalization: TextCapitalization.words,
+                textInputAction: TextInputAction.done,
+                autofillHints: const [AutofillHints.name],
+                onSubmitted: (_) {
+                  if (!_isSubmitting) {
+                    _submit();
+                  }
+                },
+                decoration: const InputDecoration(
+                  labelText: 'Your name',
+                  hintText: 'Enter your full name',
+                  prefixIcon: Icon(Icons.person_outline),
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  key: const ValueKey('change-phone-number-button'),
+                  onPressed: _isSubmitting ? null : _resetPhoneOtp,
+                  child: const Text('Change number'),
+                ),
+              ),
+            ] else if (_phoneOtpSent) ...[
               const SizedBox(height: 12),
               TextField(
                 key: const ValueKey('phone-otp-field'),
@@ -178,6 +251,14 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
                 ],
               ),
             ],
+            if (_customerGooglePhoneRequired) ...[
+              const SizedBox(height: 4),
+              TextButton(
+                key: const ValueKey('cancel-customer-gmail-button'),
+                onPressed: _isSubmitting ? null : _cancelCustomerGoogleLogin,
+                child: const Text('Use another login method'),
+              ),
+            ],
           ] else if (_method == AuthLoginMethod.email) ...[
             TextField(
               key: const ValueKey('email-login-field'),
@@ -185,6 +266,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
               focusNode: _emailFocusNode,
               keyboardType: TextInputType.emailAddress,
               textInputAction: TextInputAction.next,
+              readOnly: _emailOtpSent,
               decoration: const InputDecoration(
                 labelText: 'Email address',
                 prefixIcon: Icon(Icons.alternate_email),
@@ -212,6 +294,30 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
                   prefixIcon: Icon(Icons.password_outlined),
                 ),
               ),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    key: const ValueKey('change-email-button'),
+                    onPressed: _isSubmitting ? null : _resetEmailOtp,
+                    child: const Text('Change email'),
+                  ),
+                  const SizedBox(width: 4),
+                  TextButton.icon(
+                    key: const ValueKey('resend-email-otp-button'),
+                    onPressed: _isSubmitting || _resendSeconds > 0
+                        ? null
+                        : _resendEmailOtp,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: Text(
+                      _resendSeconds > 0
+                          ? 'Resend in ${_resendSeconds}s'
+                          : 'Resend code',
+                    ),
+                  ),
+                ],
+              ),
             ],
           ],
           const SizedBox(height: 16),
@@ -226,7 +332,8 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
                 : Icon(_buttonIcon),
             label: Text(_buttonLabel),
           ),
-          if (!phoneOnly) ...[
+          if (widget.role != UserRole.barber &&
+              !_customerGooglePhoneRequired) ...[
             const SizedBox(height: 14),
             Row(
               children: [
@@ -266,6 +373,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     setState(() {
       _method = method;
       _phoneOtpSent = false;
+      _customerNameRequired = false;
       _emailOtpSent = false;
       _verificationId = '';
       _resendSeconds = 0;
@@ -286,6 +394,12 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
   }
 
   IconData get _buttonIcon {
+    if (_customerNameRequired) {
+      return Icons.person_add_alt_1_outlined;
+    }
+    if (_customerGooglePhoneRequired) {
+      return Icons.save_outlined;
+    }
     return switch (_method) {
       AuthLoginMethod.phone => Icons.sms_outlined,
       AuthLoginMethod.email => Icons.mark_email_unread_outlined,
@@ -293,9 +407,16 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
   }
 
   String get _buttonLabel {
+    if (_customerNameRequired) {
+      return 'Create customer account';
+    }
     return switch (_method) {
       AuthLoginMethod.phone =>
-        _phoneOtpSent ? 'Verify and sign in' : 'Continue',
+        _phoneOtpSent
+            ? 'Verify and sign in'
+            : _customerGooglePhoneRequired
+            ? 'Save phone and continue'
+            : 'Continue',
       AuthLoginMethod.email =>
         _emailOtpSent ? 'Verify and sign in' : 'Continue',
     };
@@ -331,6 +452,24 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     try {
       await _loginWithGoogle(appState);
       widget.onLoggedIn?.call();
+    } on CustomerPhoneRequiredException {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _method = AuthLoginMethod.phone;
+        _customerGooglePhoneRequired = true;
+        _phoneOtpSent = false;
+        _customerNameRequired = false;
+        _verificationId = '';
+        _otpController.clear();
+      });
+      _showSnack('Gmail connected. Add your 10-digit mobile number.');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _phoneFocusNode.requestFocus();
+        }
+      });
     } catch (error) {
       if (!mounted) {
         return;
@@ -346,15 +485,44 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
   }
 
   Future<void> _submitPhone(AppState appState) async {
-    final name = _nameController.text.trim();
-    final phone = _phoneController.text.trim();
-    if (widget.role == UserRole.customer && name.isEmpty) {
-      _showSnack('Enter your name');
-      _nameFocusNode.requestFocus();
+    final phoneDigits = _phoneController.text.replaceAll(RegExp(r'\D'), '');
+    if (phoneDigits.isEmpty) {
+      _setPhoneValidation('Enter your phone number');
       return;
     }
-    if (phone.isEmpty) {
-      _showSnack('Enter your phone number');
+    if (phoneDigits.length != 10) {
+      _setPhoneValidation(
+        phoneDigits.length == 9
+            ? 'Enter one more digit. Mobile number must contain 10 digits.'
+            : 'Enter a valid 10-digit Indian mobile number.',
+      );
+      _phoneFocusNode.requestFocus();
+      return;
+    }
+    if (_phoneValidationMessage != null) {
+      setState(() => _phoneValidationMessage = null);
+    }
+    final phone = '+91$phoneDigits';
+    if (_customerGooglePhoneRequired) {
+      await appState.completeCustomerGmailPhone(phone: phone);
+      if (mounted) {
+        setState(() => _customerGooglePhoneRequired = false);
+      }
+      widget.onLoggedIn?.call();
+      return;
+    }
+    if (_customerNameRequired) {
+      final name = _nameController.text.trim();
+      if (name.isEmpty) {
+        _showSnack('Enter your name to create your customer account');
+        _nameFocusNode.requestFocus();
+        return;
+      }
+      await appState.completeCustomerPhoneRegistration(
+        name: name,
+        phone: phone,
+      );
+      widget.onLoggedIn?.call();
       return;
     }
     if (!_phoneOtpSent) {
@@ -363,16 +531,23 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
         return;
       }
       if (verificationId.isEmpty) {
-        await _loginWithPhone(appState);
-        widget.onLoggedIn?.call();
+        await _completePhoneOtpLogin(appState);
         return;
       }
       setState(() {
         _verificationId = verificationId;
         _phoneOtpSent = true;
       });
+      if (appState.isPhoneAutoVerified(phone)) {
+        _verificationId = '';
+        await _completePhoneOtpLogin(appState);
+        return;
+      }
       _startResendCountdown();
-      _showSnack('OTP sent to ${appState.normalizePhone(phone)}');
+      _showSnack(
+        'OTP requested for ${appState.normalizePhone(phone)}. If it does not '
+        'arrive, resend it or change the number.',
+      );
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
           _phoneOtpFocusNode.requestFocus();
@@ -380,8 +555,99 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       });
       return;
     }
-    await _loginWithPhone(appState);
-    widget.onLoggedIn?.call();
+    if (!RegExp(r'^\d{6}$').hasMatch(_otpController.text.trim())) {
+      _showSnack('Enter the latest 6-digit OTP');
+      _phoneOtpFocusNode.requestFocus();
+      return;
+    }
+    await _completePhoneOtpLogin(appState);
+  }
+
+  Future<void> _completePhoneOtpLogin(AppState appState) async {
+    try {
+      await _loginWithPhone(appState);
+      widget.onLoggedIn?.call();
+    } on CustomerNameRequiredException {
+      if (!mounted) {
+        return;
+      }
+      _resendTimer?.cancel();
+      _otpController.clear();
+      setState(() {
+        _phoneOtpSent = true;
+        _customerNameRequired = true;
+        _resendSeconds = 0;
+      });
+      _showSnack('Phone verified. Enter your name once to create the account.');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _nameFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  Future<void> _handleAutoVerifiedPhone(String phone) async {
+    if (!mounted ||
+        _isAutoCompletingPhoneOtp ||
+        !_phoneOtpSent ||
+        _customerNameRequired ||
+        _customerGooglePhoneRequired) {
+      return;
+    }
+    final digits = _phoneController.text.replaceAll(RegExp(r'\D'), '');
+    if (digits.length != 10 || phone != '+91$digits') {
+      return;
+    }
+    _isAutoCompletingPhoneOtp = true;
+    setState(() {
+      _verificationId = '';
+      _isSubmitting = true;
+    });
+    try {
+      await _completePhoneOtpLogin(
+        _subscribedAppState ?? AppStateScope.read(context),
+      );
+    } catch (error) {
+      if (mounted) {
+        _showSnack(_friendlyLoginError(error));
+      }
+    } finally {
+      _isAutoCompletingPhoneOtp = false;
+      if (mounted) {
+        setState(() => _isSubmitting = false);
+      }
+    }
+  }
+
+  Future<void> _pickDevicePhoneNumber() async {
+    setState(() => _isPickingPhoneNumber = true);
+    try {
+      final digits = await DevicePhoneHint.request();
+      if (!mounted) {
+        return;
+      }
+      if (digits == null) {
+        _showSnack(
+          'No phone number was selected. You can enter the number manually.',
+        );
+        return;
+      }
+      _phoneController.value = TextEditingValue(
+        text: digits,
+        selection: TextSelection.collapsed(offset: digits.length),
+      );
+      setState(() => _phoneValidationMessage = null);
+      _phoneFocusNode.requestFocus();
+    } catch (error) {
+      if (mounted) {
+        _showSnack('Could not read a phone number from this device.');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isPickingPhoneNumber = false);
+      }
+    }
   }
 
   Future<void> _resendPhoneOtp() async {
@@ -400,8 +666,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       _otpController.clear();
       _verificationId = verificationId;
       if (verificationId.isEmpty) {
-        await _loginWithPhone(appState);
-        widget.onLoggedIn?.call();
+        await _completePhoneOtpLogin(appState);
         return;
       }
       _startResendCountdown();
@@ -420,9 +685,9 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     }
   }
 
-  void _startResendCountdown() {
+  void _startResendCountdown({int seconds = 30}) {
     _resendTimer?.cancel();
-    setState(() => _resendSeconds = 30);
+    setState(() => _resendSeconds = seconds);
     _resendTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (!mounted) {
         timer.cancel();
@@ -441,15 +706,39 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     _resendTimer?.cancel();
     setState(() {
       _phoneOtpSent = false;
+      _customerNameRequired = false;
       _verificationId = '';
       _resendSeconds = 0;
       _otpController.clear();
+      _nameController.clear();
+      _phoneValidationMessage = null;
     });
+    if (!_customerGooglePhoneRequired) {
+      unawaited(AppStateScope.read(context).cancelPendingCustomerPhoneLogin());
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _phoneFocusNode.requestFocus();
       }
     });
+  }
+
+  Future<void> _cancelCustomerGoogleLogin() async {
+    await AppStateScope.read(context).cancelPendingCustomerGmailLogin();
+    if (!mounted) {
+      return;
+    }
+    _resendTimer?.cancel();
+    setState(() {
+      _customerGooglePhoneRequired = false;
+      _phoneOtpSent = false;
+      _verificationId = '';
+      _resendSeconds = 0;
+      _phoneController.clear();
+      _otpController.clear();
+      _phoneValidationMessage = null;
+    });
+    _phoneFocusNode.requestFocus();
   }
 
   Future<void> _submitEmail(AppState appState) async {
@@ -465,7 +754,13 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
         return;
       }
       setState(() => _emailOtpSent = true);
-      _showSnack('Email OTP sent. Enter the code to continue.');
+      _startResendCountdown(seconds: 45);
+      _showSnack('Email OTP requested. Enter the latest code to continue.');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _emailOtpFocusNode.requestFocus();
+        }
+      });
       return;
     }
     final otp = _emailOtpController.text.trim();
@@ -476,6 +771,46 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     }
     await _loginWithEmail(appState);
     widget.onLoggedIn?.call();
+  }
+
+  Future<void> _resendEmailOtp() async {
+    if (_isSubmitting || _resendSeconds > 0) {
+      return;
+    }
+    final appState = AppStateScope.read(context);
+    setState(() => _isSubmitting = true);
+    try {
+      await appState.sendEmailOtp(email: _emailController.text.trim());
+      if (!mounted) {
+        return;
+      }
+      _emailOtpController.clear();
+      _startResendCountdown(seconds: 45);
+      _showSnack('A new email OTP was requested. Use only the latest code.');
+      _emailOtpFocusNode.requestFocus();
+    } catch (error) {
+      if (mounted) {
+        _showSnack(_friendlyLoginError(error));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmitting = false);
+      }
+    }
+  }
+
+  void _resetEmailOtp() {
+    _resendTimer?.cancel();
+    setState(() {
+      _emailOtpSent = false;
+      _resendSeconds = 0;
+      _emailOtpController.clear();
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _emailFocusNode.requestFocus();
+      }
+    });
   }
 
   Future<void> _loginWithPhone(AppState appState) {
@@ -538,9 +873,21 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  void _setPhoneValidation(String message) {
+    if (!mounted) {
+      return;
+    }
+    setState(() => _phoneValidationMessage = message);
+    _showSnack(message);
+  }
+
   String _friendlyLoginError(Object error) {
     if (error is FirebaseFunctionsException) {
       final detail = error.message?.toLowerCase() ?? '';
+      if (error.code == 'already-exists') {
+        return error.message ??
+            'This phone number is already registered for another account type.';
+      }
       if (error.code == 'permission-denied' &&
           detail.contains('incorrect email otp')) {
         return 'That email OTP is not correct. Please check the code and try again.';
@@ -583,11 +930,56 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       return 'Too many OTP attempts. Please wait and try again.';
     }
     if (message.contains('invalid-phone-number')) {
-      return 'Enter the phone number with country code, for example +91 98765 43210.';
+      return 'Enter a valid 10-digit Indian mobile number.';
+    }
+    if (message.contains('credential-already-in-use') ||
+        message.contains('account-exists-with-different-credential')) {
+      return 'This phone number belongs to another login. Sign in using the phone number instead.';
     }
     if (message.contains('invalid-verification-code')) {
       return 'That OTP is not correct. Please check the code and try again.';
     }
+    if (message.contains('replaced by a newer code')) {
+      return 'That OTP is no longer valid. Enter the latest code we sent.';
+    }
+    if (message.contains('network-request-failed') ||
+        message.contains('unavailable')) {
+      return 'Unable to contact the login service. Check your internet connection and try again.';
+    }
+    if (message.toLowerCase().contains('canceled') ||
+        message.toLowerCase().contains('cancelled')) {
+      return 'Google sign-in was cancelled.';
+    }
+    if (message.contains('already registered as a')) {
+      return message
+          .replaceFirst('Bad state: ', '')
+          .replaceFirst('Exception: ', '');
+    }
     return 'Login failed: $message';
+  }
+}
+
+class IndianMobileNumberFormatter extends TextInputFormatter {
+  final VoidCallback onTooLong;
+
+  IndianMobileNumberFormatter({required this.onTooLong});
+
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) {
+    var digits = newValue.text.replaceAll(RegExp(r'\D'), '');
+    if (digits.length == 12 && digits.startsWith('91')) {
+      digits = digits.substring(2);
+    }
+    if (digits.length > 10) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => onTooLong());
+      digits = digits.substring(0, 10);
+    }
+    return TextEditingValue(
+      text: digits,
+      selection: TextSelection.collapsed(offset: digits.length),
+    );
   }
 }

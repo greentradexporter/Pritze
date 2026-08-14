@@ -38,7 +38,7 @@ class BarberDashboardScreen extends StatelessWidget {
                 AccountOverflowMenu(
                   role: UserRole.barber,
                   canLogout: true,
-                  onNotificationOpened: (destination) {
+                  onNotificationOpened: (destination, {bookingId}) {
                     if (destination == AppNotificationDestination.bookings) {
                       DefaultTabController.of(dashboardContext).animateTo(0);
                     }
@@ -1198,7 +1198,7 @@ class _BarberBookingCard extends StatelessWidget {
                   booking.status == BookingStatus.confirmed)) ...[
             const SizedBox(height: 8),
             Text(
-              'Customer countdown: ${appState.countdownTo(booking.start)}',
+              'Customer expected by ${appState.formatTime(booking.start)}',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: AppColors.primaryDark,
                 fontWeight: FontWeight.w600,

@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 class AppColors {
@@ -27,9 +26,8 @@ class AppColors {
 
 class AppTheme {
   static ThemeData build() {
-    final isIOS = defaultTargetPlatform == TargetPlatform.iOS;
-    final actionColor = isIOS ? AppColors.primaryDark : AppColors.primary;
-    final borderColor = isIOS ? AppColors.iosLine : AppColors.line;
+    const actionColor = AppColors.primary;
+    const borderColor = AppColors.line;
     final colorScheme = ColorScheme.light(
       primary: actionColor,
       onPrimary: Colors.white,

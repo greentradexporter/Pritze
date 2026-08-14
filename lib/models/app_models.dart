@@ -13,6 +13,18 @@ enum SalonBookingBucket { requests, upcoming, active, history, cancelled }
 
 enum CustomerBookingBucket { active, history, cancelled }
 
+enum AppNotificationDestination { bookings, overview, team }
+
+class AppNotificationNavigation {
+  final AppNotificationDestination destination;
+  final String bookingId;
+
+  const AppNotificationNavigation({
+    required this.destination,
+    this.bookingId = '',
+  });
+}
+
 extension BookingStatusLabel on BookingStatus {
   String get label {
     switch (this) {
@@ -84,12 +96,26 @@ class UserAccount {
   final String name;
   final String contact;
   final LoginProvider provider;
+  final String photoUrl;
+  final String gender;
+  final String birthDate;
+  final List<String> preferredStyles;
+  final List<String> stylePhotoUrls;
+  final double salonRating;
+  final int salonRatingCount;
 
   const UserAccount({
     required this.id,
     required this.name,
     required this.contact,
     required this.provider,
+    this.photoUrl = '',
+    this.gender = '',
+    this.birthDate = '',
+    this.preferredStyles = const [],
+    this.stylePhotoUrls = const [],
+    this.salonRating = 0,
+    this.salonRatingCount = 0,
   });
 
   UserAccount copyWith({
@@ -97,14 +123,68 @@ class UserAccount {
     String? name,
     String? contact,
     LoginProvider? provider,
+    String? photoUrl,
+    String? gender,
+    String? birthDate,
+    List<String>? preferredStyles,
+    List<String>? stylePhotoUrls,
+    double? salonRating,
+    int? salonRatingCount,
   }) {
     return UserAccount(
       id: id ?? this.id,
       name: name ?? this.name,
       contact: contact ?? this.contact,
       provider: provider ?? this.provider,
+      photoUrl: photoUrl ?? this.photoUrl,
+      gender: gender ?? this.gender,
+      birthDate: birthDate ?? this.birthDate,
+      preferredStyles: preferredStyles ?? this.preferredStyles,
+      stylePhotoUrls: stylePhotoUrls ?? this.stylePhotoUrls,
+      salonRating: salonRating ?? this.salonRating,
+      salonRatingCount: salonRatingCount ?? this.salonRatingCount,
     );
   }
+}
+
+class SalonFeedback {
+  final String bookingId;
+  final String customerUid;
+  final String salonId;
+  final String salonName;
+  final int rating;
+  final String note;
+  final DateTime createdAt;
+
+  const SalonFeedback({
+    required this.bookingId,
+    required this.customerUid,
+    required this.salonId,
+    required this.salonName,
+    required this.rating,
+    required this.note,
+    required this.createdAt,
+  });
+}
+
+class CustomerSalonRating {
+  final String bookingId;
+  final String customerUid;
+  final String salonId;
+  final String salonName;
+  final int rating;
+  final String note;
+  final DateTime createdAt;
+
+  const CustomerSalonRating({
+    required this.bookingId,
+    required this.customerUid,
+    required this.salonId,
+    required this.salonName,
+    required this.rating,
+    required this.note,
+    required this.createdAt,
+  });
 }
 
 class SalonService {
@@ -155,6 +235,7 @@ class Salon {
   final String address;
   final String directionsUrl;
   final String phone;
+  final String email;
   final String logoUrl;
   final List<String> photoUrls;
   final String distanceLabel;
@@ -174,6 +255,7 @@ class Salon {
     required this.address,
     this.directionsUrl = '',
     required this.phone,
+    this.email = '',
     required this.logoUrl,
     this.photoUrls = const [],
     required this.distanceLabel,
@@ -194,6 +276,7 @@ class Salon {
     String? address,
     String? directionsUrl,
     String? phone,
+    String? email,
     String? logoUrl,
     List<String>? photoUrls,
     String? distanceLabel,
@@ -213,6 +296,7 @@ class Salon {
       address: address ?? this.address,
       directionsUrl: directionsUrl ?? this.directionsUrl,
       phone: phone ?? this.phone,
+      email: email ?? this.email,
       logoUrl: logoUrl ?? this.logoUrl,
       photoUrls: photoUrls ?? this.photoUrls,
       distanceLabel: distanceLabel ?? this.distanceLabel,
@@ -234,6 +318,11 @@ class Salon {
       return photoUrls.first;
     }
     return logoUrl;
+  }
+
+  String get displayName {
+    final value = name.trim();
+    return value.isEmpty ? 'Salon listing' : value;
   }
 
   List<SalonService> get availableServices =>
@@ -317,6 +406,7 @@ class Booking {
   final String? customerUid;
   final String salonId;
   final String serviceId;
+  final List<String> serviceIds;
   final String barberId;
   final String customerName;
   final String customerPhone;
@@ -331,6 +421,12 @@ class Booking {
   final DateTime createdAt;
   final bool isInstant;
   final DateTime? acceptedAt;
+  final DateTime? startedAt;
+  final DateTime? completedAt;
+  final DateTime? cancelledAt;
+  final DateTime? rejectedAt;
+  final DateTime? customerArrivalReminderSentAt;
+  final DateTime? ownerArrivalReminderSentAt;
   final int arrivalMinutes;
   final String cancellationReason;
   final String cancelledBy;
@@ -340,6 +436,7 @@ class Booking {
     this.customerUid,
     required this.salonId,
     required this.serviceId,
+    this.serviceIds = const [],
     required this.barberId,
     required this.customerName,
     required this.customerPhone,
@@ -354,6 +451,12 @@ class Booking {
     required this.createdAt,
     this.isInstant = false,
     this.acceptedAt,
+    this.startedAt,
+    this.completedAt,
+    this.cancelledAt,
+    this.rejectedAt,
+    this.customerArrivalReminderSentAt,
+    this.ownerArrivalReminderSentAt,
     this.arrivalMinutes = 0,
     this.cancellationReason = '',
     this.cancelledBy = '',
@@ -366,7 +469,16 @@ class Booking {
     return isInstant ? 15 : 0;
   }
 
+  List<String> get resolvedServiceIds {
+    if (serviceIds.isNotEmpty) {
+      return List.unmodifiable(serviceIds);
+    }
+    return serviceId.trim().isEmpty ? const [] : [serviceId];
+  }
+
   int get salonArrivalMinutes => customerArrivalMinutes + 5;
+
+  DateTime get salonArrivalDeadline => start.add(const Duration(minutes: 5));
 
   String resolvedServiceName([SalonService? currentService]) {
     final orderedName = serviceName.trim();
@@ -389,6 +501,7 @@ class Booking {
     String? customerUid,
     String? salonId,
     String? serviceId,
+    List<String>? serviceIds,
     String? barberId,
     String? customerName,
     String? customerPhone,
@@ -403,6 +516,12 @@ class Booking {
     DateTime? createdAt,
     bool? isInstant,
     DateTime? acceptedAt,
+    DateTime? startedAt,
+    DateTime? completedAt,
+    DateTime? cancelledAt,
+    DateTime? rejectedAt,
+    DateTime? customerArrivalReminderSentAt,
+    DateTime? ownerArrivalReminderSentAt,
     int? arrivalMinutes,
     String? cancellationReason,
     String? cancelledBy,
@@ -412,6 +531,7 @@ class Booking {
       customerUid: customerUid ?? this.customerUid,
       salonId: salonId ?? this.salonId,
       serviceId: serviceId ?? this.serviceId,
+      serviceIds: serviceIds ?? this.serviceIds,
       barberId: barberId ?? this.barberId,
       customerName: customerName ?? this.customerName,
       customerPhone: customerPhone ?? this.customerPhone,
@@ -426,6 +546,14 @@ class Booking {
       createdAt: createdAt ?? this.createdAt,
       isInstant: isInstant ?? this.isInstant,
       acceptedAt: acceptedAt ?? this.acceptedAt,
+      startedAt: startedAt ?? this.startedAt,
+      completedAt: completedAt ?? this.completedAt,
+      cancelledAt: cancelledAt ?? this.cancelledAt,
+      rejectedAt: rejectedAt ?? this.rejectedAt,
+      customerArrivalReminderSentAt:
+          customerArrivalReminderSentAt ?? this.customerArrivalReminderSentAt,
+      ownerArrivalReminderSentAt:
+          ownerArrivalReminderSentAt ?? this.ownerArrivalReminderSentAt,
       arrivalMinutes: arrivalMinutes ?? this.arrivalMinutes,
       cancellationReason: cancellationReason ?? this.cancellationReason,
       cancelledBy: cancelledBy ?? this.cancelledBy,

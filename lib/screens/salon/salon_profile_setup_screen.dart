@@ -1,4 +1,6 @@
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../models/app_models.dart';
@@ -7,6 +9,7 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/service_icon.dart';
+import '../customer/customer_home_screen.dart';
 
 class SalonProfileSetupScreen extends StatefulWidget {
   const SalonProfileSetupScreen({super.key});
@@ -23,6 +26,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
   final _addressController = TextEditingController();
   final _directionsUrlController = TextEditingController();
   final _phoneController = TextEditingController();
+  final _emailController = TextEditingController();
   final _openTimeController = TextEditingController();
   final _closeTimeController = TextEditingController();
   List<String> _photoUrls = [];
@@ -42,6 +46,11 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _addressController.text = salon.address;
     _directionsUrlController.text = salon.directionsUrl;
     _phoneController.text = salon.phone.contains('@') ? '' : salon.phone;
+    final ownerContact =
+        AppStateScope.read(context).ownerAccount?.contact ?? '';
+    _emailController.text = salon.email.isNotEmpty
+        ? salon.email
+        : (ownerContact.contains('@') ? ownerContact : '');
     _photoUrls = [...salon.photoUrls];
     _openTimeController.text = salon.openTime;
     _closeTimeController.text = salon.closeTime;
@@ -55,6 +64,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _addressController.dispose();
     _directionsUrlController.dispose();
     _phoneController.dispose();
+    _emailController.dispose();
     _openTimeController.dispose();
     _closeTimeController.dispose();
     super.dispose();
@@ -64,22 +74,34 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final salon = appState.ownerSalon;
+    final isNewOnboarding = appState.ownerSalonOrNull == null;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Shop registration')),
+      appBar: AppBar(
+        title: const Text('Shop registration'),
+        leading: isNewOnboarding
+            ? IconButton(
+                key: const ValueKey('exit-salon-onboarding-icon'),
+                onPressed: _isSaving ? null : () => _returnToCustomerHome(),
+                icon: const Icon(Icons.home_outlined),
+                tooltip: 'Back to customer home',
+              )
+            : null,
+      ),
       body: Form(
         key: _formKey,
         child: ListView(
           padding: const EdgeInsets.fromLTRB(18, 10, 18, 28),
           children: [
-            const AppHeroHeader(
-              eyebrow: 'Owner profile',
-              title: 'Register your shop for customer bookings',
-              subtitle:
-                  'Add shop name, address, operating hours, and the service menu shown to customers.',
-              icon: Icons.storefront,
-            ),
-            const SizedBox(height: 22),
+            if (isNewOnboarding) ...[
+              OutlinedButton.icon(
+                key: const ValueKey('exit-salon-onboarding'),
+                onPressed: _isSaving ? null : () => _returnToCustomerHome(),
+                icon: const Icon(Icons.arrow_back_rounded),
+                label: const Text('Not a salon owner? Back to customer home'),
+              ),
+              const SizedBox(height: 16),
+            ],
             const SectionHeader(title: 'Shop details'),
             const SizedBox(height: 10),
             GlassCard(
@@ -132,10 +154,26 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                     controller: _phoneController,
                     keyboardType: TextInputType.phone,
                     decoration: const InputDecoration(
-                      labelText: 'Phone number',
+                      labelText: 'Owner phone number',
+                      helperText:
+                          'Required for the salon profile, even if you signed in by email.',
                       prefixIcon: Icon(Icons.phone_outlined),
                     ),
-                    validator: _required,
+                    validator: _phone,
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _emailController,
+                    keyboardType: TextInputType.emailAddress,
+                    autocorrect: false,
+                    textCapitalization: TextCapitalization.none,
+                    decoration: const InputDecoration(
+                      labelText: 'Owner email address',
+                      helperText:
+                          'Required for the salon profile, even if you signed in by phone.',
+                      prefixIcon: Icon(Icons.email_outlined),
+                    ),
+                    validator: _email,
                   ),
                   const SizedBox(height: 12),
                   Row(
@@ -245,6 +283,17 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _returnToCustomerHome() async {
+    await AppStateScope.read(context).signOutActiveUser();
+    if (!mounted) {
+      return;
+    }
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const CustomerHomeScreen()),
+      (_) => false,
     );
   }
 
@@ -360,6 +409,30 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     return null;
   }
 
+  String? _phone(String? value) {
+    final requiredError = _required(value);
+    if (requiredError != null) {
+      return requiredError;
+    }
+    final trimmed = value!.trim();
+    final digits = trimmed.replaceAll(RegExp(r'\D'), '');
+    if (digits.length < 8 || digits.length > 15 || digits.startsWith('0')) {
+      return 'Enter a valid phone number';
+    }
+    return null;
+  }
+
+  String? _email(String? value) {
+    final requiredError = _required(value);
+    if (requiredError != null) {
+      return requiredError;
+    }
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(value!.trim())) {
+      return 'Enter a valid email address';
+    }
+    return null;
+  }
+
   String? _time(String? value) {
     final requiredError = _required(value);
     if (requiredError != null) {
@@ -462,6 +535,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         address: _addressController.text,
         directionsUrl: _directionsUrlController.text,
         phone: _phoneController.text,
+        email: _emailController.text,
         logoUrl: '',
         photoUrls: _photoUrls,
         openTime: _openTimeController.text,
@@ -479,7 +553,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       }
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Save failed: $error')));
+      ).showSnackBar(SnackBar(content: Text(_saveError(error))));
     } finally {
       if (mounted) {
         setState(() => _isSaving = false);
@@ -505,6 +579,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         address: _addressController.text,
         directionsUrl: _directionsUrlController.text,
         phone: _phoneController.text,
+        email: _emailController.text,
         logoUrl: '',
         photoUrls: _photoUrls,
         openTime: _openTimeController.text,
@@ -596,6 +671,18 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       return 'Paste a complete link beginning with https://';
     }
     return null;
+  }
+
+  String _saveError(Object error) {
+    if (error is FirebaseFunctionsException &&
+        error.message?.trim().isNotEmpty == true) {
+      return error.message!.trim();
+    }
+    final message = error.toString().replaceFirst(
+      RegExp(r'^(StateError|FormatException|Invalid argument)\s*:\s*'),
+      '',
+    );
+    return message.isEmpty ? 'Could not save the salon profile.' : message;
   }
 
   void _showAddServiceDialog(BuildContext context) {
@@ -941,10 +1028,41 @@ class _SalonPhotoTile extends StatelessWidget {
   }
 }
 
-class _ServiceCard extends StatelessWidget {
+class _ServiceCard extends StatefulWidget {
   final SalonService service;
 
   const _ServiceCard({required this.service});
+
+  @override
+  State<_ServiceCard> createState() => _ServiceCardState();
+}
+
+class _ServiceCardState extends State<_ServiceCard> {
+  late final TextEditingController _priceController;
+  bool _isEditingPrice = false;
+  bool _isSavingPrice = false;
+
+  SalonService get service => widget.service;
+
+  @override
+  void initState() {
+    super.initState();
+    _priceController = TextEditingController(text: '${service.price}');
+  }
+
+  @override
+  void didUpdateWidget(covariant _ServiceCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_isEditingPrice && oldWidget.service.price != service.price) {
+      _priceController.text = '${service.price}';
+    }
+  }
+
+  @override
+  void dispose() {
+    _priceController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1001,13 +1119,72 @@ class _ServiceCard extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
-          Text(
-            '₹${service.price}',
-            style: const TextStyle(
-              color: AppColors.ink,
-              fontWeight: FontWeight.w600,
+          if (_isEditingPrice)
+            SizedBox(
+              width: 112,
+              child: TextField(
+                key: ValueKey('service-price-editor-${service.id}'),
+                controller: _priceController,
+                autofocus: true,
+                enabled: !_isSavingPrice,
+                keyboardType: TextInputType.number,
+                textInputAction: TextInputAction.done,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                selectAllOnFocus: true,
+                onSubmitted: (_) => _savePrice(context),
+                decoration: InputDecoration(
+                  prefixText: '₹',
+                  labelText: 'Price',
+                  isDense: true,
+                  suffixIcon: IconButton(
+                    tooltip: 'Save price',
+                    onPressed: _isSavingPrice
+                        ? null
+                        : () => _savePrice(context),
+                    icon: _isSavingPrice
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.check, size: 19),
+                  ),
+                ),
+              ),
+            )
+          else
+            Tooltip(
+              message: 'Tap to edit price',
+              child: InkWell(
+                key: ValueKey('service-price-${service.id}'),
+                borderRadius: BorderRadius.circular(10),
+                onTap: _beginPriceEdit,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 10,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '₹${service.price}',
+                        style: const TextStyle(
+                          color: AppColors.ink,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(width: 3),
+                      const Icon(
+                        Icons.edit_outlined,
+                        size: 15,
+                        color: AppColors.muted,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
-          ),
           PopupMenuButton<String>(
             tooltip: 'Service actions',
             onSelected: (action) {
@@ -1079,6 +1256,58 @@ class _ServiceCard extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  void _beginPriceEdit() {
+    _priceController
+      ..text = '${service.price}'
+      ..selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: '${service.price}'.length,
+      );
+    setState(() => _isEditingPrice = true);
+  }
+
+  Future<void> _savePrice(BuildContext context) async {
+    if (_isSavingPrice) {
+      return;
+    }
+    final price = int.tryParse(_priceController.text.trim()) ?? 0;
+    if (price <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a price greater than zero.')),
+      );
+      return;
+    }
+    if (price == service.price) {
+      setState(() => _isEditingPrice = false);
+      return;
+    }
+    setState(() => _isSavingPrice = true);
+    try {
+      await AppStateScope.read(context).updateOwnerService(
+        serviceId: service.id,
+        name: service.name,
+        category: service.category,
+        price: price,
+        durationMinutes: service.durationMinutes,
+        isAvailable: service.isAvailable,
+        instantBookingEnabled: service.instantBookingEnabled,
+      );
+      if (mounted) {
+        setState(() => _isEditingPrice = false);
+      }
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Price update failed: $error')));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSavingPrice = false);
+      }
+    }
   }
 
   Future<void> _updateServiceControls(

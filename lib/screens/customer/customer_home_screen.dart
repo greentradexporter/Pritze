@@ -4,10 +4,10 @@ import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../state/app_state.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/app_ui.dart';
-import '../../widgets/booking_status_timeline.dart';
 import '../../widgets/salon_logo.dart';
 import 'salon_detail_screen.dart';
 import 'my_bookings_screen.dart';
@@ -20,7 +20,7 @@ class CustomerHomeScreen extends StatefulWidget {
 }
 
 class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
-  _ServiceCategory? _selectedCategory;
+  final Set<_ServiceCategory> _selectedCategories = {};
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
 
@@ -33,26 +33,22 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final bookableSalons = appState.bookableSalons;
+    final pendingNavigation = appState.activeRole == UserRole.customer
+        ? appState.takePendingNotificationNavigation()
+        : null;
+    if (pendingNavigation?.destination == AppNotificationDestination.bookings) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (context.mounted && ModalRoute.of(context)?.isCurrent == true) {
+          Navigator.of(
+            context,
+          ).push(MaterialPageRoute(builder: (_) => const MyBookingsScreen()));
+        }
+      });
+    }
     final visibleSalons = _rankedSalons(appState);
-    final accent = _selectedCategory?.color ?? AppColors.primary;
-    final isIOS = Theme.of(context).platform == TargetPlatform.iOS;
-    final currentBooking = _currentBooking(appState.customerBookings);
-
+    final accent = _selectedCategories.firstOrNull?.color ?? AppColors.primary;
     return Scaffold(
-      bottomNavigationBar: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (currentBooking != null)
-            CurrentBookingBottomPanel(
-              booking: currentBooking,
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
-              ),
-            ),
-          const AppBottomNav(selectedIndex: 0),
-        ],
-      ),
+      bottomNavigationBar: const AppBottomNav(selectedIndex: 0),
       body: SafeArea(
         child: RefreshIndicator(
           onRefresh: appState.refresh,
@@ -60,7 +56,7 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
             physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
             children: [
-              _LocationHeader(canLogout: appState.hasActiveCustomerSession),
+              const _LocationHeader(),
               const SizedBox(height: 12),
               _HeroSearch(
                 accent: accent,
@@ -76,14 +72,14 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
               const SizedBox(height: 18),
               SectionHeader(
                 title: 'Services',
-                actionLabel: _selectedCategory == null ? null : 'Clear',
-                onAction: _selectedCategory == null
+                actionLabel: _selectedCategories.isEmpty ? null : 'Clear',
+                onAction: _selectedCategories.isEmpty
                     ? null
-                    : () => setState(() => _selectedCategory = null),
+                    : () => setState(_selectedCategories.clear),
               ),
               const SizedBox(height: 8),
               SizedBox(
-                height: isIOS ? 92 : 82,
+                height: 82,
                 child: ListView.separated(
                   key: const Key('service-category-list'),
                   scrollDirection: Axis.horizontal,
@@ -93,9 +89,7 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
                     final category = _popularCategories[index];
                     return _CategoryCard(
                       category: category,
-                      selected: _selectedCategory == category,
-                      count: category.salonCount(bookableSalons),
-                      useIOSLayout: isIOS,
+                      selected: _selectedCategories.contains(category),
                       onTap: () => _toggleCategory(category),
                     );
                   },
@@ -105,23 +99,28 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
               _ResultsHeader(
                 title: _searchQuery.isNotEmpty
                     ? 'Search results'
-                    : (_selectedCategory == null
+                    : (_selectedCategories.isEmpty
                           ? 'Recommended'
-                          : '${_selectedCategory!.label} matches'),
-                subtitle: _selectedCategory == null
-                    ? 'Top-rated salons open near you'
-                    : 'Open salons offering ${_selectedCategory!.label.toLowerCase()}',
+                          : _selectedCategories.length == 1
+                          ? '${_selectedCategories.first.label} matches'
+                          : '${_selectedCategories.length} services selected'),
+                subtitle: _selectedCategories.isEmpty
+                    ? 'All salon listings near you'
+                    : 'Salons offering all selected services',
               ),
               const SizedBox(height: 8),
               if (visibleSalons.isEmpty)
                 const EmptyState(
                   icon: Icons.search_off,
-                  title: 'No open salons found',
-                  message: 'Try another service or search again later.',
+                  title: 'No salons found',
+                  message: 'Try another service or change your search.',
                 )
               else
                 for (final salon in visibleSalons) ...[
-                  _SalonCard(salon: salon, selectedCategory: _selectedCategory),
+                  _SalonCard(
+                    salon: salon,
+                    selectedCategories: _selectedCategories,
+                  ),
                   const SizedBox(height: 10),
                 ],
             ],
@@ -131,48 +130,47 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
     );
   }
 
-  Booking? _currentBooking(List<Booking> bookings) {
-    final now = DateTime.now();
-    final visible = bookings.where((booking) {
-      switch (booking.status) {
-        case BookingStatus.pending:
-        case BookingStatus.confirmed:
-        case BookingStatus.inProgress:
-          return true;
-        case BookingStatus.rejected:
-        case BookingStatus.cancelled:
-          return now.difference(booking.createdAt).inHours < 24;
-        case BookingStatus.completed:
-          return false;
-      }
-    }).toList()..sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    return visible.isEmpty ? null : visible.first;
-  }
-
   void _toggleCategory(_ServiceCategory category) {
     setState(() {
-      _selectedCategory = _selectedCategory == category ? null : category;
+      if (!_selectedCategories.add(category)) {
+        _selectedCategories.remove(category);
+      }
     });
   }
 
   List<Salon> _rankedSalons(AppState appState) {
-    final category = _selectedCategory;
     final query = _searchQuery.trim().toLowerCase();
-    final salons = appState.bookableSalons
+    final salons = appState.discoverableSalons
         .where(
           (salon) =>
-              appState.isSalonCurrentlyOpen(salon.id) &&
-              (category == null ||
-                  salon.availableServices.any(category.matches)) &&
+              _selectedCategories.every(
+                (category) => salon.availableServices.any(category.matches),
+              ) &&
               (query.isEmpty || _matchesSearch(salon, query)),
         )
         .toList();
 
     salons.sort((a, b) {
+      final aPriority = _salonSortPriority(appState, a);
+      final bPriority = _salonSortPriority(appState, b);
+      if (aPriority != bPriority) {
+        return aPriority.compareTo(bPriority);
+      }
       return b.rating.compareTo(a.rating);
     });
 
     return salons;
+  }
+
+  int _salonSortPriority(AppState appState, Salon salon) {
+    if (appState.isSalonBookable(salon.id) &&
+        appState.isSalonCurrentlyOpen(salon.id)) {
+      return 0;
+    }
+    if (appState.isSalonBookable(salon.id)) {
+      return 1;
+    }
+    return 2;
   }
 
   bool _matchesSearch(Salon salon, String query) {
@@ -188,9 +186,7 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
 }
 
 class _LocationHeader extends StatelessWidget {
-  final bool canLogout;
-
-  const _LocationHeader({required this.canLogout});
+  const _LocationHeader();
 
   @override
   Widget build(BuildContext context) {
@@ -219,10 +215,8 @@ class _LocationHeader extends StatelessWidget {
             ],
           ),
         ),
-        AccountOverflowMenu(
-          role: UserRole.customer,
-          canLogout: canLogout,
-          onNotificationOpened: (destination) {
+        CustomerNotificationButton(
+          onNotificationOpened: (destination, {bookingId}) {
             if (destination == AppNotificationDestination.bookings) {
               Navigator.of(context).push(
                 MaterialPageRoute(builder: (_) => const MyBookingsScreen()),
@@ -317,22 +311,18 @@ class _ResultsHeader extends StatelessWidget {
 class _CategoryCard extends StatelessWidget {
   final _ServiceCategory category;
   final bool selected;
-  final int count;
-  final bool useIOSLayout;
   final VoidCallback onTap;
 
   const _CategoryCard({
     required this.category,
     required this.selected,
-    required this.count,
-    required this.useIOSLayout,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: useIOSLayout ? 112 : 104,
+      width: 104,
       child: Material(
         color: selected ? category.color.withAlpha(18) : Colors.white,
         borderRadius: BorderRadius.circular(8),
@@ -362,17 +352,8 @@ class _CategoryCard extends StatelessWidget {
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: selected ? category.color : AppColors.ink,
-                    fontSize: useIOSLayout ? 14 : 13,
+                    fontSize: 13,
                     fontWeight: FontWeight.w600,
-                  ),
-                ),
-                Text(
-                  '$count shops',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: selected ? category.color : AppColors.muted,
-                    fontSize: useIOSLayout ? 14 : 12,
                   ),
                 ),
               ],
@@ -386,34 +367,102 @@ class _CategoryCard extends StatelessWidget {
 
 class _SalonCard extends StatelessWidget {
   final Salon salon;
-  final _ServiceCategory? selectedCategory;
+  final Set<_ServiceCategory> selectedCategories;
 
-  const _SalonCard({required this.salon, this.selectedCategory});
+  const _SalonCard({required this.salon, required this.selectedCategories});
 
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final accent = selectedCategory?.color ?? AppColors.primary;
-    final matchedServices = selectedCategory == null
+    final matchedServices = selectedCategories.isEmpty
         ? salon.availableServices
-        : salon.availableServices.where(selectedCategory!.matches).toList();
+        : salon.availableServices
+              .where(
+                (service) => selectedCategories.any(
+                  (category) => category.matches(service),
+                ),
+              )
+              .toList();
     final previewServices = matchedServices
         .take(3)
         .map((s) => s.name)
         .join(', ');
     final barbers = appState.barbersForSalon(salon.id);
+    final isBookable = appState.isSalonBookable(salon.id);
+    final isCurrentlyOpen = appState.isSalonCurrentlyOpen(salon.id);
+    final availabilityLabel = !isBookable
+        ? 'Listing visible · booking setup in progress'
+        : isCurrentlyOpen
+        ? 'Open now'
+        : 'Closed now';
+    final availabilityColor = isBookable && isCurrentlyOpen
+        ? AppColors.success
+        : AppColors.muted;
     final instantAvailable = appState.isInstantBookingAvailableForServices(
       salon.id,
       matchedServices.map((service) => service.id),
     );
 
-    void openSalon() {
+    void openSalon([SalonDetailEntryAction? entryAction]) {
+      if (entryAction == SalonDetailEntryAction.instant) {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => InstantServiceSelectionScreen(salonId: salon.id),
+          ),
+        );
+        return;
+      }
       Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => SalonDetailScreen(salonId: salon.id)),
+        MaterialPageRoute(
+          builder: (_) => SalonDetailScreen(
+            salonId: salon.id,
+            entryAction: entryAction,
+            directScheduleEntry: entryAction == SalonDetailEntryAction.service,
+          ),
+        ),
+      );
+    }
+
+    void scheduleSlot() {
+      openSalon(SalonDetailEntryAction.service);
+    }
+
+    void showSalonPreview() {
+      showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        showDragHandle: true,
+        useSafeArea: true,
+        builder: (sheetContext) => _SalonPreviewSheet(
+          salon: salon,
+          barberCount: barbers.length,
+          isCurrentlyOpen: isCurrentlyOpen,
+          instantAvailable: instantAvailable,
+          onScheduleSlot: () {
+            Navigator.pop(sheetContext);
+            scheduleSlot();
+          },
+          onInstant: () {
+            Navigator.pop(sheetContext);
+            openSalon(SalonDetailEntryAction.instant);
+          },
+          onCall: salon.phone.trim().isEmpty
+              ? null
+              : () {
+                  Navigator.pop(sheetContext);
+                  UrlLauncherUtils.makePhoneCall(context, salon.phone);
+                },
+          onDirections: () {
+            Navigator.pop(sheetContext);
+            UrlLauncherUtils.openDirectionsLink(context, salon.directionsUrl);
+          },
+        ),
       );
     }
 
     return GlassCard(
+      key: ValueKey('salon-card-${salon.id}'),
+      onTap: showSalonPreview,
       padding: const EdgeInsets.all(0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -427,8 +476,9 @@ class _SalonCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     SalonLogo(
+                      key: ValueKey('salon-card-image-${salon.id}'),
                       logoUrl: salon.coverImageUrl,
-                      color: accent,
+                      color: AppColors.primary,
                       size: 42,
                     ),
                     const SizedBox(width: 10),
@@ -437,17 +487,40 @@ class _SalonCard extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            salon.name,
+                            salon.displayName,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: Theme.of(context).textTheme.titleLarge,
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            previewServices,
+                            salon.address.trim().isEmpty
+                                ? 'Address not added'
+                                : salon.address.trim(),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: AppColors.ink),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            previewServices.isEmpty
+                                ? 'Services will be added soon'
+                                : previewServices,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: Theme.of(context).textTheme.bodyMedium,
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            availabilityLabel,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: availabilityColor,
+                                  fontWeight: FontWeight.w600,
+                                ),
                           ),
                         ],
                       ),
@@ -467,11 +540,7 @@ class _SalonCard extends StatelessWidget {
                     Expanded(
                       child: _SalonFact(
                         icon: Icons.schedule_outlined,
-                        label: _compactTimeRange(
-                          salon,
-                          compactForIOS:
-                              Theme.of(context).platform == TargetPlatform.iOS,
-                        ),
+                        label: _compactTimeRange(salon),
                         color: AppColors.primary,
                       ),
                     ),
@@ -482,44 +551,33 @@ class _SalonCard extends StatelessWidget {
                         color: AppColors.muted,
                       ),
                     ),
-                    Expanded(
-                      child: _SalonFact(
-                        icon: Icons.near_me_outlined,
-                        label: salon.distanceLabel,
-                        color: AppColors.muted,
-                      ),
-                    ),
                   ],
                 ),
                 const SizedBox(height: 11),
                 Row(
                   children: [
-                    if (Theme.of(context).platform == TargetPlatform.iOS)
+                    if (instantAvailable) ...[
                       Expanded(
-                        child: _IOSSalonActions(
-                          instantAvailable: instantAvailable,
-                          onPressed: openSalon,
-                        ),
-                      )
-                    else ...[
-                      if (instantAvailable) ...[
-                        Expanded(
-                          child: FilledButton.icon(
-                            onPressed: openSalon,
-                            icon: const Icon(Icons.bolt_outlined, size: 19),
-                            label: const Text('Book instantly'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                      ],
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: openSalon,
-                          icon: const Icon(Icons.storefront_outlined, size: 18),
-                          label: const Text('View salon'),
+                        child: FilledButton.icon(
+                          onPressed: () =>
+                              openSalon(SalonDetailEntryAction.instant),
+                          icon: const Icon(Icons.bolt_outlined, size: 19),
+                          label: const Text('Book instantly'),
                         ),
                       ),
+                      const SizedBox(width: 8),
                     ],
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        key: ValueKey('salon-card-schedule-${salon.id}'),
+                        onPressed: scheduleSlot,
+                        icon: const Icon(
+                          Icons.event_available_outlined,
+                          size: 18,
+                        ),
+                        label: const Text('Schedule Slot'),
+                      ),
+                    ),
                   ],
                 ),
               ],
@@ -531,73 +589,179 @@ class _SalonCard extends StatelessWidget {
   }
 }
 
-class _IOSSalonActions extends StatelessWidget {
+class _SalonPreviewSheet extends StatelessWidget {
+  final Salon salon;
+  final int barberCount;
+  final bool isCurrentlyOpen;
   final bool instantAvailable;
-  final VoidCallback onPressed;
+  final VoidCallback onScheduleSlot;
+  final VoidCallback onInstant;
+  final VoidCallback? onCall;
+  final VoidCallback onDirections;
 
-  const _IOSSalonActions({
+  const _SalonPreviewSheet({
+    required this.salon,
+    required this.barberCount,
+    required this.isCurrentlyOpen,
     required this.instantAvailable,
-    required this.onPressed,
+    required this.onScheduleSlot,
+    required this.onInstant,
+    required this.onCall,
+    required this.onDirections,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        if (instantAvailable) ...[
-          Expanded(
-            child: FilledButton(
-              onPressed: onPressed,
-              style: FilledButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
+    final photos = salon.photoUrls;
+    return FractionallySizedBox(
+      heightFactor: 0.76,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(18, 2, 18, 24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (photos.isEmpty)
+              Container(
+                height: 190,
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  color: AppColors.mint.withAlpha(90),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                alignment: Alignment.center,
+                child: SalonLogo(
+                  logoUrl: salon.coverImageUrl,
+                  color: AppColors.primary,
+                  size: 82,
+                ),
+              )
+            else
+              SizedBox(
+                key: ValueKey('salon-preview-photos-${salon.id}'),
+                height: 190,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: photos.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 10),
+                  itemBuilder: (context, index) => ClipRRect(
+                    borderRadius: BorderRadius.circular(18),
+                    child: SizedBox(
+                      width: MediaQuery.sizeOf(context).width * 0.78,
+                      child: Image.network(
+                        photos[index],
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, _, _) => Container(
+                          color: AppColors.line,
+                          alignment: Alignment.center,
+                          child: const Icon(Icons.broken_image_outlined),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ),
-              child: const _CompactButtonLabel(
-                icon: Icons.bolt_outlined,
-                label: 'Book instantly',
-              ),
+            const SizedBox(height: 16),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        salon.displayName,
+                        style: Theme.of(context).textTheme.headlineSmall,
+                      ),
+                      if (salon.address.trim().isNotEmpty) ...[
+                        const SizedBox(height: 5),
+                        Text(
+                          salon.address,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                _SalonRating(
+                  rating: salon.rating,
+                  reviewCount: salon.reviewCount,
+                ),
+              ],
             ),
-          ),
-          const SizedBox(width: 8),
-        ],
-        Expanded(
-          child: OutlinedButton(
-            onPressed: onPressed,
-            style: OutlinedButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                AppPill(
+                  icon: isCurrentlyOpen
+                      ? Icons.check_circle_outline
+                      : Icons.schedule_outlined,
+                  label: isCurrentlyOpen ? 'Open now' : 'Closed now',
+                  color: isCurrentlyOpen ? AppColors.success : AppColors.muted,
+                ),
+                AppPill(
+                  icon: Icons.schedule_outlined,
+                  label: _compactTimeRange(salon),
+                  color: AppColors.primary,
+                ),
+                AppPill(
+                  icon: Icons.content_cut,
+                  label: '$barberCount barbers',
+                  color: AppColors.coral,
+                ),
+              ],
             ),
-            child: const _CompactButtonLabel(
-              icon: Icons.storefront_outlined,
-              label: 'View salon',
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('salon-preview-call'),
+                    onPressed: onCall,
+                    icon: const Icon(Icons.call_outlined),
+                    label: const Text('Call'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('salon-preview-directions'),
+                    onPressed: onDirections,
+                    icon: const Icon(Icons.directions_outlined),
+                    label: const Text('Directions'),
+                  ),
+                ),
+              ],
             ),
-          ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: const ValueKey('salon-preview-schedule-slot'),
+                    onPressed: onScheduleSlot,
+                    icon: const Icon(Icons.event_available_outlined),
+                    label: const Text('Schedule Slot'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    key: const ValueKey('salon-preview-book-instantly'),
+                    onPressed: instantAvailable ? onInstant : null,
+                    icon: const Icon(Icons.bolt_outlined),
+                    label: Text(
+                      instantAvailable ? 'Book instantly' : 'Unavailable',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
         ),
-      ],
-    );
-  }
-}
-
-class _CompactButtonLabel extends StatelessWidget {
-  final IconData icon;
-  final String label;
-
-  const _CompactButtonLabel({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(icon, size: 18),
-        const SizedBox(width: 5),
-        Flexible(
-          child: Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-          ),
-        ),
-      ],
+      ),
     );
   }
 }
@@ -661,14 +825,13 @@ class _SalonRating extends StatelessWidget {
   }
 }
 
-String _compactTimeRange(Salon salon, {bool compactForIOS = false}) {
+String _compactTimeRange(Salon salon) {
+  if (salon.openTime.trim().isEmpty || salon.closeTime.trim().isEmpty) {
+    return 'Hours pending';
+  }
   String compact(String value) =>
       value.replaceAll(':00', '').replaceAll(' ', '');
-  var opening = compact(salon.openTime);
-  if (compactForIOS) {
-    opening = opening.replaceFirst(RegExp(r'(AM|PM)$'), '');
-  }
-  return '$opening-${compact(salon.closeTime)}';
+  return '${compact(salon.openTime)}-${compact(salon.closeTime)}';
 }
 
 class _ServiceCategory {
@@ -727,10 +890,6 @@ class _ServiceCategory {
       default:
         return false;
     }
-  }
-
-  int salonCount(List<Salon> salons) {
-    return salons.where((salon) => salon.availableServices.any(matches)).length;
   }
 }
 

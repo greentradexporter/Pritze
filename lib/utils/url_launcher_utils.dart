@@ -16,21 +16,14 @@ class UrlLauncherUtils {
       }
       return;
     }
-    try {
-      final launched =
-          await launchUrl(url, mode: LaunchMode.externalApplication) ||
-          await launchUrl(url, mode: LaunchMode.platformDefault);
-      if (!launched && context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(errorMessage)));
-      }
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $e')));
-      }
+    final launched = await _tryLaunch(url, const [
+      LaunchMode.externalApplication,
+      LaunchMode.platformDefault,
+    ]);
+    if (!launched && context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(errorMessage)));
     }
   }
 
@@ -79,6 +72,29 @@ class UrlLauncherUtils {
       );
       return;
     }
-    await launchAction(context, trimmed, 'Could not open the directions link.');
+    final launched = await _tryLaunch(uri, const [
+      LaunchMode.externalNonBrowserApplication,
+      LaunchMode.externalApplication,
+      LaunchMode.platformDefault,
+    ]);
+    if (!launched && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open Google Maps.')),
+      );
+    }
+  }
+
+  static Future<bool> _tryLaunch(Uri uri, List<LaunchMode> modes) async {
+    for (final mode in modes) {
+      try {
+        if (await launchUrl(uri, mode: mode)) {
+          return true;
+        }
+      } catch (_) {
+        // Some Android devices reject one launch mode even though another mode
+        // can handle the same Maps, phone, or web URI.
+      }
+    }
+    return false;
   }
 }

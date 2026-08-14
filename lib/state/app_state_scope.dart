@@ -47,4 +47,13 @@ class AppStateScope extends InheritedNotifier<AppState> {
     final scope = element!.widget as AppStateScope;
     return scope.notifier!;
   }
+
+  static AppState? maybeRead(BuildContext context) {
+    final element = context
+        .getElementForInheritedWidgetOfExactType<AppStateScope>();
+    if (element == null) {
+      return null;
+    }
+    return (element.widget as AppStateScope).notifier;
+  }
 }

@@ -32,6 +32,14 @@
 				<string>com.googleusercontent.apps.3474382418-ff7ksfsf009o4jfjmsoi5jd3gssongb0</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>app-1-3474382418-ios-73bf27d33b1eddec8c498b</string>
+			</array>
+		</dict>
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
@@ -48,8 +56,11 @@
 	<true/>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Pritze lets salon owners choose photos for their salon profile.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Pritze lets you choose a phone number to fill the sign-in form.</string>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>fetch</string>
 		<string>remote-notification</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>

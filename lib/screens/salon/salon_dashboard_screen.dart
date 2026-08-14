@@ -13,10 +13,18 @@ import '../../widgets/account_actions.dart';
 import '../../widgets/auth_login_panel.dart';
 import '../../widgets/booking_status_timeline.dart';
 import '../../widgets/status_chip.dart';
+import '../customer/customer_home_screen.dart';
 import 'salon_profile_setup_screen.dart';
 
-class SalonDashboardScreen extends StatelessWidget {
+class SalonDashboardScreen extends StatefulWidget {
   const SalonDashboardScreen({super.key});
+
+  @override
+  State<SalonDashboardScreen> createState() => _SalonDashboardScreenState();
+}
+
+class _SalonDashboardScreenState extends State<SalonDashboardScreen> {
+  final GlobalKey<_OwnerBookingsState> _bookingsKey = GlobalKey();
 
   @override
   Widget build(BuildContext context) {
@@ -26,6 +34,9 @@ class SalonDashboardScreen extends StatelessWidget {
     if (appState.ownerAccount == null) {
       return const _OwnerLoginGate();
     }
+    if (appState.ownerSalonOrNull == null) {
+      return const SalonProfileSetupScreen();
+    }
     final activeInstantBooking = _activeInstantBooking(
       appState.bookingsForSalon(salon.id),
     );
@@ -33,77 +44,137 @@ class SalonDashboardScreen extends StatelessWidget {
     return DefaultTabController(
       length: 3,
       child: Builder(
-        builder: (dashboardContext) => Scaffold(
-          appBar: AppBar(
-            title: Text(
-              salon.name.trim().isEmpty ? 'Salon dashboard' : salon.name,
+        builder: (dashboardContext) {
+          final pendingNavigation = appState
+              .takePendingNotificationNavigation();
+          if (pendingNavigation != null) {
+            _openNotificationDestination(
+              dashboardContext,
+              pendingNavigation.destination,
+              bookingId: pendingNavigation.bookingId,
+            );
+          }
+          return Scaffold(
+            appBar: AppBar(
+              title: Text(
+                salon.name.trim().isEmpty ? 'Salon dashboard' : salon.name,
+              ),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.edit_outlined),
+                  tooltip: 'Salon listing',
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const SalonProfileSetupScreen(),
+                      ),
+                    );
+                  },
+                ),
+                AccountOverflowMenu(
+                  role: UserRole.owner,
+                  canLogout: true,
+                  onNotificationOpened: (destination, {bookingId}) =>
+                      _openNotificationDestination(
+                        dashboardContext,
+                        destination,
+                        bookingId: bookingId,
+                      ),
+                  onLoggedOut: () async {
+                    if (context.mounted && Navigator.of(context).canPop()) {
+                      Navigator.of(context).pop();
+                    }
+                  },
+                ),
+                const SizedBox(width: 8),
+              ],
+              bottom: const TabBar(
+                tabs: [
+                  Tab(text: 'Overview'),
+                  Tab(text: 'Bookings'),
+                  Tab(text: 'Team'),
+                ],
+              ),
             ),
-            actions: [
-              IconButton(
-                icon: const Icon(Icons.edit_outlined),
-                tooltip: 'Salon listing',
-                onPressed: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => const SalonProfileSetupScreen(),
+            bottomNavigationBar: activeInstantBooking == null
+                ? null
+                : BookingArrivalBottomPanel(
+                    booking: activeInstantBooking,
+                    audience: BookingTimerAudience.salon,
+                    onTap: () => _openNotificationDestination(
+                      dashboardContext,
+                      AppNotificationDestination.bookings,
+                      bookingId: activeInstantBooking.id,
                     ),
-                  );
-                },
-              ),
-              AccountOverflowMenu(
-                role: UserRole.owner,
-                canLogout: true,
-                onNotificationOpened: (destination) {
-                  final controller = DefaultTabController.of(dashboardContext);
-                  controller.animateTo(
-                    destination == AppNotificationDestination.team ? 2 : 0,
-                  );
-                },
-                onLoggedOut: () async {
-                  if (context.mounted && Navigator.of(context).canPop()) {
-                    Navigator.of(context).pop();
-                  }
-                },
-              ),
-              const SizedBox(width: 8),
-            ],
-            bottom: const TabBar(
-              tabs: [
-                Tab(text: 'Overview'),
-                Tab(text: 'Bookings'),
-                Tab(text: 'Team'),
+                  ),
+            body: TabBarView(
+              children: [
+                _OwnerRefresh(child: _OwnerOverview(salon: salon)),
+                _OwnerRefresh(
+                  child: _OwnerBookings(key: _bookingsKey, salonId: salon.id),
+                ),
+                _OwnerRefresh(child: _OwnerStaff(salon: salon)),
               ],
             ),
-          ),
-          bottomNavigationBar: activeInstantBooking == null
-              ? null
-              : BookingArrivalBottomPanel(
-                  booking: activeInstantBooking,
-                  audience: BookingTimerAudience.salon,
-                  onTap: () =>
-                      DefaultTabController.of(dashboardContext).animateTo(1),
-                ),
-          body: TabBarView(
-            children: [
-              _OwnerRefresh(child: _OwnerOverview(salon: salon)),
-              _OwnerRefresh(child: _OwnerBookings(salonId: salon.id)),
-              _OwnerRefresh(child: _OwnerStaff(salon: salon)),
-            ],
-          ),
-        ),
+          );
+        },
       ),
     );
   }
 
+  int _dashboardTabFor(AppNotificationDestination destination) {
+    return switch (destination) {
+      AppNotificationDestination.overview => 0,
+      AppNotificationDestination.bookings => 1,
+      AppNotificationDestination.team => 2,
+    };
+  }
+
+  void _openNotificationDestination(
+    BuildContext dashboardContext,
+    AppNotificationDestination destination, {
+    String? bookingId,
+  }) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!dashboardContext.mounted) {
+        return;
+      }
+      DefaultTabController.of(
+        dashboardContext,
+      ).animateTo(_dashboardTabFor(destination));
+      if (destination != AppNotificationDestination.bookings) {
+        return;
+      }
+      _revealBookingWhenReady(bookingId?.trim() ?? '');
+    });
+  }
+
+  void _revealBookingWhenReady(String bookingId, [int attempt = 0]) {
+    final bookingsState = _bookingsKey.currentState;
+    if (bookingsState != null) {
+      bookingsState.showBooking(bookingId);
+      return;
+    }
+    if (attempt >= 5 || !mounted) {
+      return;
+    }
+    Future<void>.delayed(const Duration(milliseconds: 80), () {
+      if (mounted) {
+        _revealBookingWhenReady(bookingId, attempt + 1);
+      }
+    });
+  }
+
   Booking? _activeInstantBooking(List<Booking> bookings) {
+    final now = DateTime.now();
     final active =
         bookings
             .where(
               (booking) =>
                   booking.isInstant &&
-                  booking.status != BookingStatus.cancelled &&
-                  booking.status != BookingStatus.rejected &&
-                  booking.status != BookingStatus.completed,
+                  (booking.status == BookingStatus.pending ||
+                      (booking.status == BookingStatus.confirmed &&
+                          now.isBefore(booking.salonArrivalDeadline))),
             )
             .toList()
           ..sort((a, b) => a.start.compareTo(b.start));
@@ -146,7 +217,7 @@ class _OwnerOverview extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(18, 14, 18, 28),
       children: [
         AppHeroHeader(
-          eyebrow: 'Revenue at ${salon.name}',
+          eyebrow: 'Revenue at ${salon.displayName}',
           title: '₹${appState.totalCollection(salon.id)} total revenue',
           subtitle:
               '${appState.todayBookingCount(salon.id)} appointments today. Track staff, revenue, and booking status.',
@@ -205,10 +276,6 @@ class _OwnerOverview extends StatelessWidget {
             ),
           ],
         ),
-        const SizedBox(height: 22),
-        const SectionHeader(title: 'Chair board'),
-        const SizedBox(height: 10),
-        _ChairBoard(salonId: salon.id),
         const SizedBox(height: 18),
         const SectionHeader(title: 'Service revenue'),
         const SizedBox(height: 10),
@@ -236,15 +303,45 @@ class _OwnerOverview extends StatelessWidget {
 class _OwnerBookings extends StatefulWidget {
   final String salonId;
 
-  const _OwnerBookings({required this.salonId});
+  const _OwnerBookings({super.key, required this.salonId});
 
   @override
   State<_OwnerBookings> createState() => _OwnerBookingsState();
 }
 
 class _OwnerBookingsState extends State<_OwnerBookings> {
-  SalonBookingBucket _selectedBucket = SalonBookingBucket.requests;
+  SalonBookingBucket _selectedBucket = SalonBookingBucket.upcoming;
+  String? _requestedBookingId;
   late final Timer _clock;
+
+  void showBooking(String? bookingId) {
+    final normalizedBookingId = bookingId?.trim() ?? '';
+    if (normalizedBookingId.isEmpty) {
+      return;
+    }
+    _requestedBookingId = normalizedBookingId;
+    _revealRequestedBooking();
+  }
+
+  void _revealRequestedBooking() {
+    final bookingId = _requestedBookingId;
+    if (bookingId == null || !mounted) {
+      return;
+    }
+    final appState = AppStateScope.read(context);
+    final booking = appState
+        .bookingsForSalon(widget.salonId)
+        .where((item) => item.id == bookingId)
+        .firstOrNull;
+    if (booking == null) {
+      return;
+    }
+    _requestedBookingId = null;
+    final bucket = appState.salonBookingBucket(booking);
+    if (_selectedBucket != bucket) {
+      setState(() => _selectedBucket = bucket);
+    }
+  }
 
   @override
   void initState() {
@@ -267,6 +364,11 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
     final appState = AppStateScope.watch(context);
     final now = DateTime.now();
     final allBookings = appState.bookingsForSalon(widget.salonId);
+    if (_requestedBookingId != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _revealRequestedBooking();
+      });
+    }
     final counts = {
       for (final bucket in SalonBookingBucket.values)
         bucket: allBookings
@@ -287,6 +389,14 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
           }
           return a.start.compareTo(b.start);
         });
+    final oldestInstantRequest =
+        allBookings
+            .where(
+              (booking) =>
+                  booking.isInstant && booking.status == BookingStatus.pending,
+            )
+            .toList()
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
@@ -298,7 +408,7 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
         ),
         const SizedBox(height: 6),
         Text(
-          'Accept requests, start services, complete revenue, and keep missed appointments in history.',
+          'Scheduled appointments register in Upcoming. Instant requests stay urgent until you accept or reject them.',
           style: Theme.of(context).textTheme.bodyMedium,
         ),
         const SizedBox(height: 16),
@@ -314,21 +424,50 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
             const SizedBox(width: 8),
             Expanded(
               child: _OwnerBookingMetric(
-                value: '${counts[SalonBookingBucket.active] ?? 0}',
-                label: 'Active',
-                color: AppColors.primary,
+                value: '${counts[SalonBookingBucket.upcoming] ?? 0}',
+                label: 'Upcoming',
+                color: AppColors.goldDeep,
               ),
             ),
             const SizedBox(width: 8),
             Expanded(
               child: _OwnerBookingMetric(
-                value: '${counts[SalonBookingBucket.history] ?? 0}',
-                label: 'History',
-                color: AppColors.success,
+                value: '${counts[SalonBookingBucket.active] ?? 0}',
+                label: 'Active',
+                color: AppColors.primary,
               ),
             ),
           ],
         ),
+        if (oldestInstantRequest.isNotEmpty &&
+            _selectedBucket != SalonBookingBucket.requests) ...[
+          const SizedBox(height: 14),
+          GlassCard(
+            color: AppColors.coral.withAlpha(12),
+            child: Row(
+              children: [
+                const SoftIconBox(
+                  icon: Icons.notifications_active_outlined,
+                  color: AppColors.coral,
+                  size: 44,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    '${oldestInstantRequest.first.customerName} is waiting for an instant booking response.',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => setState(
+                    () => _selectedBucket = SalonBookingBucket.requests,
+                  ),
+                  child: const Text('Respond'),
+                ),
+              ],
+            ),
+          ),
+        ],
         const SizedBox(height: 14),
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
@@ -362,6 +501,7 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
               bucket: _selectedBucket,
               outcome: appState.salonBookingOutcome(booking, now: now),
               now: now,
+              onBookingChanged: () => showBooking(booking.id),
             ),
             const SizedBox(height: 12),
           ],
@@ -395,9 +535,9 @@ class _OwnerBookingsState extends State<_OwnerBookings> {
 
   String _emptyMessage(SalonBookingBucket bucket) => switch (bucket) {
     SalonBookingBucket.requests =>
-      'New customer requests appear here until their appointment time passes.',
+      'Only instant requests appear here and remain until you accept or reject them.',
     SalonBookingBucket.upcoming =>
-      'Accepted future bookings appear here before they are ready to start.',
+      'Registered scheduled bookings and accepted instant bookings appear here.',
     SalonBookingBucket.active =>
       'Services in progress and accepted bookings inside their appointment window appear here.',
     SalonBookingBucket.history =>
@@ -514,131 +654,6 @@ class _OwnerBookingMetric extends StatelessWidget {
               context,
             ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ChairBoard extends StatelessWidget {
-  final String salonId;
-
-  const _ChairBoard({required this.salonId});
-
-  @override
-  Widget build(BuildContext context) {
-    final appState = AppStateScope.watch(context);
-    final barbers = appState.barbersForSalon(salonId);
-
-    if (barbers.isEmpty) {
-      return const GlassCard(
-        child: Text('Add barbers to see chair occupancy.'),
-      );
-    }
-
-    return Column(
-      children: [
-        for (final barber in barbers) ...[
-          _ChairCard(barber: barber),
-          const SizedBox(height: 10),
-        ],
-      ],
-    );
-  }
-}
-
-class _ChairCard extends StatelessWidget {
-  final Barber barber;
-
-  const _ChairCard({required this.barber});
-
-  @override
-  Widget build(BuildContext context) {
-    final appState = AppStateScope.watch(context);
-    final current = appState.currentBookingForBarber(barber.id);
-    final next = appState.nextBookingForBarber(barber.id);
-    final displayBooking = current ?? next;
-    final service = displayBooking == null
-        ? null
-        : appState.getService(displayBooking.salonId, displayBooking.serviceId);
-    final occupied = current != null;
-    final color = occupied ? AppColors.coral : AppColors.primary;
-
-    return GlassCard(
-      color: occupied ? AppColors.coral.withAlpha(10) : Colors.white,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              CircleAvatar(
-                radius: 23,
-                backgroundColor: color.withAlpha(20),
-                foregroundColor: color,
-                child: Text(
-                  barber.name.characters.first,
-                  style: const TextStyle(fontWeight: FontWeight.w600),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      barber.name,
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      barber.speciality,
-                      style: Theme.of(context).textTheme.bodyMedium,
-                    ),
-                  ],
-                ),
-              ),
-              AppPill(label: occupied ? 'Occupied' : 'Free', color: color),
-            ],
-          ),
-          const SizedBox(height: 14),
-          if (displayBooking == null)
-            Row(
-              children: [
-                const Icon(
-                  Icons.event_available,
-                  color: AppColors.primary,
-                  size: 18,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'No upcoming booking. Available for new customers.',
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: AppColors.primaryDark,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-              ],
-            )
-          else ...[
-            _SmallDetail(
-              icon: occupied ? Icons.content_cut : Icons.upcoming,
-              label:
-                  '${occupied ? 'Doing' : 'Next'}: ${service?.name ?? 'Service'}',
-            ),
-            _SmallDetail(
-              icon: Icons.person_outline,
-              label: displayBooking.customerName,
-            ),
-            _SmallDetail(
-              icon: Icons.schedule,
-              label:
-                  '${appState.formatDate(displayBooking.start)}, ${appState.formatTime(displayBooking.start)}',
-            ),
-            const SizedBox(height: 10),
-            StatusChip(status: displayBooking.status),
-          ],
         ],
       ),
     );
@@ -822,12 +837,14 @@ class _OwnerBookingCard extends StatelessWidget {
   final SalonBookingBucket bucket;
   final String outcome;
   final DateTime now;
+  final VoidCallback onBookingChanged;
 
   const _OwnerBookingCard({
     required this.booking,
     required this.bucket,
     required this.outcome,
     required this.now,
+    required this.onBookingChanged,
   });
 
   @override
@@ -841,21 +858,24 @@ class _OwnerBookingCard extends StatelessWidget {
               ? 'Instant request · ${booking.customerArrivalMinutes} min customer ETA · ${booking.salonArrivalMinutes} min salon window'
               : 'Arrive by ${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}'
         : '${appState.formatDate(booking.start)}, ${appState.formatTime(booking.start)}';
-    final isPastStart = !now.isBefore(booking.start);
     final isPastEnd = !now.isBefore(end);
-    final canAcceptOrReject =
+    final canRespond =
+        booking.isInstant &&
         booking.status == BookingStatus.pending &&
         bucket == SalonBookingBucket.requests;
+    final canAccept = canRespond;
     final canStart =
         booking.status == BookingStatus.confirmed &&
-        bucket == SalonBookingBucket.active &&
-        isPastStart &&
+        (bucket == SalonBookingBucket.upcoming ||
+            bucket == SalonBookingBucket.active) &&
+        (booking.isInstant || _isSameDay(now, booking.start)) &&
         !isPastEnd;
     final canCancel =
         booking.status == BookingStatus.confirmed &&
         !isPastEnd &&
         bucket != SalonBookingBucket.history;
     final canComplete = booking.status == BookingStatus.inProgress;
+    final canRateCustomer = booking.status == BookingStatus.completed;
 
     return GlassCard(
       child: Column(
@@ -904,27 +924,39 @@ class _OwnerBookingCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 14),
-          _SmallDetail(icon: Icons.badge, label: barber?.name ?? 'Barber'),
+          _SmallDetail(
+            icon: Icons.badge,
+            label:
+                barber?.name ??
+                (booking.isInstant ? 'Any available barber' : 'Barber'),
+          ),
           _SmallDetail(icon: Icons.schedule, label: timeLabel),
-          if (booking.isInstant &&
-              (booking.status == BookingStatus.pending ||
-                  booking.status == BookingStatus.confirmed))
+          if (booking.isInstant && booking.status == BookingStatus.confirmed)
             _SmallDetail(
               icon: Icons.hourglass_bottom_outlined,
               label:
-                  'Customer arrival timer: ${appState.countdownTo(booking.start, now: now)}',
+                  'Expect customer by ${appState.formatTime(booking.salonArrivalDeadline)}',
             ),
-          _SmallDetail(icon: Icons.phone, label: booking.customerPhone),
           if (booking.customerPhone.trim().isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 10),
-              child: OutlinedButton.icon(
-                onPressed: () => UrlLauncherUtils.makePhoneCall(
-                  context,
-                  booking.customerPhone,
-                ),
-                icon: const Icon(Icons.call_outlined),
-                label: const Text('Call customer'),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Customer contact',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  IconButton.filledTonal(
+                    onPressed: () => UrlLauncherUtils.makePhoneCall(
+                      context,
+                      booking.customerPhone,
+                    ),
+                    icon: const Icon(Icons.call_outlined),
+                    tooltip: 'Call customer',
+                  ),
+                ],
               ),
             ),
           if (booking.cancellationReason.isNotEmpty)
@@ -943,48 +975,70 @@ class _OwnerBookingCard extends StatelessWidget {
                 'Service ₹${booking.resolvedServicePrice(service)} · booking fee ₹${booking.bookingFee}',
           ),
           const SizedBox(height: 14),
-          if (canAcceptOrReject || canStart || canCancel || canComplete)
+          if (canRespond ||
+              canStart ||
+              canCancel ||
+              canComplete ||
+              canRateCustomer)
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
-                if (canAcceptOrReject) ...[
+                if (canRespond) ...[
                   _StatusButton(
+                    key: ValueKey('${booking.id}-confirmed'),
                     label: 'Accept booking',
                     status: BookingStatus.confirmed,
                     booking: booking,
                     icon: Icons.check_circle_outline,
                     isPrimary: true,
+                    enabled: canAccept,
+                    onBookingChanged: onBookingChanged,
                   ),
                   _StatusButton(
+                    key: ValueKey('${booking.id}-rejected'),
                     label: 'Reject',
                     status: BookingStatus.rejected,
                     booking: booking,
                     icon: Icons.close,
+                    onBookingChanged: onBookingChanged,
                   ),
                 ],
                 if (canStart)
                   _StatusButton(
+                    key: ValueKey('${booking.id}-inProgress'),
                     label: 'Start service',
                     status: BookingStatus.inProgress,
                     booking: booking,
                     icon: Icons.content_cut,
                     isPrimary: true,
+                    onBookingChanged: onBookingChanged,
                   ),
                 if (canCancel)
                   _StatusButton(
+                    key: ValueKey('${booking.id}-cancelled'),
                     label: 'Cancel',
                     status: BookingStatus.cancelled,
                     booking: booking,
                     icon: Icons.cancel_outlined,
+                    onBookingChanged: onBookingChanged,
                   ),
                 if (canComplete)
                   _StatusButton(
-                    label: 'Complete & add revenue',
+                    key: ValueKey('${booking.id}-completed'),
+                    label: 'Complete service',
                     status: BookingStatus.completed,
                     booking: booking,
                     icon: Icons.check_circle_outline,
                     isPrimary: true,
+                    onBookingChanged: onBookingChanged,
+                  ),
+                if (canRateCustomer)
+                  OutlinedButton.icon(
+                    key: ValueKey('rate-customer-${booking.id}'),
+                    onPressed: () => _showCustomerRatingDialog(context),
+                    icon: const Icon(Icons.star_outline_rounded),
+                    label: const Text('Rate customer'),
                   ),
               ],
             )
@@ -1019,6 +1073,105 @@ class _OwnerBookingCard extends StatelessWidget {
         return AppColors.coral;
     }
   }
+
+  bool _isSameDay(DateTime first, DateTime second) {
+    return first.year == second.year &&
+        first.month == second.month &&
+        first.day == second.day;
+  }
+
+  Future<void> _showCustomerRatingDialog(BuildContext pageContext) async {
+    var rating = 5;
+    var submitting = false;
+    final noteController = TextEditingController();
+    await showDialog<void>(
+      context: pageContext,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('Rate ${booking.customerName}'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                'This rating is connected to the completed visit and will appear on the customer profile.',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 14),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  for (var index = 1; index <= 5; index++)
+                    IconButton(
+                      onPressed: submitting
+                          ? null
+                          : () => setDialogState(() => rating = index),
+                      icon: Icon(
+                        index <= rating
+                            ? Icons.star_rounded
+                            : Icons.star_outline_rounded,
+                        color: AppColors.amber,
+                      ),
+                      tooltip: '$index stars',
+                    ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: noteController,
+                minLines: 2,
+                maxLines: 4,
+                maxLength: 500,
+                decoration: const InputDecoration(
+                  labelText: 'Private visit note (optional)',
+                  alignLabelWithHint: true,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: submitting ? null : () => Navigator.pop(dialogContext),
+              child: const Text('Not now'),
+            ),
+            FilledButton(
+              onPressed: submitting
+                  ? null
+                  : () async {
+                      setDialogState(() => submitting = true);
+                      try {
+                        await AppStateScope.read(
+                          pageContext,
+                        ).submitCustomerRating(
+                          bookingId: booking.id,
+                          rating: rating,
+                          note: noteController.text,
+                        );
+                        if (!dialogContext.mounted || !pageContext.mounted) {
+                          return;
+                        }
+                        Navigator.pop(dialogContext);
+                        ScaffoldMessenger.of(pageContext).showSnackBar(
+                          const SnackBar(
+                            content: Text('Customer rating saved.'),
+                          ),
+                        );
+                      } catch (error) {
+                        if (!dialogContext.mounted) return;
+                        setDialogState(() => submitting = false);
+                        ScaffoldMessenger.of(pageContext).showSnackBar(
+                          SnackBar(content: Text('Rating failed: $error')),
+                        );
+                      }
+                    },
+              child: Text(submitting ? 'Saving...' : 'Save rating'),
+            ),
+          ],
+        ),
+      ),
+    );
+    noteController.dispose();
+  }
 }
 
 class _OwnerStaff extends StatelessWidget {
@@ -1029,9 +1182,6 @@ class _OwnerStaff extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final requests = appState.pendingJoinRequests
-        .where((request) => request.salonId == salon.id)
-        .toList();
     final barbers = appState.barbersForSalon(salon.id);
 
     return ListView(
@@ -1064,16 +1214,6 @@ class _OwnerStaff extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 22),
-        const SectionHeader(title: 'Join requests'),
-        const SizedBox(height: 10),
-        if (requests.isEmpty)
-          const GlassCard(child: Text('No pending requests right now.'))
-        else
-          for (final request in requests) ...[
-            _JoinRequestCard(request: request),
-            const SizedBox(height: 10),
-          ],
-        const SizedBox(height: 18),
         const SectionHeader(title: 'Barber workload'),
         const SizedBox(height: 10),
         if (barbers.isEmpty)
@@ -1120,7 +1260,6 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
   final _phoneController = TextEditingController();
-  final _emailController = TextEditingController();
   final _experienceController = TextEditingController(text: '2');
   final _resumeController = TextEditingController();
   final _serviceSearchController = TextEditingController();
@@ -1134,7 +1273,6 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
   void dispose() {
     _nameController.dispose();
     _phoneController.dispose();
-    _emailController.dispose();
     _experienceController.dispose();
     _resumeController.dispose();
     _serviceSearchController.dispose();
@@ -1205,19 +1343,10 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                     ),
                     const SizedBox(height: 10),
                     TextFormField(
-                      controller: _emailController,
-                      keyboardType: TextInputType.emailAddress,
-                      decoration: const InputDecoration(
-                        labelText: 'Email address',
-                      ),
-                      validator: _email,
-                    ),
-                    const SizedBox(height: 10),
-                    TextFormField(
                       controller: _phoneController,
                       keyboardType: TextInputType.phone,
                       decoration: const InputDecoration(
-                        labelText: 'Phone number',
+                        labelText: 'Phone number (optional)',
                       ),
                       validator: _phone,
                     ),
@@ -1278,7 +1407,9 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                           ListTile(
                             title: const Text('Assigned services'),
                             subtitle: Text(
-                              '${_selectedServices.length} selected',
+                              _selectedServices.isEmpty
+                                  ? 'All services by default'
+                                  : '${_selectedServices.length} selected',
                             ),
                             trailing: Icon(
                               _servicesExpanded
@@ -1376,26 +1507,17 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
 
   String? _phone(String? value) {
     final digits = (value ?? '').replaceAll(RegExp(r'\D'), '');
+    if (digits.isEmpty) {
+      return null;
+    }
     final localDigits = digits.length == 12 && digits.startsWith('91')
         ? digits.substring(2)
         : digits;
     return localDigits.length == 10 ? null : 'Enter a 10-digit phone number';
   }
 
-  String? _email(String? value) {
-    return RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch((value ?? '').trim())
-        ? null
-        : 'Enter a valid email address';
-  }
-
   Future<void> _save(AppState appState) async {
     if (!_formKey.currentState!.validate()) {
-      return;
-    }
-    if (_selectedServices.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Select at least one service.')),
-      );
       return;
     }
     setState(() => _isSaving = true);
@@ -1403,7 +1525,6 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
       await appState.addOwnerBarber(
         name: _nameController.text,
         phone: _phoneController.text,
-        email: _emailController.text,
         speciality: _speciality,
         experienceYears: int.tryParse(_experienceController.text) ?? 1,
         resumeSummary: _resumeController.text,
@@ -1649,13 +1770,11 @@ class _StaffCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  barber.uid == null
-                      ? 'Login verification pending${barber.email.isEmpty ? '' : ' · ${barber.email}'}'
-                      : 'Account verified',
-                  style: TextStyle(
-                    color: barber.uid == null
-                        ? AppColors.amber
-                        : AppColors.success,
+                  barber.phone.isEmpty
+                      ? 'Staff profile'
+                      : 'Staff profile · ${barber.phone}',
+                  style: const TextStyle(
+                    color: AppColors.success,
                     fontSize: 14,
                     fontWeight: FontWeight.w600,
                   ),
@@ -1734,6 +1853,16 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
             'Manage your salon, services, staff, timings, and bookings.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            key: const ValueKey('exit-salon-login'),
+            onPressed: () => Navigator.of(context).pushAndRemoveUntil(
+              MaterialPageRoute(builder: (_) => const CustomerHomeScreen()),
+              (_) => false,
+            ),
+            icon: const Icon(Icons.arrow_back_rounded),
+            label: const Text('Back to customer home'),
+          ),
           const SizedBox(height: 16),
           AuthLoginPanel(
             role: UserRole.owner,
@@ -1759,13 +1888,7 @@ class _OwnerSetupBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final hasDetails = appState.hasSalonDetails(salon.id);
-    final hasServices = salon.services.isNotEmpty;
-    final hasBarber = appState.barbersForSalon(salon.id).isNotEmpty;
-    final serviceIds = salon.services.map((service) => service.id).toSet();
-    final hasAssignedBarber = appState
-        .barbersForSalon(salon.id)
-        .any((barber) => barber.serviceIds.any(serviceIds.contains));
+    final missingItems = appState.missingSalonSetupItems(salon.id);
 
     return GlassCard(
       color: AppColors.mint,
@@ -1782,7 +1905,7 @@ class _OwnerSetupBanner extends StatelessWidget {
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
-                  'Complete setup before customer bookings go live',
+                  'Complete the remaining salon setup',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     color: AppColors.primaryDark,
                     fontWeight: FontWeight.w600,
@@ -1802,14 +1925,16 @@ class _OwnerSetupBanner extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          _SetupCheckRow(done: hasDetails, label: 'Shop details saved'),
-          _SetupCheckRow(done: hasServices, label: 'At least one service'),
-          _SetupCheckRow(done: hasBarber, label: 'At least one barber'),
-          _SetupCheckRow(
-            done: hasAssignedBarber,
-            label: 'Barber assigned to a service',
+          const SizedBox(height: 6),
+          Text(
+            'Your salon remains visible to customers. Complete these items so the profile and booking experience are fully ready.',
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: AppColors.primaryDark),
           ),
+          const SizedBox(height: 12),
+          for (final item in missingItems)
+            _SetupCheckRow(done: false, label: item),
         ],
       ),
     );
@@ -1956,69 +2081,126 @@ class _SmallDetail extends StatelessWidget {
   }
 }
 
-class _StatusButton extends StatelessWidget {
+class _StatusButton extends StatefulWidget {
   final String label;
   final BookingStatus status;
   final Booking booking;
   final IconData? icon;
   final bool isPrimary;
+  final bool enabled;
+  final VoidCallback? onBookingChanged;
 
   const _StatusButton({
+    super.key,
     required this.label,
     required this.status,
     required this.booking,
     this.icon,
     this.isPrimary = false,
+    this.enabled = true,
+    this.onBookingChanged,
   });
+
+  @override
+  State<_StatusButton> createState() => _StatusButtonState();
+}
+
+class _StatusButtonState extends State<_StatusButton> {
+  bool _submitted = false;
 
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final onPressed = booking.status == status
+    final onPressed =
+        !widget.enabled ||
+            _submitted ||
+            widget.booking.status == widget.status ||
+            appState.isBookingStatusUpdatePending(widget.booking.id)
         ? null
-        : () async {
-            try {
-              await appState.updateBookingStatus(
-                booking.id,
-                status,
-                cancelledBy: status == BookingStatus.cancelled ? 'salon' : null,
-              );
-              if (context.mounted && status == BookingStatus.completed) {
-                final service = appState.getService(
-                  booking.salonId,
-                  booking.serviceId,
-                );
-                final price = booking.servicePrice > 0
-                    ? booking.servicePrice
-                    : service?.price ?? 0;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text(
-                      'Service completed. ₹$price added to revenue.',
-                    ),
-                  ),
-                );
-              }
-            } catch (error) {
-              if (!context.mounted) {
-                return;
-              }
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('Status update failed: $error')),
-              );
+        : () {
+            setState(() => _submitted = true);
+            final isInstantDecision =
+                widget.booking.isInstant &&
+                widget.booking.status == BookingStatus.pending &&
+                (widget.status == BookingStatus.confirmed ||
+                    widget.status == BookingStatus.rejected);
+            if (isInstantDecision) {
+              appState.silenceOwnerBookingAlert(widget.booking.id);
             }
+            final update = appState.updateBookingStatus(
+              widget.booking.id,
+              widget.status,
+              cancelledBy: widget.status == BookingStatus.cancelled
+                  ? 'salon'
+                  : null,
+            );
+            widget.onBookingChanged?.call();
+            unawaited(
+              update
+                  .then((_) {
+                    widget.onBookingChanged?.call();
+                    if (!context.mounted) {
+                      return;
+                    }
+                    if (widget.status != BookingStatus.completed) {
+                      return;
+                    }
+                    final service = appState.getService(
+                      widget.booking.salonId,
+                      widget.booking.serviceId,
+                    );
+                    final price = widget.booking.servicePrice > 0
+                        ? widget.booking.servicePrice
+                        : service?.price ?? 0;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          'Service completed. ₹$price added to revenue.',
+                        ),
+                      ),
+                    );
+                  })
+                  .catchError((Object error) {
+                    widget.onBookingChanged?.call();
+                    if (!context.mounted) {
+                      return;
+                    }
+                    setState(() => _submitted = false);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Status update failed: $error')),
+                    );
+                  }),
+            );
           };
-    if (isPrimary) {
+    final actionLabel = _submitted
+        ? _pendingLabel(widget.status)
+        : widget.label;
+    final actionIcon = _submitted
+        ? const SizedBox.square(
+            dimension: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          )
+        : Icon(widget.icon ?? Icons.arrow_forward);
+    if (widget.isPrimary) {
       return FilledButton.icon(
         onPressed: onPressed,
-        icon: Icon(icon ?? Icons.arrow_forward),
-        label: Text(label),
+        icon: actionIcon,
+        label: Text(actionLabel),
       );
     }
     return OutlinedButton.icon(
       onPressed: onPressed,
-      icon: Icon(icon ?? Icons.arrow_forward),
-      label: Text(label),
+      icon: actionIcon,
+      label: Text(actionLabel),
     );
   }
+
+  String _pendingLabel(BookingStatus status) => switch (status) {
+    BookingStatus.confirmed => 'Accepting...',
+    BookingStatus.rejected => 'Rejecting...',
+    BookingStatus.cancelled => 'Cancelling...',
+    BookingStatus.inProgress => 'Starting...',
+    BookingStatus.completed => 'Completing...',
+    BookingStatus.pending => 'Updating...',
+  };
 }

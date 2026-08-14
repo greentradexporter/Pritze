@@ -10,37 +10,69 @@ service cloud.firestore {
       return signedIn() && request.auth.uid == userId;
     }
 
-    function ownerSalonId(salonId) {
-      return signedIn() && salonId == 'salon-' + request.auth.uid;
-    }
-
-    function salonHasOwner() {
-      return resource.data.keys().hasAny(['ownerUid']) &&
-        resource.data.ownerUid is string &&
-        resource.data.ownerUid.size() > 0;
-    }
-
-    function ownerClaimsOwnSalon(salonId) {
-      return ownerSalonId(salonId) &&
-        !salonHasOwner() &&
-        request.resource.data.ownerUid == request.auth.uid;
-    }
-
-    function barberClaimsOwnProfile() {
+    function signedInAs(role) {
       return signedIn() &&
-        resource.data.uid == null &&
-        request.resource.data.uid == request.auth.uid &&
-        (get(/databases/$(database)/documents/users/$(request.auth.uid))
-          .data.contact == resource.data.phone ||
-         get(/databases/$(database)/documents/users/$(request.auth.uid))
-          .data.email == resource.data.email) &&
-        request.resource.data.diff(resource.data).affectedKeys()
-          .hasOnly(['uid', 'updatedAt']);
+        get(/databases/$(database)/documents/users/$(request.auth.uid))
+          .data.role == role;
+    }
+
+    function ownsSalon(salonId) {
+      return signedInAs('owner') &&
+        get(/databases/$(database)/documents/salons/$(salonId))
+          .data.ownerUid == request.auth.uid;
+    }
+
+    function hasRequiredSalonContact() {
+      return request.resource.data.phone is string &&
+        request.resource.data.phone.matches('^\\+[1-9][0-9]{7,14}$') &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid))
+          .data.profilePhone == request.resource.data.phone &&
+        request.resource.data.email is string &&
+        request.resource.data.email.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$');
+    }
+
+    function hasRequiredSalonProfile() {
+      return request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 &&
+        request.resource.data.ownerName is string &&
+        request.resource.data.ownerName.size() > 0 &&
+        request.resource.data.address is string &&
+        request.resource.data.address.size() > 0 &&
+        request.resource.data.openTime is string &&
+        request.resource.data.openTime.size() > 0 &&
+        request.resource.data.closeTime is string &&
+        request.resource.data.closeTime.size() > 0 &&
+        request.resource.data.isOpen is bool &&
+        request.resource.data.services is list &&
+        hasRequiredSalonContact();
+    }
+
+    function updatesOnlyOwnProfileFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'name',
+        'contact',
+        'email',
+        'phone',
+        'provider',
+        'fcmTokens',
+        'ownerAlertV3Tokens',
+        'lastFcmToken',
+        'notificationsEnabled',
+        'ownerNotificationsEnabled',
+        'fcmUpdatedAt',
+        'updatedAt'
+      ]);
     }
 
     match /users/{userId} {
-      allow read, update: if userOwnsProfile(userId);
-      allow create: if signedIn() && request.auth.uid == userId;
+      allow read: if userOwnsProfile(userId);
+      allow create: if false;
+      allow update: if userOwnsProfile(userId) &&
+        updatesOnlyOwnProfileFields();
+    }
+
+    match /loginIdentifiers/{identifierId} {
+      allow read, write: if false;
     }
 
     match /appConfig/{configId} {
@@ -50,55 +82,68 @@ service cloud.firestore {
 
     match /salons/{salonId} {
       allow read: if true;
-      allow create: if signedIn() &&
-        request.resource.data.ownerUid == request.auth.uid;
-      allow update, delete: if signedIn() &&
-        (resource.data.ownerUid == request.auth.uid ||
-         ownerClaimsOwnSalon(salonId));
+      allow create: if signedInAs('owner') &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        hasRequiredSalonProfile();
+      allow update: if signedInAs('owner') &&
+        resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        hasRequiredSalonProfile();
+      allow delete: if signedInAs('owner') &&
+        resource.data.ownerUid == request.auth.uid;
     }
 
     match /barbers/{barberId} {
       allow read: if true;
-      allow create: if signedIn();
-      allow update: if signedIn() &&
-        (resource.data.uid == request.auth.uid ||
-         resource.data.ownerUid == request.auth.uid ||
-         barberClaimsOwnProfile());
-      allow delete: if signedIn() &&
-        (resource.data.uid == request.auth.uid ||
-         resource.data.ownerUid == request.auth.uid);
+      allow create: if signedInAs('owner') &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        ownsSalon(request.resource.data.salonId);
+      allow update, delete: if signedInAs('owner') &&
+        (resource.data.ownerUid == request.auth.uid ||
+         ownsSalon(resource.data.salonId));
     }
 
     match /slotLocks/{slotLockId} {
       allow read: if true;
-      allow create, update: if signedIn();
-      allow delete: if false;
+      allow write: if false;
     }
 
     match /activeInstantBookings/{userId} {
-      allow read, create, update: if userOwnsProfile(userId);
-      allow delete: if false;
+      allow read: if userOwnsProfile(userId) &&
+        signedInAs('customer');
+      allow write: if false;
     }
 
     match /activeCustomerBookings/{userId} {
-      allow read, create, update: if userOwnsProfile(userId);
-      allow delete: if false;
+      allow read: if userOwnsProfile(userId) &&
+        signedInAs('customer');
+      allow write: if false;
     }
 
     match /bookings/{bookingId} {
-      allow create: if signedIn() &&
-        request.resource.data.customerUid == request.auth.uid;
-      allow read, update: if signedIn() &&
+      allow read: if signedIn() &&
         (resource.data.customerUid == request.auth.uid ||
-         resource.data.barberUid == request.auth.uid ||
          resource.data.ownerUid == request.auth.uid);
-      allow delete: if false;
+      allow write: if false;
+    }
+
+    match /salonFeedback/{bookingId} {
+      allow read: if signedIn() &&
+        (resource.data.customerUid == request.auth.uid ||
+         resource.data.ownerUid == request.auth.uid);
+      allow write: if false;
+    }
+
+    match /customerRatings/{bookingId} {
+      allow read: if signedIn() &&
+        (resource.data.customerUid == request.auth.uid ||
+         resource.data.ownerUid == request.auth.uid);
+      allow write: if false;
     }
 
     match /joinRequests/{requestId} {
-      allow create: if signedIn() &&
-        request.resource.data.requesterUid == request.auth.uid;
-      allow read, update: if signedIn() &&
+      allow create, update: if false;
+      allow read: if signedIn() &&
         (resource.data.requesterUid == request.auth.uid ||
          resource.data.ownerUid == request.auth.uid);
       allow delete: if false;

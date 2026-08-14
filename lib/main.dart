@@ -10,6 +10,7 @@ import 'state/app_state.dart';
 import 'theme/app_theme.dart';
 import 'widgets/trimtime_logo.dart';
 import 'widgets/customer_booking_confirmation_gate.dart';
+import 'widgets/app_update_prompt.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,6 +45,8 @@ class TrimtimeApp extends StatelessWidget {
       title: 'Pritze',
       theme: AppTheme.build(),
       home: const AppEntryScreen(),
+      builder: (context, child) =>
+          AppUpdatePrompt(child: child ?? const SizedBox.shrink()),
       debugShowCheckedModeBanner: false,
     );
   }

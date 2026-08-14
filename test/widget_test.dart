@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -7,18 +9,22 @@ import 'package:nashik_salon_booking/models/app_models.dart';
 import 'package:nashik_salon_booking/models/service_catalog.dart';
 import 'package:nashik_salon_booking/screens/barber/barber_dashboard_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/customer_home_screen.dart';
+import 'package:nashik_salon_booking/screens/customer/customer_profile_editor.dart';
+import 'package:nashik_salon_booking/screens/customer/customer_profile_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/my_bookings_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/salon_booking_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/salon_detail_screen.dart';
 import 'package:nashik_salon_booking/screens/partner/partner_hub_screen.dart';
 import 'package:nashik_salon_booking/screens/salon/salon_dashboard_screen.dart';
 import 'package:nashik_salon_booking/screens/salon/salon_profile_setup_screen.dart';
+import 'package:nashik_salon_booking/services/android_phone_hint.dart';
 import 'package:nashik_salon_booking/state/app_state.dart';
 import 'package:nashik_salon_booking/state/app_state_scope.dart';
 import 'package:nashik_salon_booking/widgets/account_actions.dart';
 import 'package:nashik_salon_booking/widgets/auth_login_panel.dart';
 import 'package:nashik_salon_booking/widgets/booking_status_timeline.dart';
 import 'package:nashik_salon_booking/widgets/customer_booking_confirmation_gate.dart';
+import 'package:nashik_salon_booking/widgets/app_update_prompt.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -28,6 +34,18 @@ void main() {
 
   test('uses the configured Pritze support number by default', () {
     expect(AppState().supportPhone, '+91 89996 08278');
+  });
+
+  test('phone hints normalize Indian SIM number formats', () {
+    expect(indianMobileDigitsFromHint('+91 98765 43210'), '9876543210');
+    expect(indianMobileDigitsFromHint('09876543210'), '9876543210');
+    expect(indianMobileDigitsFromHint('9876543210'), '9876543210');
+    expect(indianMobileDigitsFromHint('+1 555 123 4567'), isNull);
+  });
+
+  test('app update prompt compares platform build numbers', () {
+    expect(shouldShowAppUpdate(installedBuild: 24, latestBuild: 25), isTrue);
+    expect(shouldShowAppUpdate(installedBuild: 24, latestBuild: 24), isFalse);
   });
 
   test('push permission policy handles iOS and Android first launch', () {
@@ -92,7 +110,7 @@ void main() {
     expect(find.text('Chembur'), findsOneWidget);
     await tester.drag(find.byType(Scrollable).first, const Offset(0, -350));
     await tester.pumpAndSettle();
-    expect(find.text('No open salons found'), findsOneWidget);
+    expect(find.text('No salons found'), findsOneWidget);
     expect(find.text('Discover'), findsOneWidget);
   });
 
@@ -115,6 +133,36 @@ void main() {
     expect(find.text('Search results'), findsOneWidget);
   });
 
+  testWidgets('customer home keeps incomplete salon listings visible', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+
+    expect(state.isSalonBookable(salonId), isFalse);
+    expect(
+      state.discoverableSalons.any((salon) => salon.id == salonId),
+      isTrue,
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerHomeScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pritze Cuts'), findsOneWidget);
+    expect(
+      find.text('Listing visible · booking setup in progress'),
+      findsOneWidget,
+    );
+    expect(find.byKey(ValueKey('salon-card-image-$salonId')), findsOneWidget);
+    expect(find.text('Schedule Slot'), findsOneWidget);
+  });
+
   testWidgets('customer service categories scroll horizontally', (
     tester,
   ) async {
@@ -135,6 +183,81 @@ void main() {
     expect(find.text('Makeup'), findsOneWidget);
   });
 
+  testWidgets(
+    'customer can select multiple services and salons must offer all of them',
+    (tester) async {
+      final state = AppState();
+      await state.loginOwnerWithEmail(
+        name: 'Complete owner',
+        email: 'complete@example.com',
+      );
+      await state.updateOwnerSalon(
+        name: 'Complete Salon',
+        ownerName: 'Complete owner',
+        address: 'College Road, Nashik',
+        phone: '9000000101',
+        openTime: '9:00 AM',
+        closeTime: '8:00 PM',
+      );
+      await state.addOwnerService(
+        name: 'Classic Haircut',
+        category: 'Hair',
+        price: 250,
+        durationMinutes: 30,
+      );
+      await state.addOwnerService(
+        name: 'Glow Facial',
+        category: 'Facial',
+        price: 600,
+        durationMinutes: 45,
+      );
+      await state.signOutActiveUser();
+      await state.loginOwnerWithEmail(
+        name: 'Hair owner',
+        email: 'hair-only@example.com',
+      );
+      await state.updateOwnerSalon(
+        name: 'Hair Only Salon',
+        ownerName: 'Hair owner',
+        address: 'Main Road, Nashik',
+        phone: '9000000102',
+        openTime: '9:00 AM',
+        closeTime: '8:00 PM',
+      );
+      await state.addOwnerService(
+        name: 'Basic Haircut',
+        category: 'Hair',
+        price: 200,
+        durationMinutes: 30,
+      );
+      await state.signOutActiveUser();
+
+      await tester.pumpWidget(
+        AppStateProvider(
+          createAppState: () => state,
+          child: const MaterialApp(home: CustomerHomeScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final categories = find.byKey(const Key('service-category-list'));
+      await tester.tap(
+        find.descendant(of: categories, matching: find.text('Haircut')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.descendant(of: categories, matching: find.text('Facial')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('2 services selected'), findsOneWidget);
+      expect(find.text('Complete Salon'), findsOneWidget);
+      expect(find.text('College Road, Nashik'), findsOneWidget);
+      expect(find.text('Hair Only Salon'), findsNothing);
+      expect(find.text('Nearby'), findsNothing);
+    },
+  );
+
   testWidgets('iOS home uses Chembur and readable horizontal services', (
     tester,
   ) async {
@@ -152,7 +275,7 @@ void main() {
       tester.widget<ListView>(categoryList).scrollDirection,
       Axis.horizontal,
     );
-    expect(tester.widget<Text>(find.text('Haircut')).style?.fontSize, 14);
+    expect(tester.widget<Text>(find.text('Haircut')).style?.fontSize, 13);
 
     await tester.drag(categoryList, const Offset(-650, 0));
     await tester.pumpAndSettle();
@@ -191,7 +314,53 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Book instantly'), findsOneWidget);
-    expect(find.text('View salon'), findsOneWidget);
+    expect(find.text('Schedule Slot'), findsOneWidget);
+    expect(find.textContaining('shops'), findsNothing);
+  });
+
+  testWidgets('homepage instant booking opens a standalone services page', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Instant barber',
+      phone: '9888888891',
+      speciality: 'Hair',
+      experienceYears: 2,
+      resumeSummary: 'Instant bookings.',
+      serviceIds: [service.id],
+    );
+    await state.signOutActiveUser();
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerHomeScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final instantButton = find.text('Book instantly');
+    await tester.ensureVisible(instantButton);
+    await tester.pumpAndSettle();
+    await tester.tap(instantButton);
+    await tester.pumpAndSettle();
+
+    expect(find.byType(InstantServiceSelectionScreen), findsOneWidget);
+    expect(find.byType(SalonDetailScreen), findsNothing);
+    expect(find.text('Choose instant services'), findsOneWidget);
+
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.byType(CustomerHomeScreen), findsOneWidget);
   });
 
   testWidgets('salon detail offers direct barber picker without scrolling', (
@@ -199,6 +368,14 @@ void main() {
   ) async {
     final state = await _stateWithSalonService(signOut: false);
     final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
     await state.addOwnerBarber(
       name: 'Ravi',
       phone: '9888888801',
@@ -220,14 +397,442 @@ void main() {
 
     expect(find.text('Pick service'), findsOneWidget);
     expect(find.text('Pick barber'), findsOneWidget);
+    expect(find.byType(ExpansionTile), findsNothing);
+    expect(find.byIcon(Icons.near_me_outlined), findsNothing);
+    expect(find.textContaining('Nearby'), findsNothing);
     await tester.tap(find.text('Pick barber'));
     await tester.pumpAndSettle();
 
     expect(find.text('Choose your barber'), findsOneWidget);
     expect(find.text('Ravi'), findsOneWidget);
+
+    await tester.tap(find.text('Ravi'));
+    await tester.pumpAndSettle();
+    expect(find.text('Choose a service'), findsOneWidget);
+
+    await tester.tap(find.text(service.name));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SalonBookingScreen), findsOneWidget);
+    expect(find.text('Book slot'), findsOneWidget);
+    expect(
+      tester
+          .widget<SalonBookingScreen>(find.byType(SalonBookingScreen))
+          .initialBarberId,
+      state.barbersForSalon(state.ownerSalon.id).single.id,
+    );
+    expect(
+      tester
+          .widget<SalonBookingScreen>(find.byType(SalonBookingScreen))
+          .instantOnly,
+      isFalse,
+    );
+    expect(find.text('Available slots'), findsOneWidget);
+    expect(find.text('Choose barber'), findsNothing);
+    expect(find.text('Request instant booking'), findsNothing);
   });
 
-  testWidgets('iOS booking controls fit without overflow', (tester) async {
+  testWidgets('customer barber picker shows every active salon barber', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    for (var index = 1; index <= 4; index += 1) {
+      await state.addOwnerBarber(
+        name: 'Barber $index',
+        phone: '98888887${index.toString().padLeft(2, '0')}',
+        speciality: 'Team member',
+        experienceYears: index,
+        resumeSummary: 'Salon team member.',
+        serviceIds: index <= 2 ? [service.id] : const [],
+      );
+    }
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonDetailScreen(salonId: state.ownerSalon.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('4 available'), findsOneWidget);
+    await tester.tap(find.text('Pick barber'));
+    await tester.pumpAndSettle();
+
+    final barberList = find.descendant(
+      of: find.byType(FractionallySizedBox),
+      matching: find.byType(Scrollable),
+    );
+    expect(barberList, findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('Barber 4'),
+      160,
+      scrollable: barberList,
+    );
+    expect(find.text('Barber 4'), findsOneWidget);
+  });
+
+  testWidgets('only the dedicated instant action opens instant booking', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Instant barber',
+      phone: '9888888806',
+      speciality: 'Instant services',
+      experienceYears: 2,
+      resumeSummary: 'Instant test.',
+      serviceIds: [service.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonDetailScreen(salonId: state.ownerSalon.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Book instantly'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Choose instant services'), findsOneWidget);
+    await tester.tap(find.text(service.name));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('continue-instant-services')));
+    await tester.pumpAndSettle();
+
+    final bookingScreen = tester.widget<SalonBookingScreen>(
+      find.byType(SalonBookingScreen),
+    );
+    expect(bookingScreen.instantOnly, isTrue);
+    expect(find.text('Request instant booking'), findsOneWidget);
+    expect(find.text('Choose barber'), findsNothing);
+    expect(find.text('Available slots'), findsNothing);
+    expect(find.textContaining('any available barber'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, 'Book for ₹0'), findsNothing);
+  });
+
+  testWidgets('closed salons expose services but block appointment entry', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '12:01 AM',
+    );
+    await state.addOwnerBarber(
+      name: 'Closed salon barber',
+      phone: '9888888815',
+      speciality: 'Hair',
+      experienceYears: 3,
+      resumeSummary: 'Closed salon test.',
+      serviceIds: [service.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonDetailScreen(salonId: state.ownerSalon.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Pick service'), findsOneWidget);
+    expect(find.text('Pick barber'), findsOneWidget);
+    await tester.tap(find.text('Pick service'));
+    await tester.pumpAndSettle();
+    expect(find.text(service.name), findsOneWidget);
+    await tester.tap(find.text(service.name));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Salon is closed'), findsOneWidget);
+    expect(find.byType(SalonBookingScreen), findsNothing);
+  });
+
+  testWidgets('salon card body opens the complete action preview', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Preview barber',
+      phone: '9888888816',
+      speciality: 'Hair',
+      experienceYears: 3,
+      resumeSummary: 'Preview test.',
+      serviceIds: [service.id],
+    );
+    await state.signOutActiveUser();
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerHomeScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Pritze Cuts'));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('salon-preview-call')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('salon-preview-directions')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('salon-preview-schedule-slot')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('salon-preview-book-instantly')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('salon card schedule action bypasses the preview sheet', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Schedule barber',
+      phone: '9888888817',
+      speciality: 'Hair',
+      experienceYears: 3,
+      resumeSummary: 'Schedule test.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerHomeScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scheduleButton = find.byKey(ValueKey('salon-card-schedule-$salonId'));
+    await tester.ensureVisible(scheduleButton);
+    await tester.pumpAndSettle();
+    await tester.tap(scheduleButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Choose a service'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('salon-preview-book-instantly')),
+      findsNothing,
+    );
+
+    await tester.tap(find.text(service.name));
+    await tester.pumpAndSettle();
+    expect(find.byType(SalonBookingScreen), findsOneWidget);
+    expect(find.text('Choose barber'), findsOneWidget);
+
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.byType(CustomerHomeScreen), findsOneWidget);
+    expect(find.byType(SalonDetailScreen), findsNothing);
+  });
+
+  test('instant booking preserves multiple selected services', () async {
+    final state = await _stateWithSalonService(signOut: false);
+    final first = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerService(
+      name: 'Beard trim',
+      category: 'Beard',
+      price: 120,
+      durationMinutes: 15,
+    );
+    final second = state.ownerSalon.services.last;
+    await state.addOwnerBarber(
+      name: 'Multi service barber',
+      phone: '9888888817',
+      speciality: 'Hair and beard',
+      experienceYears: 4,
+      resumeSummary: 'Multi service test.',
+      serviceIds: [first.id, second.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+
+    final booking = await state.createInstantBooking(
+      salonId: salonId,
+      serviceIds: [first.id, second.id],
+      arrivalMinutes: 15,
+    );
+
+    expect(booking.resolvedServiceIds, [first.id, second.id]);
+    expect(booking.serviceName, 'Haircut, Beard trim');
+    expect(booking.durationMinutes, 45);
+    expect(booking.servicePrice, 320);
+    expect(booking.barberId, isEmpty);
+  });
+
+  testWidgets('picking a service opens scheduled slots, not instant booking', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Scheduled barber',
+      phone: '9888888807',
+      speciality: 'Scheduled services',
+      experienceYears: 2,
+      resumeSummary: 'Scheduled test.',
+      serviceIds: [service.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonDetailScreen(salonId: state.ownerSalon.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Pick service'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(service.name));
+    await tester.pumpAndSettle();
+
+    final bookingScreen = tester.widget<SalonBookingScreen>(
+      find.byType(SalonBookingScreen),
+    );
+    expect(bookingScreen.instantOnly, isFalse);
+    expect(find.text('Available slots'), findsOneWidget);
+    expect(find.text('Request instant booking'), findsNothing);
+  });
+
+  testWidgets('salon service picker searches only the salon service list', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Search barber',
+      phone: '9888888805',
+      speciality: 'Service specialist',
+      experienceYears: 2,
+      resumeSummary: 'Search test.',
+      serviceIds: [service.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonDetailScreen(salonId: state.ownerSalon.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Pick service'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('salon-service-search-field')),
+      findsOneWidget,
+    );
+    expect(find.text(service.name), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const ValueKey('salon-service-search-field')),
+      'not offered here',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text(service.name), findsNothing);
+    expect(find.text('No matching services'), findsOneWidget);
+  });
+
+  testWidgets('owner overview and team omit legacy chair and join requests', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Chair board'), findsNothing);
+
+    await tester.tap(find.text('Team'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Join requests'), findsNothing);
+    expect(find.text('No pending requests right now.'), findsNothing);
+    expect(find.text('Team members'), findsOneWidget);
+  });
+
+  testWidgets('iOS booking matches Android controls without overflow', (
+    tester,
+  ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     await tester.binding.setSurfaceSize(const Size(428, 926));
@@ -259,11 +864,82 @@ void main() {
     expect(find.text('Any available'), findsOneWidget);
     expect(find.text('Sahil'), findsWidgets);
     expect(find.text('1 barber'), findsNWidgets(2));
-    expect(find.text('0 booking fee'), findsOneWidget);
-    expect(find.text('Book this slot'), findsOneWidget);
-    expect(find.text('Book for ₹0'), findsNothing);
+    expect(find.text('0 booking fee'), findsNothing);
+    expect(find.text('Book this slot'), findsNothing);
+    expect(find.text('Book for ₹0'), findsOneWidget);
     expect(tester.takeException(), isNull);
     debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('scheduled booking exposes a horizontal 30-day calendar', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Calendar barber',
+      phone: '9888888806',
+      speciality: 'Scheduled services',
+      experienceYears: 3,
+      resumeSummary: 'Calendar test.',
+      serviceIds: [service.id],
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonBookingScreen(salonId: salonId, serviceId: service.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final selector = find.byKey(const ValueKey('booking-date-selector'));
+    final dateList = find.descendant(
+      of: selector,
+      matching: find.byType(ListView),
+    );
+    final list = tester.widget<ListView>(dateList);
+    expect(list.scrollDirection, Axis.horizontal);
+    expect(
+      list.childrenDelegate.estimatedChildCount,
+      scheduledBookingHorizonDays * 2 - 1,
+    );
+
+    final today = DateTime.now();
+    final firstSlotDate = state
+        .slotsForService(salonId, service.id)
+        .first
+        .start;
+    final target =
+        firstSlotDate.day == today.day &&
+            firstSlotDate.month == today.month &&
+            firstSlotDate.year == today.year
+        ? DateTime(today.year, today.month, today.day + 1)
+        : DateTime(today.year, today.month, today.day);
+    final targetKey = ValueKey(
+      'booking-date-${target.year}-${target.month.toString().padLeft(2, '0')}-${target.day.toString().padLeft(2, '0')}',
+    );
+    await tester.tap(find.byKey(targetKey));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('Available times for ${state.formatDate(target)}'),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('Android booking action makes the zero cost explicit', (
@@ -292,10 +968,10 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('Android booking action opens the polished sign-in sheet', (
+  testWidgets('iOS booking action opens the Android-matched sign-in sheet', (
     tester,
   ) async {
-    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -333,18 +1009,15 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.drag(find.byType(ListView).first, const Offset(0, -720));
-    await tester.pumpAndSettle();
     final slotFinder = find.text(firstSlotLabel).first;
+    await tester.ensureVisible(slotFinder);
+    await tester.pumpAndSettle();
     await tester.tap(slotFinder);
     await tester.pump();
     await tester.tap(find.widgetWithText(FilledButton, 'Book for ₹0'));
     await tester.pumpAndSettle();
 
-    expect(
-      find.byKey(const ValueKey('android-booking-login-sheet')),
-      findsOneWidget,
-    );
+    expect(find.byKey(const ValueKey('booking-login-sheet')), findsOneWidget);
     expect(find.text('Complete your booking'), findsOneWidget);
     expect(find.text('₹0 booking fee'), findsOneWidget);
     expect(find.byKey(const ValueKey('phone-login-field')), findsOneWidget);
@@ -352,10 +1025,10 @@ void main() {
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('Android completed booking shows the polished confirmation', (
+  testWidgets('iOS completed booking shows the Android-matched confirmation', (
     tester,
   ) async {
-    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -380,10 +1053,7 @@ void main() {
       serviceIds: [service.id],
     );
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'confirmation@example.com',
-    );
+    await _loginCustomer(state);
     final firstSlot = state.slotsForService(salonId, service.id).first;
     final firstSlotLabel = state.formatTime(firstSlot.start);
 
@@ -397,56 +1067,49 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.drag(find.byType(ListView).first, const Offset(0, -720));
-    await tester.pumpAndSettle();
     final slotFinder = find.text(firstSlotLabel).first;
+    await tester.ensureVisible(slotFinder);
+    await tester.pumpAndSettle();
     await tester.tap(slotFinder);
     await tester.pump();
     await tester.tap(find.widgetWithText(FilledButton, 'Book for ₹0'));
     await tester.pumpAndSettle();
 
     expect(
-      find.byKey(const ValueKey('android-booking-success-dialog')),
+      find.byKey(const ValueKey('booking-success-dialog')),
       findsOneWidget,
     );
-    expect(find.text('Booking request sent'), findsOneWidget);
+    expect(find.text('Booking confirmed'), findsOneWidget);
     expect(find.text('BOOKING DETAILS'), findsOneWidget);
-    expect(find.text('Awaiting salon confirmation'), findsOneWidget);
+    expect(find.text('Appointment registered'), findsOneWidget);
     expect(find.text('View my bookings'), findsOneWidget);
     expect(tester.takeException(), isNull);
     debugDefaultTargetPlatformOverride = null;
   });
 
-  testWidgets('barber speciality is chosen from a dropdown', (tester) async {
-    final state = await _stateWithSalonService();
-    await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
-    await tester.pumpWidget(
-      AppStateProvider(
-        createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
+  test('barber login methods are rejected', () async {
+    final state = AppState();
+    await expectLater(
+      state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com'),
+      throwsStateError,
+    );
+    await expectLater(
+      state.loginBarberWithGmail(name: 'Aman', email: 'aman@gmail.com'),
+      throwsStateError,
+    );
+    await expectLater(
+      state.loginBarberWithPhone(
+        phone: '9876543210',
+        verificationId: 'test-verification',
+        smsCode: '123456',
       ),
+      throwsStateError,
     );
-
-    expect(find.text('Haircut specialist'), findsOneWidget);
-
-    final specialityDropdown = find.byType(DropdownButtonFormField<String>);
-    await tester.scrollUntilVisible(
-      specialityDropdown,
-      220,
-      scrollable: find.byType(Scrollable).first,
-    );
-    await tester.drag(find.byType(Scrollable).first, const Offset(0, -160));
-    await tester.pumpAndSettle();
-    await tester.tap(specialityDropdown);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Fade specialist').last);
-    await tester.pumpAndSettle();
-
-    expect(find.text('Fade specialist'), findsOneWidget);
-    expect(find.widgetWithText(TextFormField, 'Speciality'), findsNothing);
   });
 
-  testWidgets('customer discovery only shows bookable shops', (tester) async {
+  testWidgets('customer discovery shows ready and incomplete shops', (
+    tester,
+  ) async {
     final state = AppState();
     await state.loginOwnerWithEmail(
       name: 'Owner A',
@@ -496,7 +1159,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Ready Cuts'), findsOneWidget);
-    expect(find.text('Almost Ready Salon'), findsNothing);
+    expect(find.text('Almost Ready Salon'), findsOneWidget);
+    expect(
+      find.text('Listing visible · booking setup in progress'),
+      findsOneWidget,
+    );
   });
 
   test(
@@ -642,6 +1309,18 @@ void main() {
         ),
       ),
     );
+    expect(find.text('Confirmed'), findsOneWidget);
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: BookingStatusTimeline(
+            status: BookingStatus.confirmed,
+            isInstant: true,
+          ),
+        ),
+      ),
+    );
     expect(find.text('Accepted'), findsOneWidget);
 
     await tester.pumpWidget(
@@ -669,10 +1348,7 @@ void main() {
     );
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'timeline@example.com',
-    );
+    await _loginCustomer(state);
     final booking = await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
@@ -688,13 +1364,76 @@ void main() {
       find.byKey(const Key('current-booking-bottom-panel')),
       findsOneWidget,
     );
-    expect(find.text('Current booking · Haircut'), findsOneWidget);
-    expect(find.text('Booking sent'), findsOneWidget);
-    expect(find.text('Salon response'), findsOneWidget);
+    expect(find.text('CURRENT BOOKING'), findsOneWidget);
+    expect(find.text('Haircut'), findsWidgets);
+    expect(
+      find.byKey(const ValueKey('booking-panel-view-action')),
+      findsOneWidget,
+    );
+    expect(find.text('Confirmed'), findsWidgets);
+    expect(find.text('Appointment'), findsOneWidget);
 
     await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
     await tester.pump();
-    expect(find.text('Accepted'), findsOneWidget);
+    expect(find.text('Confirmed'), findsWidgets);
+
+    await tester.tap(find.text('Profile').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Profile'), findsWidgets);
+    expect(
+      find.byKey(const Key('current-booking-bottom-panel')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('customer cancellation removes all active UI immediately', (
+    tester,
+  ) async {
+    final state = _DelayedBookingStatusAppState();
+    await _stateWithSalonService(signOut: false, appState: state);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9898989897',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerHomeScreen()),
+      ),
+    );
+    expect(
+      find.byKey(const Key('current-booking-bottom-panel')),
+      findsOneWidget,
+    );
+
+    final cancellation = state.cancelBooking(
+      booking.id,
+      reason: 'Plans changed',
+    );
+    await tester.pump();
+
+    expect(state.activeCustomerBooking, isNull);
+    expect(state.customerBookings.single.status, BookingStatus.cancelled);
+    expect(find.byKey(const Key('current-booking-bottom-panel')), findsNothing);
+    expect(find.text('Current booking · Haircut'), findsNothing);
+
+    state.completeStatusWrite();
+    await cancellation;
+    await tester.pump();
+    expect(state.customerBookings.single.status, BookingStatus.cancelled);
+    expect(find.byKey(const Key('current-booking-bottom-panel')), findsNothing);
   });
 
   testWidgets('salon booking desk shows the ordered service snapshot', (
@@ -712,10 +1451,7 @@ void main() {
     );
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'snapshot@example.com',
-    );
+    await _loginCustomer(state);
     await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
@@ -778,10 +1514,7 @@ void main() {
       );
 
       await state.signOutActiveUser();
-      await state.loginCustomerWithEmail(
-        name: 'Customer',
-        email: 'service-settings@example.com',
-      );
+      await _loginCustomer(state);
       final booking = await state.createBooking(
         slot: state.slotsForService(salonId, original.id).first,
       );
@@ -828,6 +1561,8 @@ void main() {
       240,
       scrollable: find.byType(Scrollable).first,
     );
+    await tester.drag(find.byType(Scrollable).first, const Offset(0, -180));
+    await tester.pumpAndSettle();
     await tester.tap(actions);
     await tester.pumpAndSettle();
 
@@ -842,8 +1577,44 @@ void main() {
     expect(find.text('Hidden'), findsOneWidget);
   });
 
+  testWidgets('owner can edit a displayed service price by tapping it', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonProfileSetupScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Owner profile'), findsNothing);
+    final price = find.byKey(ValueKey('service-price-${service.id}'));
+    await tester.scrollUntilVisible(
+      price,
+      240,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.ensureVisible(price);
+    await tester.pumpAndSettle();
+    await tester.tap(price);
+    await tester.pumpAndSettle();
+
+    final editor = find.byKey(ValueKey('service-price-editor-${service.id}'));
+    expect(editor, findsOneWidget);
+    await tester.enterText(editor, '575');
+    await tester.tap(find.byTooltip('Save price'));
+    await tester.pumpAndSettle();
+
+    expect(state.ownerSalon.services.single.price, 575);
+    expect(find.text('₹575'), findsOneWidget);
+  });
+
   test(
-    'instant booking preserves the selected arrival timer through acceptance',
+    'instant booking starts its selected arrival timer on acceptance',
     () async {
       final state = await _stateWithSalonService(signOut: false);
       final service = state.ownerSalon.services.single;
@@ -866,10 +1637,7 @@ void main() {
       );
       final salonId = state.ownerSalon.id;
       await state.signOutActiveUser();
-      await state.loginCustomerWithEmail(
-        name: 'Customer',
-        email: 'instant@example.com',
-      );
+      await _loginCustomer(state);
 
       final booking = await state.createInstantBooking(
         salonId: salonId,
@@ -879,7 +1647,7 @@ void main() {
 
       expect(booking.isInstant, isTrue);
       expect(booking.status, BookingStatus.pending);
-      expect(booking.barberId, isNotEmpty);
+      expect(booking.barberId, isEmpty);
       expect(booking.bookingFee, 0);
       expect(booking.paymentRequired, isFalse);
       expect(booking.paymentStatus, 'not_required');
@@ -894,7 +1662,12 @@ void main() {
       );
 
       expect(accepted.acceptedAt, isNotNull);
-      expect(accepted.start, requestedStart);
+      expect(accepted.barberId, isNotEmpty);
+      expect(accepted.start, isNot(requestedStart));
+      expect(
+        accepted.start.difference(accepted.acceptedAt!),
+        const Duration(minutes: 25),
+      );
       expect(state.customerBookingOutcome(accepted), 'Accepted · arrive soon');
     },
   );
@@ -924,6 +1697,7 @@ void main() {
       final salonId = state.ownerSalon.id;
       await state.signOutActiveUser();
       await state.loginCustomerWithPhone(
+        name: 'Customer',
         phone: '9876543200',
         verificationId: 'test-verification',
         smsCode: '123456',
@@ -1051,7 +1825,54 @@ void main() {
     },
   );
 
-  testWidgets('instant countdown starts while salon response is pending', (
+  test(
+    'scheduled rescheduling keeps one confirmed booking atomically',
+    () async {
+      final state = await _stateWithSalonService(signOut: false);
+      final service = state.ownerSalon.services.single;
+      await state.addOwnerBarber(
+        name: 'Ravi',
+        phone: '9333333350',
+        speciality: 'Haircut specialist',
+        experienceYears: 4,
+        resumeSummary: 'Scheduled cuts.',
+        serviceIds: [service.id],
+      );
+      final salonId = state.ownerSalon.id;
+      final barber = state.barbersForSalon(salonId).single;
+      await state.signOutActiveUser();
+      await _loginCustomer(state, phone: '9876543250');
+      final now = DateTime.now();
+      final originalStart = DateTime(now.year, now.month, now.day + 1, 10);
+      final newStart = DateTime(now.year, now.month, now.day + 1, 11);
+      final booking = await state.createBooking(
+        slot: TimeSlot(
+          salonId: salonId,
+          serviceId: service.id,
+          barberId: barber.id,
+          start: originalStart,
+        ),
+      );
+
+      final updated = await state.rescheduleBooking(
+        booking.id,
+        slot: TimeSlot(
+          salonId: salonId,
+          serviceId: service.id,
+          barberId: barber.id,
+          start: newStart,
+        ),
+      );
+
+      expect(updated.id, booking.id);
+      expect(updated.status, BookingStatus.confirmed);
+      expect(updated.start, newStart);
+      expect(state.bookings, hasLength(1));
+      expect(state.activeCustomerBooking?.id, booking.id);
+    },
+  );
+
+  testWidgets('instant reach-by time appears only after salon acceptance', (
     tester,
   ) async {
     final state = await _stateWithSalonService(signOut: false);
@@ -1075,10 +1896,7 @@ void main() {
     );
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'instant-timer@example.com',
-    );
+    await _loginCustomer(state);
     final booking = await state.createInstantBooking(
       salonId: salonId,
       serviceId: service.id,
@@ -1092,27 +1910,79 @@ void main() {
     );
     await tester.pump();
 
-    expect(find.text('Instant request · waiting for salon'), findsOneWidget);
-    expect(find.textContaining('Reach the salon in'), findsWidgets);
+    expect(
+      find.textContaining('Waiting for the salon to accept'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Reach by'), findsNothing);
 
     await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
     await tester.pump();
 
-    expect(find.textContaining('Starts in'), findsOneWidget);
+    expect(find.textContaining('Reach by'), findsOneWidget);
+    expect(find.textContaining('about 15 min remaining'), findsOneWidget);
+    expect(find.textContaining('Starts in'), findsNothing);
   });
 
-  testWidgets('salon instant arrival countdown uses whole minutes', (
+  testWidgets(
+    'salon instant reach-by time includes grace without a ticking clock',
+    (tester) async {
+      final booking = Booking(
+        id: 'minute-timer',
+        salonId: 'salon',
+        serviceId: 'service',
+        barberId: 'barber',
+        customerName: 'Customer',
+        customerPhone: '+919876543210',
+        start: DateTime.now().add(const Duration(minutes: 15)),
+        status: BookingStatus.confirmed,
+        createdAt: DateTime.now(),
+        isInstant: true,
+        arrivalMinutes: 15,
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            bottomNavigationBar: BookingArrivalBottomPanel(
+              booking: booking,
+              audience: BookingTimerAudience.salon,
+              onTap: () {},
+            ),
+          ),
+        ),
+      );
+
+      final timerText = tester
+          .widgetList<Text>(find.byType(Text))
+          .map((widget) => widget.data ?? '')
+          .firstWhere((text) => text.contains('Expect customer by'));
+      expect(timerText, contains('15 min selected'));
+      expect(timerText, contains('20 min salon window'));
+      expect(timerText, contains('about 20 min remaining'));
+      expect(timerText, isNot(contains('within')));
+
+      await tester.pump(const Duration(seconds: 30));
+      final unchangedText = tester
+          .widgetList<Text>(find.byType(Text))
+          .map((widget) => widget.data ?? '')
+          .firstWhere((text) => text.contains('Expect customer by'));
+      expect(unchangedText, timerText);
+    },
+  );
+
+  testWidgets('pending owner request has no arrival time before acceptance', (
     tester,
   ) async {
     final booking = Booking(
-      id: 'minute-timer',
+      id: 'pending-arrival',
       salonId: 'salon',
       serviceId: 'service',
-      barberId: 'barber',
+      barberId: '',
       customerName: 'Customer',
       customerPhone: '+919876543210',
       start: DateTime.now().add(const Duration(minutes: 15)),
-      status: BookingStatus.confirmed,
+      status: BookingStatus.pending,
       createdAt: DateTime.now(),
       isInstant: true,
       arrivalMinutes: 15,
@@ -1130,12 +2000,9 @@ void main() {
       ),
     );
 
-    final timerText = tester
-        .widgetList<Text>(find.byType(Text))
-        .map((widget) => widget.data ?? '')
-        .firstWhere((text) => text.contains('Customer ETA'));
-    expect(timerText, contains('min'));
-    expect(RegExp(r'\d{2}:\d{2}').hasMatch(timerText), isFalse);
+    expect(find.textContaining('Accept or reject this request'), findsOneWidget);
+    expect(find.textContaining('Expect customer by'), findsNothing);
+    expect(find.textContaining('remaining'), findsNothing);
   });
 
   testWidgets('accepted booking opens a full-screen customer confirmation', (
@@ -1161,7 +2028,6 @@ void main() {
       serviceIds: [service.id],
     );
     final salonId = state.ownerSalon.id;
-    final barber = state.barbersForSalon(salonId).single;
     await state.signOutActiveUser();
     await state.loginCustomerWithPhone(
       name: 'Mayur',
@@ -1169,13 +2035,10 @@ void main() {
       verificationId: 'confirmation-verification',
       smsCode: '123456',
     );
-    final booking = await state.createBooking(
-      slot: TimeSlot(
-        salonId: salonId,
-        serviceId: service.id,
-        barberId: barber.id,
-        start: DateTime.now().add(const Duration(hours: 2)),
-      ),
+    final booking = await state.createInstantBooking(
+      salonId: salonId,
+      serviceId: service.id,
+      arrivalMinutes: 15,
     );
     await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
 
@@ -1239,93 +2102,26 @@ void main() {
     );
   });
 
-  test('barber email login links approved join request to account', () async {
-    final state = await _stateWithSalonService();
-    await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
-    await state.submitJoinRequest(
-      salonId: state.salons.first.id,
-      barberName: 'Aman',
-      barberPhone: '9222222222',
+  test('owner can create a barber without login details', () async {
+    final state = await _stateWithSalonService(signOut: false);
+    final serviceId = state.ownerSalon.services.first.id;
+
+    await state.addOwnerBarber(
+      name: 'Ravi',
       speciality: 'Haircut specialist',
-      experienceYears: 3,
-      resumeSummary: 'Sharp cuts.',
-      serviceIds: [state.salons.first.services.first.id],
-    );
-    final requestId = state.currentJoinRequest!.id;
-    await state.approveJoinRequest(requestId);
-
-    expect(state.currentBarber?.name, 'Aman');
-    expect(state.currentBarber?.phone, '+919222222222');
-  });
-
-  test(
-    'owner added barber can see assigned barber profile after login',
-    () async {
-      final state = await _stateWithSalonService(signOut: false);
-      final serviceId = state.ownerSalon.services.first.id;
-      await state.addOwnerBarber(
-        name: 'Ravi',
-        phone: '9333333333',
-        email: 'ravi@example.com',
-        speciality: 'Haircut specialist',
-        experienceYears: 4,
-        resumeSummary: 'Walk-in and appointment cuts.',
-        serviceIds: [serviceId],
-      );
-
-      expect(state.pendingJoinRequests, isEmpty);
-      expect(state.joinRequests.last.status, JoinRequestStatus.approved);
-
-      await state.signOutActiveUser();
-      await state.loginBarberWithEmail(name: 'Ravi', email: 'ravi@example.com');
-
-      expect(state.currentBarber?.name, 'Ravi');
-      expect(state.currentBarber?.serviceIds, contains(serviceId));
-    },
-  );
-
-  testWidgets('barber join request is blocked when no shops exist', (
-    tester,
-  ) async {
-    final state = AppState();
-    await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
-    await tester.pumpWidget(
-      AppStateProvider(
-        createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
-      ),
+      experienceYears: 4,
+      resumeSummary: '',
+      serviceIds: const [],
     );
 
-    expect(find.text('No shops available yet'), findsOneWidget);
-    expect(find.text('Send request'), findsNothing);
+    final barber = state.barbersForSalon(state.ownerSalon.id).single;
+    expect(barber.name, 'Ravi');
+    expect(barber.phone, isEmpty);
+    expect(barber.email, isEmpty);
+    expect(barber.uid, isNull);
+    expect(barber.serviceIds, contains(serviceId));
+    expect(state.joinRequests, isEmpty);
   });
-
-  testWidgets(
-    'barber services use a dropdown and request action stays visible',
-    (tester) async {
-      final state = await _stateWithSalonService();
-      await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
-      await tester.pumpWidget(
-        AppStateProvider(
-          createAppState: () => state,
-          child: const MaterialApp(home: BarberDashboardScreen()),
-        ),
-      );
-
-      expect(find.text('Send request'), findsOneWidget);
-
-      await tester.scrollUntilVisible(
-        find.text('Services you can handle'),
-        250,
-        scrollable: find.byType(Scrollable).first,
-      );
-      await tester.tap(find.text('Services you can handle'));
-      await tester.pumpAndSettle();
-
-      expect(find.byType(CheckboxListTile), findsWidgets);
-      expect(find.text('Send request'), findsOneWidget);
-    },
-  );
 
   test('adding more than three barbers never overwrites staff', () async {
     final state = await _stateWithSalonService(signOut: false);
@@ -1359,10 +2155,7 @@ void main() {
       serviceIds: [serviceId],
     );
     await state.signOutActiveUser();
-    final customer = await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'customer@example.com',
-    );
+    final customer = await _loginCustomer(state);
     final slot = state.slotsForService(state.salons.first.id, serviceId).first;
 
     final booking = await state.createBooking(slot: slot);
@@ -1400,6 +2193,17 @@ void main() {
     final slots = state.slotsForService(state.ownerSalon.id, service.id);
 
     expect(slots, isNotEmpty);
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final lastBookableDate = today.add(
+      const Duration(days: scheduledBookingHorizonDays - 1),
+    );
+    final latestSlotDate = slots
+        .map(
+          (slot) => DateTime(slot.start.year, slot.start.month, slot.start.day),
+        )
+        .reduce((a, b) => a.isAfter(b) ? a : b);
+    expect(latestSlotDate, lastBookableDate);
     for (final slot in slots) {
       final startMinutes = slot.start.hour * 60 + slot.start.minute;
       final endMinutes = startMinutes + service.durationMinutes;
@@ -1491,10 +2295,7 @@ void main() {
         serviceIds: [longService.id, shortService.id],
       );
       await state.signOutActiveUser();
-      await state.loginCustomerWithEmail(
-        name: 'Customer',
-        email: 'customer@example.com',
-      );
+      await _loginCustomer(state);
       final bookedSlot = state
           .slotsForService(state.salons.single.id, longService.id)
           .first;
@@ -1575,7 +2376,7 @@ void main() {
 
     expect(state.slotQueryCount, lessThanOrEqualTo(2));
 
-    await tester.tap(find.text('Bookings'));
+    await tester.tap(find.text('Profile'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Discover'));
     await tester.pumpAndSettle();
@@ -1639,10 +2440,7 @@ void main() {
     final barber = state.barbersForSalon(state.ownerSalon.id).single;
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'customer@example.com',
-    );
+    await _loginCustomer(state);
     final booking = await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
@@ -1662,52 +2460,6 @@ void main() {
     );
   });
 
-  testWidgets('barber has a connected earnings tab', (tester) async {
-    final state = await _stateWithSalonService(signOut: false);
-    final service = state.ownerSalon.services.single;
-    await state.addOwnerBarber(
-      name: 'Ravi',
-      phone: '9888888865',
-      email: 'ravi@example.com',
-      speciality: 'Haircut specialist',
-      experienceYears: 3,
-      resumeSummary: 'Haircut specialist.',
-      serviceIds: [service.id],
-    );
-    final barber = state.barbersForSalon(state.ownerSalon.id).single;
-    final salonId = state.ownerSalon.id;
-    await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'earnings-customer@example.com',
-    );
-    final booking = await state.createBooking(
-      slot: state.slotsForService(salonId, service.id).first,
-    );
-    await state.updateBookingStatus(booking.id, BookingStatus.completed);
-    await state.signOutActiveUser();
-    await state.loginBarberWithEmail(name: 'Ravi', email: 'ravi@example.com');
-
-    await tester.pumpWidget(
-      AppStateProvider(
-        createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
-      ),
-    );
-    await tester.pumpAndSettle();
-
-    expect(state.currentBarber?.id, barber.id);
-    expect(find.text('Appointments'), findsOneWidget);
-    expect(find.text('Earnings'), findsOneWidget);
-    await tester.tap(find.text('Earnings'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Total earnings'), findsOneWidget);
-    expect(find.text('Today'), findsOneWidget);
-    expect(find.text('This month'), findsOneWidget);
-    expect(find.text('₹${service.price}'), findsWidgets);
-  });
-
   test('started cutting marks barber occupied until completion', () async {
     final state = await _stateWithSalonService(signOut: false);
     final service = state.ownerSalon.services.single;
@@ -1722,16 +2474,18 @@ void main() {
     final barber = state.barbersForSalon(state.ownerSalon.id).single;
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'occupied@example.com',
-    );
+    await _loginCustomer(state);
     final booking = await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
 
     await state.updateBookingStatus(booking.id, BookingStatus.inProgress);
     expect(state.currentBookingForBarber(barber.id)?.id, booking.id);
+    expect(state.totalCollection(salonId), 0);
+    expect(
+      state.bookings.singleWhere((item) => item.id == booking.id).startedAt,
+      isNotNull,
+    );
 
     await state.updateBookingStatus(booking.id, BookingStatus.completed);
     expect(state.currentBookingForBarber(barber.id), isNull);
@@ -1797,16 +2551,14 @@ void main() {
       start: now.add(const Duration(hours: 1)),
       status: BookingStatus.pending,
       createdAt: now,
+      isInstant: true,
     );
 
     expect(
       state.salonBookingBucket(base, now: now),
       SalonBookingBucket.requests,
     );
-    expect(
-      state.salonBookingOutcome(base, now: now),
-      'Waiting for owner action',
-    );
+    expect(state.salonBookingOutcome(base, now: now), 'Instant request');
 
     final overdueRequest = base.copyWith(
       start: now.subtract(const Duration(minutes: 1)),
@@ -1817,8 +2569,18 @@ void main() {
     );
     expect(
       state.salonBookingOutcome(overdueRequest, now: now),
-      'Waiting for owner action',
+      'Instant request',
     );
+
+    final scheduled = base.copyWith(
+      status: BookingStatus.confirmed,
+      isInstant: false,
+    );
+    expect(
+      state.salonBookingBucket(scheduled, now: now),
+      SalonBookingBucket.upcoming,
+    );
+    expect(state.salonBookingOutcome(scheduled, now: now), 'Registered');
 
     final active = base.copyWith(
       start: now.subtract(const Duration(minutes: 10)),
@@ -1931,17 +2693,20 @@ void main() {
 
   testWidgets('logout requires explicit confirmation', (tester) async {
     final state = AppState();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'customer@example.com',
-    );
+    await _loginCustomer(state);
     await tester.pumpWidget(
       AppStateProvider(createAppState: () => state, child: const TrimtimeApp()),
     );
 
-    await tester.tap(find.byTooltip('Account menu'));
+    await tester.tap(find.text('Profile'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Log out'));
+    expect(find.byType(CustomerProfileScreen), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('customer-profile-logout')),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.byKey(const ValueKey('customer-profile-logout')));
     await tester.pumpAndSettle();
 
     expect(find.text('Log out?'), findsOneWidget);
@@ -1951,14 +2716,100 @@ void main() {
     await tester.pumpAndSettle();
     expect(state.hasActiveCustomerSession, isTrue);
 
-    await tester.tap(find.byTooltip('Account menu'));
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('customer-profile-logout')),
+    );
+    await tester.tap(find.byKey(const ValueKey('customer-profile-logout')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Log out'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Log out'));
+    await tester.tap(find.widgetWithText(FilledButton, 'Log out'));
     await tester.pumpAndSettle();
 
     expect(state.hasActiveCustomerSession, isFalse);
+  });
+
+  testWidgets('customer can edit personal and style profile details', (
+    tester,
+  ) async {
+    final state = AppState();
+    await _loginCustomer(state);
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerProfileScreen()),
+      ),
+    );
+
+    expect(find.text('Ratings from salons'), findsOneWidget);
+    expect(find.text('Feedback you shared'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('edit-customer-profile')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(CustomerProfileEditor), findsOneWidget);
+    expect(find.byKey(const ValueKey('edit-customer-name')), findsOneWidget);
+    expect(find.byKey(const ValueKey('edit-customer-phone')), findsOneWidget);
+    expect(find.byKey(const ValueKey('edit-customer-gender')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('edit-customer-birthdate')),
+      findsOneWidget,
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('edit-customer-name')),
+      'Updated Customer',
+    );
+    await tester.enterText(
+      find.byKey(const ValueKey('edit-customer-phone')),
+      '9876500001',
+    );
+    await tester.ensureVisible(find.widgetWithText(FilterChip, 'Fade'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilterChip, 'Fade'));
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('save-customer-profile')),
+      600,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.byKey(const ValueKey('save-customer-profile')));
+    await tester.pumpAndSettle();
+
+    expect(state.customerAccount?.name, 'Updated Customer');
+    expect(state.customerAccount?.contact, '+919876500001');
+    expect(state.customerAccount?.preferredStyles, contains('Fade'));
+  });
+
+  test('completed visits support feedback in both directions', () async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9898989896',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+    await state.updateBookingStatus(booking.id, BookingStatus.inProgress);
+    await state.updateBookingStatus(booking.id, BookingStatus.completed);
+    await state.submitSalonFeedback(
+      bookingId: booking.id,
+      rating: 5,
+      note: 'Clean and friendly.',
+    );
+    expect(state.customerSalonFeedback.single.rating, 5);
+
+    await state.signOutActiveUser();
+    await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
+    await state.submitCustomerRating(
+      bookingId: booking.id,
+      rating: 4,
+      note: 'Arrived on time.',
+    );
+    expect(state.customerSalonRatings.single.rating, 4);
   });
 
   test('owner ringtone session is disabled outside owner login', () async {
@@ -1970,11 +2821,10 @@ void main() {
     var preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool(preferenceKey), isTrue);
 
-    await state.selectRole(UserRole.customer);
+    await expectLater(state.selectRole(UserRole.customer), throwsStateError);
     preferences = await SharedPreferences.getInstance();
-    expect(preferences.getBool(preferenceKey), isFalse);
+    expect(preferences.getBool(preferenceKey), isTrue);
 
-    await state.selectRole(UserRole.owner);
     await state.signOutActiveUser();
     preferences = await SharedPreferences.getInstance();
     expect(preferences.getBool(preferenceKey), isFalse);
@@ -1993,10 +2843,7 @@ void main() {
     );
     final salonId = state.ownerSalon.id;
     await state.signOutActiveUser();
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'customer@example.com',
-    );
+    await _loginCustomer(state);
     final booking = await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
@@ -2006,12 +2853,10 @@ void main() {
 
     expect(find.byType(RefreshIndicator), findsOneWidget);
     expect(unreadNotificationCount(state, UserRole.customer), 1);
-    await tester.tap(find.byTooltip('Account menu'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Notifications'));
+    await tester.tap(find.byTooltip('Customer notifications'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Booking request sent'), findsOneWidget);
+    expect(find.text('Booking confirmed'), findsOneWidget);
     expect(unreadNotificationCount(state, UserRole.customer), 0);
 
     await tester.tap(find.byTooltip('Delete notification'));
@@ -2019,10 +2864,33 @@ void main() {
     expect(find.text('No notifications yet'), findsOneWidget);
     expect(notificationKeys(state, UserRole.customer), isEmpty);
 
-    await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
+    await state.cancelBooking(booking.id, reason: 'Plans changed');
     await tester.pumpAndSettle();
-    expect(find.text('Booking confirmed'), findsWidgets);
+    expect(find.text('You cancelled the booking'), findsOneWidget);
     expect(unreadNotificationCount(state, UserRole.customer), 1);
+  });
+
+  test('notification badge waits for persisted read state', () async {
+    final state = _NotificationPreferencesLoadingState();
+    await _stateWithSalonService(appState: state, signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9898989898',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircuts.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+
+    expect(notificationKeys(state, UserRole.customer), isNotEmpty);
+    expect(unreadNotificationCount(state, UserRole.customer), 0);
   });
 
   testWidgets('owner notifications show customer booking requests', (
@@ -2039,10 +2907,7 @@ void main() {
       serviceIds: [service.id],
     );
     final salonId = state.ownerSalon.id;
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'customer@example.com',
-    );
+    await _loginCustomer(state);
     await state.createBooking(
       slot: state.slotsForService(salonId, service.id).first,
     );
@@ -2062,93 +2927,315 @@ void main() {
     await tester.tap(find.text('Notifications'));
     await tester.pumpAndSettle();
 
-    expect(find.text('New booking request'), findsOneWidget);
+    expect(find.text('New scheduled booking'), findsOneWidget);
     expect(find.text('Booking request sent'), findsNothing);
     expect(unreadNotificationCount(state, UserRole.owner), 0);
-  });
 
-  test('Google login derives a name when no name is entered', () async {
-    final state = AppState();
-
-    final customer = await state.loginCustomerWithGmail(name: '', email: '');
-
-    expect(customer.name, 'Google user');
-  });
-
-  testWidgets('barber notifications show join request updates', (tester) async {
-    final state = await _stateWithSalonService();
-    await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
-    await state.submitJoinRequest(
-      salonId: state.salons.single.id,
-      barberName: 'Aman',
-      barberPhone: '9876543210',
-      barberEmail: 'aman@example.com',
-      speciality: 'Haircut specialist',
-      experienceYears: 3,
-      resumeSummary: 'Haircuts.',
-      serviceIds: [state.salons.single.services.single.id],
-    );
-    await tester.pumpWidget(
-      AppStateProvider(
-        createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
-      ),
-    );
-
-    await tester.tap(find.byTooltip('Account menu'));
+    await tester.tap(find.text('New scheduled booking'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Notifications'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Join request pending'), findsOneWidget);
+    expect(find.text('Booking desk'), findsOneWidget);
   });
 
-  testWidgets('barber notifications show assigned bookings', (tester) async {
+  testWidgets('owner instant notification opens the Requests booking bucket', (
+    tester,
+  ) async {
     final state = await _stateWithSalonService(signOut: false);
     final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      directionsUrl: state.ownerSalon.directionsUrl,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
     await state.addOwnerBarber(
-      name: 'Aman',
-      phone: '9876543210',
-      email: 'aman@example.com',
+      name: 'Ravi',
+      phone: '9898989802',
       speciality: 'Haircut specialist',
       experienceYears: 3,
-      resumeSummary: 'Haircuts.',
+      resumeSummary: 'Instant services.',
       serviceIds: [service.id],
     );
     final salonId = state.ownerSalon.id;
-    await state.loginCustomerWithEmail(
-      name: 'Customer',
-      email: 'customer@example.com',
-    );
-    final booking = await state.createBooking(
-      slot: state.slotsForService(salonId, service.id).first,
-    );
-    await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
-    await state.loginBarberWithEmail(name: 'Aman', email: 'aman@example.com');
-
-    expect(unreadNotificationCount(state, UserRole.barber), 2);
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500002');
+    await state.createInstantBooking(salonId: salonId, serviceId: service.id);
+    await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
 
     await tester.pumpWidget(
       AppStateProvider(
         createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
+        child: const MaterialApp(home: SalonDashboardScreen()),
       ),
     );
-
     await tester.tap(find.byTooltip('Account menu'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Notifications'));
     await tester.pumpAndSettle();
-
-    expect(find.text('You are booked for this time'), findsOneWidget);
-    expect(unreadNotificationCount(state, UserRole.barber), 0);
-
-    await state.updateBookingStatus(booking.id, BookingStatus.cancelled);
+    await tester.tap(find.text('New instant booking request'));
     await tester.pumpAndSettle();
-    expect(unreadNotificationCount(state, UserRole.barber), 1);
 
-    expect(find.text('Your booking was cancelled'), findsOneWidget);
+    expect(find.widgetWithText(ChoiceChip, 'Requests (1)'), findsOneWidget);
+    expect(find.text('Accept booking'), findsOneWidget);
+    expect(find.text('Reject'), findsOneWidget);
   });
+
+  test('notification navigation signals are consumed exactly once', () {
+    final state = AppState();
+    state.queueNotificationNavigation(
+      AppNotificationDestination.bookings,
+      bookingId: 'booking-1',
+    );
+
+    final navigation = state.takePendingNotificationNavigation();
+    expect(navigation?.destination, AppNotificationDestination.bookings);
+    expect(navigation?.bookingId, 'booking-1');
+    expect(state.takePendingNotificationNavigation(), isNull);
+  });
+
+  testWidgets('owner can respond to an instant request from Bookings', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      directionsUrl: state.ownerSalon.directionsUrl,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9898989801',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Instant services.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500001');
+    final booking = await state.createInstantBooking(
+      salonId: salonId,
+      serviceId: service.id,
+      arrivalMinutes: 15,
+    );
+    await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
+    state.queueNotificationNavigation(
+      AppNotificationDestination.bookings,
+      bookingId: booking.id,
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.widgetWithText(ChoiceChip, 'Requests (1)'), findsOneWidget);
+    expect(find.text('Accept booking'), findsOneWidget);
+    expect(find.text('Reject'), findsOneWidget);
+    expect(find.text('Any available barber'), findsOneWidget);
+
+    await tester.ensureVisible(find.text('Accept booking'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Accept booking'));
+    await tester.pump();
+    final accepted = state.bookings.singleWhere(
+      (item) => item.id == booking.id,
+    );
+    expect(accepted.status, BookingStatus.confirmed);
+    expect(accepted.barberId, isNotEmpty);
+    expect(find.text('Accept booking'), findsNothing);
+    expect(
+      find.byKey(const ValueKey('booking-arrival-bottom-panel-salon')),
+      findsOneWidget,
+    );
+
+    await tester.pumpAndSettle();
+    expect(find.text('Start service'), findsOneWidget);
+
+    await tester.ensureVisible(find.text('Start service'));
+    await tester.drag(find.byType(ListView).last, const Offset(0, -220));
+    await tester.pump();
+    await tester.tap(find.text('Start service'));
+    await tester.pump();
+    expect(find.text('Starting...'), findsNothing);
+    expect(find.text('Complete service'), findsOneWidget);
+    expect(state.totalCollection(salonId), 0);
+
+    await tester.tap(find.text('Complete service'));
+    await tester.pump();
+    final completed = state.bookings.singleWhere(
+      (item) => item.id == booking.id,
+    );
+    expect(completed.status, BookingStatus.completed);
+    expect(state.totalCollection(salonId), service.price);
+  });
+
+  test('customer email is rejected and Gmail saves a supplied phone', () async {
+    final state = AppState();
+
+    await expectLater(
+      state.loginCustomerWithEmail(name: 'Asha', email: 'asha@example.com'),
+      throwsStateError,
+    );
+    await expectLater(
+      state.loginCustomerWithGmail(name: 'Asha', email: 'asha@gmail.com'),
+      throwsA(isA<CustomerPhoneRequiredException>()),
+    );
+    final account = await state.completeCustomerGmailPhone(phone: '9876543299');
+    expect(account.name, 'Asha');
+    expect(account.contact, '+919876543299');
+    expect(account.provider, LoginProvider.google);
+  });
+
+  test('the same phone cannot be both customer and owner', () async {
+    final ownerFirst = AppState();
+    await ownerFirst.loginOwnerWithPhone(
+      phone: '9876543210',
+      verificationId: 'owner-verification',
+      smsCode: '123456',
+    );
+    await ownerFirst.signOutActiveUser();
+    await expectLater(
+      _loginCustomer(ownerFirst, name: 'Asha', phone: '9876543210'),
+      throwsA(
+        predicate(
+          (error) =>
+              error.toString().contains('already registered as a salon owner'),
+        ),
+      ),
+    );
+
+    final customerFirst = AppState();
+    await _loginCustomer(customerFirst, name: 'Asha', phone: '9876543211');
+    await customerFirst.signOutActiveUser();
+    await expectLater(
+      customerFirst.loginOwnerWithPhone(
+        phone: '9876543211',
+        verificationId: 'owner-verification',
+        smsCode: '123456',
+      ),
+      throwsA(
+        predicate(
+          (error) =>
+              error.toString().contains('already registered as a customer'),
+        ),
+      ),
+    );
+  });
+
+  test('an email owner does not reserve an unrelated customer phone', () async {
+    final state = AppState();
+    await state.loginOwnerWithEmail(
+      name: 'Salon Owner',
+      email: 'owner@example.com',
+    );
+    await state.signOutActiveUser();
+
+    final customer = await _loginCustomer(
+      state,
+      name: 'Asha',
+      phone: '9876543212',
+    );
+
+    expect(customer.contact, '+919876543212');
+    expect(state.hasActiveCustomerSession, isTrue);
+  });
+
+  test('an owner profile phone cannot later be used by a customer', () async {
+    final state = AppState();
+    await state.loginOwnerWithEmail(
+      name: 'Salon Owner',
+      email: 'owner@example.com',
+    );
+    await state.updateOwnerSalon(
+      name: 'Owner Salon',
+      ownerName: 'Salon Owner',
+      address: 'Main Road',
+      phone: '9876543213',
+      email: 'contact@ownersalon.com',
+      openTime: '9:00 AM',
+      closeTime: '8:00 PM',
+    );
+    expect(state.ownerSalon.phone, '+919876543213');
+    expect(state.ownerSalon.email, 'contact@ownersalon.com');
+    await state.signOutActiveUser();
+
+    await expectLater(
+      _loginCustomer(state, name: 'Asha', phone: '9876543213'),
+      throwsA(
+        predicate(
+          (error) =>
+              error.toString().contains('already registered as a salon owner'),
+        ),
+      ),
+    );
+    await expectLater(
+      state.loginOwnerWithPhone(
+        phone: '9876543213',
+        verificationId: 'owner-verification',
+        smsCode: '123456',
+      ),
+      throwsA(
+        predicate(
+          (error) => error.toString().contains('original login method'),
+        ),
+      ),
+    );
+  });
+
+  test('a phone-authenticated owner profile still requires an email', () async {
+    final state = AppState();
+    await state.loginOwnerWithPhone(
+      phone: '9876543214',
+      verificationId: 'owner-verification',
+      smsCode: '123456',
+    );
+
+    await expectLater(
+      state.updateOwnerSalon(
+        name: 'Owner Salon',
+        ownerName: 'Salon Owner',
+        address: 'Main Road',
+        phone: '9876543214',
+        openTime: '9:00 AM',
+        closeTime: '8:00 PM',
+      ),
+      throwsFormatException,
+    );
+  });
+
+  test(
+    'new customer phone login requests a name after phone verification',
+    () async {
+      final state = AppState();
+      await expectLater(
+        state.loginCustomerWithPhone(
+          name: ' ',
+          phone: '9876543210',
+          verificationId: 'test-verification',
+          smsCode: '123456',
+        ),
+        throwsA(isA<CustomerNameRequiredException>()),
+      );
+
+      final account = await state.completeCustomerPhoneRegistration(
+        name: 'Mayur',
+        phone: '9876543210',
+      );
+      expect(account.name, 'Mayur');
+      expect(state.hasActiveCustomerSession, isTrue);
+    },
+  );
 
   testWidgets('partner hub hides the public barber login path', (tester) async {
     final state = AppState();
@@ -2163,6 +3250,8 @@ void main() {
     expect(find.text('Barber'), findsNothing);
     expect(find.text('Open barber tools'), findsNothing);
     expect(find.text('Barber login'), findsNothing);
+    expect(find.text('Partner space'), findsNothing);
+    expect(find.text('Choose your workspace'), findsNothing);
   });
 
   testWidgets('barber screen points staff to owner-managed setup', (
@@ -2194,6 +3283,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    expect(find.byKey(const ValueKey('exit-salon-login')), findsOneWidget);
     expect(find.text('Phone number'), findsOneWidget);
     expect(find.text('Continue'), findsOneWidget);
 
@@ -2207,7 +3297,57 @@ void main() {
     expect(find.text('Owner name'), findsNothing);
   });
 
-  testWidgets('customer authentication only offers mobile OTP', (tester) async {
+  testWidgets('new salon owner must register a shop before overview', (
+    tester,
+  ) async {
+    final state = AppState();
+    await state.loginOwnerWithEmail(
+      name: 'New owner',
+      email: 'new-owner@example.com',
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SalonProfileSetupScreen), findsOneWidget);
+    expect(find.text('Shop registration'), findsOneWidget);
+    expect(find.text('Overview'), findsNothing);
+  });
+
+  testWidgets('new salon owner can leave onboarding for customer home', (
+    tester,
+  ) async {
+    final state = AppState();
+    await state.loginOwnerWithEmail(
+      name: 'Accidental owner',
+      email: 'accidental-owner@example.com',
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('exit-salon-onboarding')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('exit-salon-onboarding')));
+    await tester.pumpAndSettle();
+
+    expect(state.ownerAccount, isNull);
+    expect(state.activeRole, isNull);
+    expect(find.byType(CustomerHomeScreen), findsOneWidget);
+  });
+
+  testWidgets('customer authentication offers phone OTP and Gmail', (
+    tester,
+  ) async {
     await tester.pumpWidget(
       const MaterialApp(
         home: Scaffold(body: AuthLoginPanel(role: UserRole.customer)),
@@ -2215,20 +3355,144 @@ void main() {
     );
 
     expect(find.byKey(const ValueKey('phone-login-field')), findsOneWidget);
-    expect(find.byKey(const ValueKey('customer-name-field')), findsOneWidget);
+    expect(find.byKey(const ValueKey('customer-name-field')), findsNothing);
     expect(find.text('Phone number'), findsOneWidget);
     expect(find.text('Email'), findsNothing);
     expect(find.byKey(const ValueKey('email-login-field')), findsNothing);
-    expect(find.text('Continue with Gmail'), findsNothing);
+    expect(find.text('Continue with Gmail'), findsOneWidget);
 
-    final nameField = tester.widget<TextField>(
-      find.byKey(const ValueKey('customer-name-field')),
-    );
     final phoneField = tester.widget<TextField>(
       find.byKey(const ValueKey('phone-login-field')),
     );
-    expect(nameField.autofillHints, contains(AutofillHints.name));
     expect(phoneField.autofillHints, contains(AutofillHints.telephoneNumber));
+    expect(
+      phoneField.autofillHints,
+      contains(AutofillHints.telephoneNumberDevice),
+    );
+    expect(phoneField.decoration?.prefixText, '+91 ');
+    expect(
+      find.byKey(const ValueKey('suggest-phone-number-button')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('Android automatic OTP completion advances without typing code', (
+    tester,
+  ) async {
+    final state = _AutoVerifiedPhoneAppState();
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(
+          home: Scaffold(body: AuthLoginPanel(role: UserRole.customer)),
+        ),
+      ),
+    );
+
+    await tester.enterText(
+      find.byKey(const ValueKey('phone-login-field')),
+      '9876543210',
+    );
+    await tester.tap(find.text('Continue'));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('phone-otp-field')), findsOneWidget);
+
+    state.completeOtpAutomatically('+919876543210');
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('phone-otp-field')), findsNothing);
+    expect(find.byKey(const ValueKey('customer-name-field')), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('customer Gmail asks for phone without sending an OTP', (
+    tester,
+  ) async {
+    final state = AppState();
+    var loginCompleted = false;
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: Scaffold(
+            body: AuthLoginPanel(
+              role: UserRole.customer,
+              onLoggedIn: () => loginCompleted = true,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Continue with Gmail'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Save phone and continue'), findsOneWidget);
+    expect(find.byKey(const ValueKey('phone-otp-field')), findsNothing);
+    expect(
+      find.text('Add your mobile number. No phone OTP is required.'),
+      findsOneWidget,
+    );
+
+    await tester.enterText(
+      find.byKey(const ValueKey('phone-login-field')),
+      '9876543298',
+    );
+    await tester.tap(find.text('Save phone and continue'));
+    await tester.pumpAndSettle();
+
+    expect(loginCompleted, isTrue);
+    expect(state.hasActiveCustomerSession, isTrue);
+    expect(state.customerAccount?.contact, '+919876543298');
+    expect(find.byKey(const ValueKey('phone-otp-field')), findsNothing);
+  });
+
+  testWidgets('customer and owner login enforce ten Indian mobile digits', (
+    tester,
+  ) async {
+    for (final role in [UserRole.customer, UserRole.owner]) {
+      await tester.pumpWidget(
+        AppStateProvider(
+          createAppState: AppState.new,
+          child: MaterialApp(
+            home: Scaffold(body: AuthLoginPanel(role: role)),
+          ),
+        ),
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('phone-login-field')),
+        '98765432109',
+      );
+      await tester.pump();
+      expect(
+        tester
+            .widget<TextField>(find.byKey(const ValueKey('phone-login-field')))
+            .controller
+            ?.text,
+        '9876543210',
+      );
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(
+        find.text('Indian mobile numbers contain exactly 10 digits.'),
+        findsWidgets,
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const ValueKey('phone-login-field')),
+        '987654321',
+      );
+      await tester.tap(find.text('Continue'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(
+        find.text(
+          'Enter one more digit. Mobile number must contain 10 digits.',
+        ),
+        findsWidgets,
+      );
+      await tester.pumpWidget(const SizedBox());
+    }
   });
 
   testWidgets('customer OTP completion invokes the login callback', (
@@ -2251,10 +3515,6 @@ void main() {
     );
 
     await tester.enterText(
-      find.byKey(const ValueKey('customer-name-field')),
-      'Mayur',
-    );
-    await tester.enterText(
       find.byKey(const ValueKey('phone-login-field')),
       '9876543210',
     );
@@ -2265,6 +3525,18 @@ void main() {
       '123456',
     );
     await tester.tap(find.text('Verify and sign in'));
+    await tester.pump();
+
+    expect(loginCompleted, isFalse);
+    expect(find.byKey(const ValueKey('phone-otp-field')), findsNothing);
+    expect(find.byKey(const ValueKey('customer-name-field')), findsOneWidget);
+    expect(find.text('Create customer account'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const ValueKey('customer-name-field')),
+      'Mayur',
+    );
+    await tester.tap(find.text('Create customer account'));
     await tester.pump();
 
     expect(loginCompleted, isTrue);
@@ -2284,10 +3556,6 @@ void main() {
       ),
     );
 
-    await tester.enterText(
-      find.byKey(const ValueKey('customer-name-field')),
-      'Mayur',
-    );
     await tester.enterText(
       find.byKey(const ValueKey('phone-login-field')),
       '9876543210',
@@ -2330,6 +3598,52 @@ void main() {
           .readOnly,
       isFalse,
     );
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('registered customer signs in with OTP without seeing name', (
+    tester,
+  ) async {
+    final state = AppState();
+    await state.loginCustomerWithPhone(
+      name: 'Existing customer',
+      phone: '9876543219',
+      verificationId: 'first-verification',
+      smsCode: '123456',
+    );
+    await state.signOutActiveUser();
+    var loginCompleted = false;
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: Scaffold(
+            body: AuthLoginPanel(
+              role: UserRole.customer,
+              onLoggedIn: () => loginCompleted = true,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.enterText(
+      find.byKey(const ValueKey('phone-login-field')),
+      '9876543219',
+    );
+    await tester.tap(find.text('Continue'));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const ValueKey('phone-otp-field')),
+      '123456',
+    );
+    await tester.tap(find.text('Verify and sign in'));
+    await tester.pump();
+
+    expect(loginCompleted, isTrue);
+    expect(find.byKey(const ValueKey('customer-name-field')), findsNothing);
+    expect(state.customerAccount?.name, 'Existing customer');
 
     await tester.pumpWidget(const SizedBox());
   });
@@ -2406,72 +3720,6 @@ void main() {
     expect(state.ownerSalon.phone, isEmpty);
   });
 
-  testWidgets('barber Google account carries Gmail into join form', (
-    tester,
-  ) async {
-    final state = await _stateWithSalonService();
-    await state.loginBarberWithGmail(
-      name: 'Aman Barber',
-      email: 'aman@gmail.com',
-    );
-
-    await tester.pumpWidget(
-      AppStateProvider(
-        createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
-      ),
-    );
-    await tester.pumpAndSettle();
-
-    expect(state.barberAccount?.contact, 'aman@gmail.com');
-    expect(find.text('aman@gmail.com'), findsOneWidget);
-    final emailField = find.widgetWithText(TextFormField, 'Email address');
-    expect(emailField, findsOneWidget);
-    final editableEmail = tester.widget<EditableText>(
-      find.descendant(of: emailField, matching: find.byType(EditableText)),
-    );
-    expect(editableEmail.readOnly, isTrue);
-  });
-
-  testWidgets('barber can withdraw a pending salon request', (tester) async {
-    final state = await _stateWithSalonService();
-    await state.loginBarberWithEmail(
-      name: 'Aman',
-      email: 'aman@example.com',
-      phone: '9876543210',
-    );
-    await state.submitJoinRequest(
-      salonId: state.salons.single.id,
-      barberName: 'Aman',
-      barberPhone: '9876543210',
-      barberEmail: 'aman@example.com',
-      speciality: 'Haircut specialist',
-      experienceYears: 3,
-      resumeSummary: 'Haircuts.',
-      serviceIds: [state.salons.single.services.single.id],
-    );
-
-    await tester.pumpWidget(
-      AppStateProvider(
-        createAppState: () => state,
-        child: const MaterialApp(home: BarberDashboardScreen()),
-      ),
-    );
-    expect(find.text('Withdraw request'), findsOneWidget);
-
-    await tester.tap(find.text('Withdraw request'));
-    await tester.pumpAndSettle();
-    expect(find.text('Withdraw request?'), findsOneWidget);
-
-    await tester.tap(find.text('Yes, withdraw request'));
-    await tester.pumpAndSettle();
-
-    expect(state.currentJoinRequest?.status, JoinRequestStatus.withdrawn);
-    expect(state.pendingJoinRequests, isEmpty);
-    expect(find.text('Previous request withdrawn'), findsOneWidget);
-    expect(find.text('Send request'), findsOneWidget);
-  });
-
   test('haircut and waxing assets map to the correct supplied artwork', () {
     expect(
       serviceIconAssetForCategory('Haircut & Styling'),
@@ -2490,7 +3738,6 @@ void main() {
       await state.addOwnerBarber(
         name: 'Aman',
         phone: '9876543210',
-        email: 'aman@example.com',
         speciality: 'Hair',
         experienceYears: 3,
         resumeSummary: 'Experienced barber.',
@@ -2518,8 +3765,24 @@ void main() {
   );
 }
 
-Future<AppState> _stateWithSalonService({bool signOut = true}) async {
-  final state = AppState();
+Future<UserAccount> _loginCustomer(
+  AppState state, {
+  String name = 'Customer',
+  String phone = '9876500000',
+}) {
+  return state.loginCustomerWithPhone(
+    name: name,
+    phone: phone,
+    verificationId: 'test-verification',
+    smsCode: '123456',
+  );
+}
+
+Future<AppState> _stateWithSalonService({
+  bool signOut = true,
+  AppState? appState,
+}) async {
+  final state = appState ?? AppState();
   await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
   await state.updateOwnerSalon(
     name: 'Pritze Cuts',
@@ -2559,6 +3822,55 @@ class _CountingAppState extends AppState {
     slotQueryCount++;
     return super.slotsForService(salonId, serviceId, barberId: barberId);
   }
+}
+
+class _DelayedBookingStatusAppState extends AppState {
+  final Completer<void> _statusWrite = Completer<void>();
+
+  void completeStatusWrite() {
+    if (!_statusWrite.isCompleted) {
+      _statusWrite.complete();
+    }
+  }
+
+  @override
+  Future<void> updateBookingStatus(
+    String bookingId,
+    BookingStatus status, {
+    String? cancellationReason,
+    String? cancelledBy,
+  }) async {
+    await _statusWrite.future;
+    await super.updateBookingStatus(
+      bookingId,
+      status,
+      cancellationReason: cancellationReason,
+      cancelledBy: cancelledBy,
+    );
+  }
+}
+
+class _AutoVerifiedPhoneAppState extends AppState {
+  final StreamController<String> _autoVerification =
+      StreamController<String>.broadcast();
+
+  @override
+  Stream<String> get autoVerifiedPhoneNumbers => _autoVerification.stream;
+
+  void completeOtpAutomatically(String phone) {
+    _autoVerification.add(phone);
+  }
+
+  @override
+  void dispose() {
+    unawaited(_autoVerification.close());
+    super.dispose();
+  }
+}
+
+class _NotificationPreferencesLoadingState extends AppState {
+  @override
+  bool notificationPreferencesReady(UserRole role) => false;
 }
 
 class _RestoringAppState extends AppState {

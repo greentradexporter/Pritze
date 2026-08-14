@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 import '../../models/app_models.dart';
@@ -8,20 +7,26 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/auth_login_panel.dart';
+import '../../widgets/booking_status_timeline.dart';
 import '../../widgets/salon_logo.dart';
-import '../../widgets/status_chip.dart';
 import 'my_bookings_screen.dart';
 
 class SalonBookingScreen extends StatefulWidget {
   final String salonId;
   final String serviceId;
   final String? initialBarberId;
+  final String? rescheduleBookingId;
+  final bool instantOnly;
+  final List<String> initialInstantServiceIds;
 
   const SalonBookingScreen({
     super.key,
     required this.salonId,
     required this.serviceId,
     this.initialBarberId,
+    this.rescheduleBookingId,
+    this.instantOnly = false,
+    this.initialInstantServiceIds = const [],
   });
 
   @override
@@ -45,9 +50,42 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final salon = appState.getSalon(widget.salonId);
-    final service = appState.getService(widget.salonId, widget.serviceId);
+    final isRescheduling = widget.rescheduleBookingId != null;
+    final isInstantOnly = widget.instantOnly && !isRescheduling;
+    final requestedInstantIds = <String>{
+      ...widget.initialInstantServiceIds,
+      if (widget.serviceId.trim().isNotEmpty) widget.serviceId,
+    }.toList();
+    final instantServices = requestedInstantIds
+        .map((id) => appState.getService(widget.salonId, id))
+        .whereType<SalonService>()
+        .toList();
+    final primaryService = appState.getService(
+      widget.salonId,
+      widget.serviceId,
+    );
+    final service = isInstantOnly && instantServices.isNotEmpty
+        ? SalonService(
+            id: instantServices.first.id,
+            name: instantServices.map((item) => item.name).join(', '),
+            category: 'Instant services',
+            price: instantServices.fold<int>(
+              0,
+              (total, item) => total + item.price,
+            ),
+            durationMinutes: instantServices.fold<int>(
+              0,
+              (total, item) => total + item.durationMinutes,
+            ),
+          )
+        : primaryService;
 
-    if (salon == null || service == null || !service.isAvailable) {
+    if (salon == null ||
+        service == null ||
+        (!isInstantOnly && !service.isAvailable) ||
+        (isInstantOnly &&
+            (instantServices.length != requestedInstantIds.length ||
+                instantServices.any((item) => !item.isAvailable)))) {
       return Scaffold(
         appBar: AppBar(title: const Text('Book')),
         body: const EmptyState(
@@ -58,22 +96,27 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
       );
     }
 
-    final eligibleBarbers = appState.barbersForService(
-      widget.salonId,
-      widget.serviceId,
-    );
+    final eligibleBarbers = isInstantOnly
+        ? appState.barbersForServices(widget.salonId, requestedInstantIds)
+        : appState.barbersForService(widget.salonId, widget.serviceId);
     final canRequestInstant =
-        appState.isInstantBookingAvailable(
+        appState.isInstantMultiServiceBookingAvailable(
           salon.id,
-          serviceId: widget.serviceId,
+          requestedInstantIds,
           arrivalMinutes: _instantArrivalMinutes,
         ) &&
         eligibleBarbers.isNotEmpty;
     final activeCustomerBooking = appState.activeCustomerBooking;
+    final blockingBooking =
+        activeCustomerBooking != null &&
+        activeCustomerBooking.id != widget.rescheduleBookingId;
     final selectedBarberId =
         eligibleBarbers.any((barber) => barber.id == _selectedBarberId)
         ? _selectedBarberId
         : null;
+    final selectedBarber = eligibleBarbers
+        .where((barber) => barber.id == selectedBarberId)
+        .firstOrNull;
     final slots = appState.slotsForService(
       widget.salonId,
       widget.serviceId,
@@ -82,12 +125,17 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     final selectedSlot = slots
         .where((slot) => slot.key == _selectedSlotKey)
         .firstOrNull;
-    final isAndroid = defaultTargetPlatform == TargetPlatform.android;
     const accent = AppColors.primary;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Book slot'),
+        title: Text(
+          isRescheduling
+              ? 'Reschedule'
+              : isInstantOnly
+              ? 'Instant booking'
+              : 'Book slot',
+        ),
         actions: [
           Padding(
             padding: const EdgeInsets.only(right: 12),
@@ -100,36 +148,41 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
           ),
         ],
       ),
-      bottomNavigationBar: SafeArea(
-        minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
-        child: FilledButton.icon(
-          onPressed:
-              selectedSlot == null ||
-                  _isBooking ||
-                  activeCustomerBooking != null
-              ? null
-              : () => _startBookingLogin(context, selectedSlot),
-          icon: _isBooking
-              ? const SizedBox(
-                  height: 18,
-                  width: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.check_circle),
-          label: Text(
-            _isBooking
-                ? 'Booking...'
-                : activeCustomerBooking != null
-                ? 'Cancel current booking first'
-                : isAndroid
-                ? 'Book for ₹0'
-                : 'Book this slot',
-          ),
-          style: FilledButton.styleFrom(
-            backgroundColor: accent,
-            padding: const EdgeInsets.symmetric(vertical: 16),
-          ),
-        ),
+      bottomNavigationBar: CustomerActiveBookingFooter(
+        onOpenBooking: () => Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const MyBookingsScreen())),
+        action: isInstantOnly
+            ? null
+            : SafeArea(
+                minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
+                child: FilledButton.icon(
+                  onPressed:
+                      selectedSlot == null || _isBooking || blockingBooking
+                      ? null
+                      : () => _startBookingLogin(context, selectedSlot),
+                  icon: _isBooking
+                      ? const SizedBox(
+                          height: 18,
+                          width: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.check_circle),
+                  label: Text(
+                    _isBooking
+                        ? 'Booking...'
+                        : blockingBooking
+                        ? 'Cancel current booking first'
+                        : isRescheduling
+                        ? 'Confirm new time'
+                        : 'Book for ₹0',
+                  ),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: accent,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                ),
+              ),
       ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
@@ -139,74 +192,125 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
             service: service,
             barberCount: eligibleBarbers.length,
             accent: accent,
-            showBookingFee: !isAndroid,
+            showBookingFee: false,
           ),
           const SizedBox(height: 14),
-          _InstantBookingCard(
-            enabled: canRequestInstant,
-            isLoading: _isInstantBooking,
-            selectedArrivalMinutes: _instantArrivalMinutes,
-            activeBooking: activeCustomerBooking,
-            onArrivalMinutesChanged: (minutes) {
-              setState(() => _instantArrivalMinutes = minutes);
-            },
-            onRequest: () => _startInstantBookingLogin(context),
-          ),
-          const SizedBox(height: 24),
-          const SectionHeader(title: 'Choose barber'),
-          const SizedBox(height: 10),
-          _BarberChoiceList(
-            barbers: eligibleBarbers,
-            selectedBarberId: selectedBarberId,
-            accent: accent,
-            onSelected: (barberId) {
-              setState(() {
-                _selectedBarberId = barberId;
-                _selectedSlotKey = null;
-              });
-            },
-          ),
-          const SizedBox(height: 22),
-          const SectionHeader(title: 'Available slots'),
-          const SizedBox(height: 10),
-          if (slots.isEmpty)
-            EmptyState(
-              icon: Icons.event_busy,
-              title: 'No slots open',
-              message: selectedBarberId == null
-                  ? 'Try another service or check back later.'
-                  : 'Try Any available or pick another barber.',
-            )
-          else
-            _SlotGrid(
-              slots: slots,
-              selectedSlotKey: _selectedSlotKey,
-              accent: accent,
-              onSelected: (slot) {
-                setState(() {
-                  _selectedSlotKey = slot.key;
-                });
+          if (isInstantOnly) ...[
+            _InstantBookingCard(
+              enabled: canRequestInstant,
+              isLoading: _isInstantBooking,
+              selectedArrivalMinutes: _instantArrivalMinutes,
+              activeBooking: activeCustomerBooking,
+              onArrivalMinutesChanged: (minutes) {
+                setState(() => _instantArrivalMinutes = minutes);
               },
+              onRequest: () => _startInstantBookingLogin(context),
             ),
-          const SizedBox(height: 12),
-          GlassCard(
-            color: accent.withAlpha(12),
-            child: Row(
-              children: [
-                SoftIconBox(icon: Icons.lock_outline, color: accent, size: 42),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'No booking fee today. The salon receives your name with the request.',
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      color: AppColors.ink,
-                      fontWeight: FontWeight.w500,
+            const SizedBox(height: 14),
+            GlassCard(
+              color: accent.withAlpha(12),
+              child: Row(
+                children: [
+                  SoftIconBox(
+                    icon: Icons.people_alt_outlined,
+                    color: accent,
+                    size: 42,
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'No barber selection is needed. The salon will assign any available barber after accepting your request.',
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
+          ] else ...[
+            if (selectedBarber == null) ...[
+              const SectionHeader(title: 'Choose barber'),
+              const SizedBox(height: 10),
+              _BarberChoiceList(
+                barbers: eligibleBarbers,
+                selectedBarberId: selectedBarberId,
+                accent: accent,
+                onSelected: (barberId) {
+                  setState(() {
+                    _selectedBarberId = barberId;
+                    _selectedSlotKey = null;
+                  });
+                },
+              ),
+              const SizedBox(height: 22),
+            ] else ...[
+              GlassCard(
+                color: accent.withAlpha(12),
+                child: Row(
+                  children: [
+                    SoftIconBox(
+                      icon: Icons.badge_outlined,
+                      color: accent,
+                      size: 42,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Booking with ${selectedBarber.name}',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 22),
+            ],
+            const SectionHeader(title: 'Available slots'),
+            const SizedBox(height: 10),
+            if (slots.isEmpty)
+              EmptyState(
+                icon: Icons.event_busy,
+                title: 'No slots open',
+                message: selectedBarberId == null
+                    ? 'Try another service or check back later.'
+                    : 'Try another barber or check back later.',
+              )
+            else
+              _SlotGrid(
+                slots: slots,
+                selectedSlotKey: _selectedSlotKey,
+                accent: accent,
+                onDateChanged: () {
+                  setState(() => _selectedSlotKey = null);
+                },
+                onSelected: (slot) {
+                  setState(() {
+                    _selectedSlotKey = slot.key;
+                  });
+                },
+              ),
+            const SizedBox(height: 12),
+            GlassCard(
+              color: accent.withAlpha(12),
+              child: Row(
+                children: [
+                  SoftIconBox(
+                    icon: Icons.lock_outline,
+                    color: accent,
+                    size: 42,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'No booking fee today. The salon receives your appointment and contact details.',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: AppColors.ink,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           const SizedBox(height: 74),
         ],
       ),
@@ -237,7 +341,12 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     final appState = AppStateScope.read(context);
     late final Booking booking;
     try {
-      booking = await appState.createBooking(slot: slot);
+      booking = widget.rescheduleBookingId == null
+          ? await appState.createBooking(slot: slot)
+          : await appState.rescheduleBooking(
+              widget.rescheduleBookingId!,
+              slot: slot,
+            );
     } catch (error) {
       if (!context.mounted) {
         return;
@@ -263,13 +372,24 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
       context: context,
       builder: (dialogContext) {
         return _BookingSuccessDialog(
+          title: widget.rescheduleBookingId == null
+              ? 'Booking confirmed'
+              : 'Booking rescheduled',
+          message: widget.rescheduleBookingId == null
+              ? 'Your appointment is registered with the salon.'
+              : 'Your new appointment time is registered with the salon.',
           salonName: salon?.name ?? 'Salon',
           serviceName: booking.resolvedServiceName(service),
           appointmentTime:
               '${appState.formatDate(booking.start)}, '
               '${appState.formatTime(booking.start)}',
           barberName: barber?.name ?? 'Assigned barber',
-          onDone: () => Navigator.pop(dialogContext),
+          onDone: () {
+            Navigator.pop(dialogContext);
+            if (widget.rescheduleBookingId != null && context.mounted) {
+              Navigator.pop(context);
+            }
+          },
           onMyBookings: () {
             Navigator.pop(dialogContext);
             Navigator.of(context).pushReplacement(
@@ -307,7 +427,9 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     try {
       booking = await appState.createInstantBooking(
         salonId: widget.salonId,
-        serviceId: widget.serviceId,
+        serviceIds: widget.initialInstantServiceIds.isEmpty
+            ? [widget.serviceId]
+            : widget.initialInstantServiceIds,
         arrivalMinutes: _instantArrivalMinutes,
       );
     } catch (error) {
@@ -339,10 +461,11 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
         return _BookingSuccessDialog(
           title: 'Instant request sent',
           message:
-              'The salon has your request. Your ${booking.customerArrivalMinutes}-minute arrival timer is already running.',
+              'The salon has your request. Your reach-by time will be set when the salon accepts it.',
           salonName: salon?.name ?? 'Salon',
           serviceName: booking.resolvedServiceName(service),
-          appointmentTime: 'Arrive by ${appState.formatTime(booking.start)}',
+          appointmentTime:
+              '${booking.customerArrivalMinutes} min after salon acceptance',
           barberName: barber?.name ?? 'Any available barber',
           onDone: () => Navigator.pop(dialogContext),
           onMyBookings: () {
@@ -371,12 +494,11 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   }
 
   Future<bool?> _showCustomerLoginSheet(BuildContext context) async {
-    final isAndroid = defaultTargetPlatform == TargetPlatform.android;
     return showModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
-      backgroundColor: isAndroid ? Colors.transparent : null,
-      barrierColor: isAndroid ? Colors.black.withAlpha(118) : null,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withAlpha(118),
       builder: (sheetContext) {
         void finishLogin() {
           if (sheetContext.mounted) {
@@ -384,63 +506,22 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
           }
         }
 
-        if (isAndroid) {
-          return _AndroidBookingLoginSheet(onLoggedIn: finishLogin);
-        }
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 18,
-            right: 18,
-            top: 18,
-            bottom: MediaQuery.of(context).viewInsets.bottom + 18,
-          ),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Container(
-                  width: 42,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 18),
-                  decoration: BoxDecoration(
-                    color: AppColors.line,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-                Text(
-                  'Sign in',
-                  style: Theme.of(context).textTheme.headlineMedium,
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  'Use your mobile number and OTP to finish booking.',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                const SizedBox(height: 16),
-                AuthLoginPanel(
-                  role: UserRole.customer,
-                  onLoggedIn: finishLogin,
-                ),
-              ],
-            ),
-          ),
-        );
+        return _BookingLoginSheet(onLoggedIn: finishLogin);
       },
     );
   }
 }
 
-class _AndroidBookingLoginSheet extends StatelessWidget {
+class _BookingLoginSheet extends StatelessWidget {
   final VoidCallback onLoggedIn;
 
-  const _AndroidBookingLoginSheet({required this.onLoggedIn});
+  const _BookingLoginSheet({required this.onLoggedIn});
 
   @override
   Widget build(BuildContext context) {
     final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
     return Container(
-      key: const ValueKey('android-booking-login-sheet'),
+      key: const ValueKey('booking-login-sheet'),
       decoration: const BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
@@ -502,7 +583,7 @@ class _AndroidBookingLoginSheet extends StatelessWidget {
                         ),
                         const SizedBox(height: 5),
                         Text(
-                          'Sign in securely to send your appointment request.',
+                          'Sign in securely to finish your appointment.',
                           style: Theme.of(context).textTheme.bodyMedium,
                         ),
                       ],
@@ -594,8 +675,8 @@ class _BookingSuccessDialog extends StatelessWidget {
   final VoidCallback onMyBookings;
 
   const _BookingSuccessDialog({
-    this.title = 'Booking request sent',
-    this.message = 'The salon will confirm your appointment soon.',
+    this.title = 'Booking confirmed',
+    this.message = 'Your appointment is registered with the salon.',
     required this.salonName,
     required this.serviceName,
     required this.appointmentTime,
@@ -604,12 +685,12 @@ class _BookingSuccessDialog extends StatelessWidget {
     required this.onMyBookings,
   });
 
-  Widget _buildAndroidDialog(BuildContext context) {
+  Widget _buildDialog(BuildContext context) {
     final waitingTitle = title == 'Instant request sent'
         ? 'Waiting for the salon to accept'
-        : 'Awaiting salon confirmation';
+        : 'Appointment registered';
     return Dialog(
-      key: const ValueKey('android-booking-success-dialog'),
+      key: const ValueKey('booking-success-dialog'),
       insetPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 24),
       backgroundColor: Colors.transparent,
       child: ConstrainedBox(
@@ -710,25 +791,25 @@ class _BookingSuccessDialog extends StatelessWidget {
                           ),
                           child: Column(
                             children: [
-                              _AndroidSuccessDetailRow(
+                              _BookingSuccessDetailRow(
                                 icon: Icons.storefront_outlined,
                                 label: 'Salon',
                                 value: salonName,
                               ),
                               const Divider(indent: 58),
-                              _AndroidSuccessDetailRow(
+                              _BookingSuccessDetailRow(
                                 icon: Icons.spa_outlined,
                                 label: 'Service',
                                 value: serviceName,
                               ),
                               const Divider(indent: 58),
-                              _AndroidSuccessDetailRow(
+                              _BookingSuccessDetailRow(
                                 icon: Icons.schedule_outlined,
                                 label: 'Date & time',
                                 value: appointmentTime,
                               ),
                               const Divider(indent: 58),
-                              _AndroidSuccessDetailRow(
+                              _BookingSuccessDetailRow(
                                 icon: Icons.badge_outlined,
                                 label: 'Professional',
                                 value: barberName,
@@ -830,150 +911,15 @@ class _BookingSuccessDialog extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      return _buildAndroidDialog(context);
-    }
-    return Dialog(
-      insetPadding: const EdgeInsets.symmetric(horizontal: 22, vertical: 24),
-      backgroundColor: Colors.transparent,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(20, 22, 20, 18),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: AppColors.line),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withAlpha(24),
-              blurRadius: 28,
-              offset: const Offset(0, 14),
-            ),
-          ],
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Center(
-              child: Container(
-                width: 70,
-                height: 70,
-                decoration: BoxDecoration(
-                  color: AppColors.success.withAlpha(14),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: AppColors.success.withAlpha(38)),
-                ),
-                child: const Icon(
-                  Icons.check_rounded,
-                  color: AppColors.success,
-                  size: 38,
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              title,
-              textAlign: TextAlign.center,
-              style: Theme.of(
-                context,
-              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: AppColors.muted,
-                height: 1.35,
-              ),
-            ),
-            const SizedBox(height: 18),
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: AppColors.champagne.withAlpha(58),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: AppColors.line),
-              ),
-              child: Column(
-                children: [
-                  _SuccessDetailRow(
-                    icon: Icons.storefront_outlined,
-                    label: salonName,
-                    isStrong: true,
-                  ),
-                  _SuccessDetailRow(
-                    icon: Icons.spa_outlined,
-                    label: serviceName,
-                  ),
-                  _SuccessDetailRow(
-                    icon: Icons.schedule,
-                    label: appointmentTime,
-                  ),
-                  _SuccessDetailRow(
-                    icon: Icons.badge_outlined,
-                    label: barberName,
-                  ),
-                  const SizedBox(height: 8),
-                  const Align(
-                    alignment: Alignment.centerLeft,
-                    child: StatusChip(status: BookingStatus.pending),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              height: 52,
-              child: FilledButton(
-                onPressed: onDone,
-                style: FilledButton.styleFrom(
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  textStyle: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                child: const Text('Done'),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Center(
-              child: TextButton(
-                onPressed: onMyBookings,
-                style: TextButton.styleFrom(
-                  foregroundColor: AppColors.primaryDark,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
-                  ),
-                  textStyle: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    decoration: TextDecoration.underline,
-                    decorationStyle: TextDecorationStyle.dotted,
-                    decorationThickness: 2,
-                  ),
-                ),
-                child: const Text('My bookings'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => _buildDialog(context);
 }
 
-class _AndroidSuccessDetailRow extends StatelessWidget {
+class _BookingSuccessDetailRow extends StatelessWidget {
   final IconData icon;
   final String label;
   final String value;
 
-  const _AndroidSuccessDetailRow({
+  const _BookingSuccessDetailRow({
     required this.icon,
     required this.label,
     required this.value,
@@ -1018,42 +964,6 @@ class _AndroidSuccessDetailRow extends StatelessWidget {
                   ),
                 ),
               ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _SuccessDetailRow extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final bool isStrong;
-
-  const _SuccessDetailRow({
-    required this.icon,
-    required this.label,
-    this.isStrong = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, color: AppColors.primary, size: 18),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              label,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: AppColors.ink,
-                fontWeight: isStrong ? FontWeight.w600 : FontWeight.w500,
-                height: 1.25,
-              ),
             ),
           ),
         ],
@@ -1229,7 +1139,7 @@ class _InstantBookingCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Choose when you can reach the salon. The timer starts as soon as the request is sent.',
+                  'Choose how soon you can reach after the salon accepts. The displayed remaining time refreshes every 3 minutes, with no continuous countdown.',
                   style: Theme.of(
                     context,
                   ).textTheme.bodyMedium?.copyWith(color: AppColors.ink),
@@ -1446,42 +1356,103 @@ class _BarberChoiceCard extends StatelessWidget {
   }
 }
 
-class _SlotGrid extends StatelessWidget {
+class _SlotGrid extends StatefulWidget {
   final List<TimeSlot> slots;
   final String? selectedSlotKey;
   final Color accent;
+  final VoidCallback onDateChanged;
   final ValueChanged<TimeSlot> onSelected;
 
   const _SlotGrid({
     required this.slots,
     required this.selectedSlotKey,
     required this.accent,
+    required this.onDateChanged,
     required this.onSelected,
   });
 
   @override
+  State<_SlotGrid> createState() => _SlotGridState();
+}
+
+class _SlotGridState extends State<_SlotGrid> {
+  late DateTime _selectedDate = _initialSelectedDate();
+
+  @override
+  void didUpdateWidget(covariant _SlotGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final selectedSlot = _selectedSlot(widget.slots, widget.selectedSlotKey);
+    if (selectedSlot != null) {
+      _selectedDate = _dateOnly(selectedSlot.start);
+      return;
+    }
+    if (!_bookingDates().contains(_selectedDate)) {
+      _selectedDate = _initialSelectedDate();
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final grouped = <String, List<TimeSlot>>{};
-    for (final slot in slots) {
-      grouped.putIfAbsent(appState.formatDate(slot.start), () => []).add(slot);
-    }
+    final dates = _bookingDates();
+    final slotsForDate = widget.slots
+        .where((slot) => _dateOnly(slot.start) == _selectedDate)
+        .toList();
 
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        for (final entry in grouped.entries) ...[
-          Row(
-            children: [
-              Text(entry.key, style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(width: 8),
-              Expanded(child: Divider(color: Colors.grey.shade300)),
-            ],
+        SizedBox(
+          key: const ValueKey('booking-date-selector'),
+          height: 52,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: dates.length,
+            separatorBuilder: (_, _) => const SizedBox(width: 8),
+            itemBuilder: (context, index) {
+              final date = dates[index];
+              final availableCount = widget.slots
+                  .where((slot) => _dateOnly(slot.start) == date)
+                  .length;
+              return ChoiceChip(
+                key: ValueKey('booking-date-${_dateKey(date)}'),
+                selected: date == _selectedDate,
+                onSelected: (_) {
+                  if (date == _selectedDate) return;
+                  setState(() => _selectedDate = date);
+                  widget.onDateChanged();
+                },
+                avatar: Icon(
+                  availableCount == 0
+                      ? Icons.event_busy_outlined
+                      : Icons.event_available_outlined,
+                  size: 17,
+                ),
+                label: Text(
+                  '${_weekdayLabel(date)} · ${appState.formatDate(date)}',
+                ),
+              );
+            },
           ),
-          const SizedBox(height: 10),
+        ),
+        const SizedBox(height: 14),
+        Text(
+          'Available times for ${appState.formatDate(_selectedDate)}',
+          key: const ValueKey('selected-booking-date-label'),
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+        const SizedBox(height: 10),
+        if (slotsForDate.isEmpty)
+          const EmptyState(
+            icon: Icons.event_busy_outlined,
+            title: 'No times available',
+            message: 'Choose another date from the 30-day calendar.',
+          )
+        else
           GridView.builder(
             shrinkWrap: true,
             physics: const NeverScrollableScrollPhysics(),
-            itemCount: entry.value.length,
+            itemCount: slotsForDate.length,
             gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
               crossAxisCount: 2,
               mainAxisSpacing: 10,
@@ -1489,20 +1460,59 @@ class _SlotGrid extends StatelessWidget {
               childAspectRatio: 2.45,
             ),
             itemBuilder: (context, index) {
-              final slot = entry.value[index];
+              final slot = slotsForDate[index];
               return _SlotCard(
                 slot: slot,
-                selected: slot.key == selectedSlotKey,
-                accent: accent,
-                onTap: () => onSelected(slot),
+                selected: slot.key == widget.selectedSlotKey,
+                accent: widget.accent,
+                onTap: () => widget.onSelected(slot),
               );
             },
           ),
-          const SizedBox(height: 18),
-        ],
+        const SizedBox(height: 18),
       ],
     );
   }
+
+  DateTime _initialSelectedDate() {
+    final selectedSlot = _selectedSlot(widget.slots, widget.selectedSlotKey);
+    if (selectedSlot != null) {
+      return _dateOnly(selectedSlot.start);
+    }
+    return widget.slots.isEmpty
+        ? _dateOnly(DateTime.now())
+        : _dateOnly(widget.slots.first.start);
+  }
+
+  List<DateTime> _bookingDates() {
+    final today = _dateOnly(DateTime.now());
+    return List<DateTime>.generate(
+      scheduledBookingHorizonDays,
+      (index) => today.add(Duration(days: index)),
+      growable: false,
+    );
+  }
+
+  TimeSlot? _selectedSlot(List<TimeSlot> slots, String? key) {
+    if (key == null) return null;
+    return slots.where((slot) => slot.key == key).firstOrNull;
+  }
+
+  DateTime _dateOnly(DateTime date) =>
+      DateTime(date.year, date.month, date.day);
+
+  String _dateKey(DateTime date) =>
+      '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+
+  String _weekdayLabel(DateTime date) => const <String>[
+    'Mon',
+    'Tue',
+    'Wed',
+    'Thu',
+    'Fri',
+    'Sat',
+    'Sun',
+  ][date.weekday - 1];
 }
 
 class _SlotCard extends StatelessWidget {

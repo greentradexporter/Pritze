@@ -27,6 +27,7 @@ class _CustomerBookingConfirmationGateState
     final booking = appState.customerBookings
         .where(
           (item) =>
+              item.isInstant &&
               item.status == BookingStatus.confirmed &&
               item.acceptedAt != null &&
               now.difference(item.acceptedAt!).abs() <
@@ -67,7 +68,7 @@ class _CustomerBookingConfirmationGateState
           child: SafeArea(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(22, 18, 22, 22),
-              child: Column(
+              child: ListView(
                 children: [
                   Align(
                     alignment: Alignment.centerRight,
@@ -77,7 +78,7 @@ class _CustomerBookingConfirmationGateState
                       tooltip: 'Close',
                     ),
                   ),
-                  const Spacer(),
+                  const SizedBox(height: 24),
                   Container(
                     width: 82,
                     height: 82,
@@ -145,8 +146,11 @@ class _CustomerBookingConfirmationGateState
                     ),
                   ),
                   const SizedBox(height: 24),
-                  BookingStatusTimeline(status: booking.status),
-                  const Spacer(),
+                  BookingStatusTimeline(
+                    status: booking.status,
+                    isInstant: booking.isInstant,
+                  ),
+                  const SizedBox(height: 24),
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton.icon(

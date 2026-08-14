@@ -1,11 +1,9 @@
 import 'package:flutter/material.dart';
 
-import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/app_ui.dart';
-import '../customer/customer_home_screen.dart';
 import '../salon/salon_dashboard_screen.dart';
 
 class PartnerHubScreen extends StatelessWidget {
@@ -17,28 +15,8 @@ class PartnerHubScreen extends StatelessWidget {
       bottomNavigationBar: const AppBottomNav(selectedIndex: 2),
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
+          padding: const EdgeInsets.fromLTRB(18, 12, 18, 24),
           children: [
-            const AppHeroHeader(
-              eyebrow: 'Partner space',
-              title: 'Run the shop side from one place',
-              subtitle:
-                  'Owners manage listings, services, staff, and booking status.',
-              icon: Icons.business_center,
-            ),
-            const SizedBox(height: 22),
-            SectionHeader(
-              title: 'Choose your workspace',
-              actionLabel: 'Customer app',
-              onAction: () {
-                AppStateScope.read(context).selectRole(UserRole.customer);
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const CustomerHomeScreen()),
-                  (route) => false,
-                );
-              },
-            ),
-            const SizedBox(height: 10),
             _PartnerCard(
               icon: Icons.dashboard_customize,
               color: AppColors.primary,
@@ -47,7 +25,15 @@ class PartnerHubScreen extends StatelessWidget {
                   'Register your shop, add services, manage staff, and control booking status.',
               primaryLabel: 'Register or manage shop',
               onTap: () {
-                AppStateScope.read(context).selectRole(UserRole.owner);
+                final appState = AppStateScope.read(context);
+                if (appState.hasActiveCustomerSession) {
+                  _showRoleConflict(
+                    context,
+                    'This phone number is already registered as a customer. '
+                    'Sign out before using a different salon owner account.',
+                  );
+                  return;
+                }
                 Navigator.of(context).push(
                   MaterialPageRoute(
                     builder: (_) => const SalonDashboardScreen(),
@@ -59,6 +45,12 @@ class PartnerHubScreen extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  void _showRoleConflict(BuildContext context, String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }
 

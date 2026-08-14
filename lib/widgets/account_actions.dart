@@ -10,19 +10,63 @@ import 'status_chip.dart';
 
 enum _AccountAction { notifications, support, logout }
 
-enum AppNotificationDestination { bookings, overview, team }
-
-String _bookingNotificationKey(Booking booking) =>
-    'booking:${booking.id}:${booking.status.name}';
+typedef NotificationOpenCallback =
+    void Function(AppNotificationDestination destination, {String? bookingId});
 
 String _joinNotificationKey(JoinRequest request) =>
     'join:${request.id}:${request.status.name}';
+
+enum _BookingNotificationKind {
+  created,
+  accepted,
+  arrivalReminder,
+  completed,
+  cancelled,
+  rejected,
+}
+
+class _BookingNotificationEvent {
+  final Booking booking;
+  final _BookingNotificationKind kind;
+  final DateTime occurredAt;
+
+  const _BookingNotificationEvent({
+    required this.booking,
+    required this.kind,
+    required this.occurredAt,
+  });
+
+  String get key {
+    final legacyStatusKey = switch (kind) {
+      _BookingNotificationKind.created =>
+        booking.isInstant
+            ? BookingStatus.pending.name
+            : BookingStatus.confirmed.name,
+      _BookingNotificationKind.accepted => BookingStatus.confirmed.name,
+      _BookingNotificationKind.completed => BookingStatus.completed.name,
+      _BookingNotificationKind.cancelled => BookingStatus.cancelled.name,
+      _BookingNotificationKind.rejected => BookingStatus.rejected.name,
+      _BookingNotificationKind.arrivalReminder => 'arrivalReminder',
+    };
+    return 'booking:${booking.id}:$legacyStatusKey';
+  }
+
+  BookingStatus get displayStatus => switch (kind) {
+    _BookingNotificationKind.created =>
+      booking.isInstant ? BookingStatus.pending : BookingStatus.confirmed,
+    _BookingNotificationKind.accepted ||
+    _BookingNotificationKind.arrivalReminder => BookingStatus.confirmed,
+    _BookingNotificationKind.completed => BookingStatus.completed,
+    _BookingNotificationKind.cancelled => BookingStatus.cancelled,
+    _BookingNotificationKind.rejected => BookingStatus.rejected,
+  };
+}
 
 class AccountOverflowMenu extends StatelessWidget {
   final UserRole role;
   final bool canLogout;
   final Future<void> Function()? onLoggedOut;
-  final ValueChanged<AppNotificationDestination>? onNotificationOpened;
+  final NotificationOpenCallback? onNotificationOpened;
 
   const AccountOverflowMenu({
     super.key,
@@ -133,6 +177,47 @@ class AccountOverflowMenu extends StatelessWidget {
   }
 }
 
+class CustomerNotificationButton extends StatelessWidget {
+  final NotificationOpenCallback? onNotificationOpened;
+
+  const CustomerNotificationButton({super.key, this.onNotificationOpened});
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    final count = unreadNotificationCount(appState, UserRole.customer);
+    return IconButton(
+      key: const ValueKey('customer-notification-button'),
+      tooltip: 'Customer notifications',
+      onPressed: () => openCustomerNotifications(
+        context,
+        onNotificationOpened: onNotificationOpened,
+      ),
+      icon: Badge(
+        isLabelVisible: count > 0,
+        label: Text(count > 9 ? '9+' : '$count'),
+        child: const Icon(Icons.notifications_outlined),
+      ),
+    );
+  }
+}
+
+Future<void> openCustomerNotifications(
+  BuildContext context, {
+  NotificationOpenCallback? onNotificationOpened,
+}) async {
+  final appState = AppStateScope.read(context);
+  appState.markNotificationsSeen(
+    UserRole.customer,
+    notificationKeys(appState, UserRole.customer),
+  );
+  await showNotificationCenter(
+    context,
+    UserRole.customer,
+    onNotificationOpened: onNotificationOpened,
+  );
+}
+
 Future<bool> confirmAndLogout(BuildContext context) async {
   final confirmed = await showDialog<bool>(
     context: context,
@@ -224,6 +309,9 @@ Future<void> showSupportSheet(BuildContext context) {
 }
 
 int unreadNotificationCount(AppState state, UserRole role) {
+  if (!state.notificationPreferencesReady(role)) {
+    return 0;
+  }
   return notificationKeys(
     state,
     role,
@@ -233,33 +321,131 @@ int unreadNotificationCount(AppState state, UserRole role) {
 List<String> notificationKeys(AppState state, UserRole role) {
   final keys = switch (role) {
     UserRole.customer => [
-      for (final booking in state.customerBookings)
-        _bookingNotificationKey(booking),
+      for (final event in _bookingNotificationEvents(state, role)) event.key,
     ],
     UserRole.barber => [
       if (state.currentJoinRequest case final request?)
         if (request.status != JoinRequestStatus.withdrawn)
           _joinNotificationKey(request),
-      if (state.currentBarber case final barber?)
-        for (final booking in state.bookingsForBarber(barber.id))
-          _bookingNotificationKey(booking),
+      if (state.currentBarber != null)
+        for (final event in _bookingNotificationEvents(state, role)) event.key,
     ],
     UserRole.owner => [
-      for (final booking in state.bookingsForSalon(state.ownerSalonId))
-        _bookingNotificationKey(booking),
+      for (final event in _bookingNotificationEvents(state, role)) event.key,
       for (final request in state.pendingJoinRequests)
         _joinNotificationKey(request),
     ],
   };
   return keys
       .where((key) => !state.hasDismissedNotification(role, key))
+      .toSet()
       .toList();
+}
+
+List<_BookingNotificationEvent> _bookingNotificationEvents(
+  AppState state,
+  UserRole role,
+) {
+  final bookings = switch (role) {
+    UserRole.customer => state.customerBookings,
+    UserRole.owner => state.bookingsForSalon(state.ownerSalonId),
+    UserRole.barber =>
+      state.currentBarber == null
+          ? const <Booking>[]
+          : state.bookingsForBarber(state.currentBarber!.id),
+  };
+  final events = <_BookingNotificationEvent>[];
+  for (final booking in bookings) {
+    events.add(
+      _BookingNotificationEvent(
+        booking: booking,
+        kind: _BookingNotificationKind.created,
+        occurredAt: booking.createdAt,
+      ),
+    );
+    if (booking.acceptedAt case final acceptedAt?) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.accepted,
+          occurredAt: acceptedAt,
+        ),
+      );
+    }
+    final reminderAt = role == UserRole.owner
+        ? booking.ownerArrivalReminderSentAt
+        : booking.customerArrivalReminderSentAt;
+    if (reminderAt != null) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.arrivalReminder,
+          occurredAt: reminderAt,
+        ),
+      );
+    }
+    if (booking.completedAt case final completedAt?) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.completed,
+          occurredAt: completedAt,
+        ),
+      );
+    } else if (booking.status == BookingStatus.completed) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.completed,
+          occurredAt: booking.start.add(
+            Duration(minutes: booking.durationMinutes),
+          ),
+        ),
+      );
+    }
+    if (booking.cancelledAt case final cancelledAt?) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.cancelled,
+          occurredAt: cancelledAt,
+        ),
+      );
+    } else if (booking.status == BookingStatus.cancelled) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.cancelled,
+          occurredAt: booking.createdAt,
+        ),
+      );
+    }
+    if (booking.rejectedAt case final rejectedAt?) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.rejected,
+          occurredAt: rejectedAt,
+        ),
+      );
+    } else if (booking.status == BookingStatus.rejected) {
+      events.add(
+        _BookingNotificationEvent(
+          booking: booking,
+          kind: _BookingNotificationKind.rejected,
+          occurredAt: booking.createdAt,
+        ),
+      );
+    }
+  }
+  events.sort((a, b) => b.occurredAt.compareTo(a.occurredAt));
+  return events;
 }
 
 Future<void> showNotificationCenter(
   BuildContext context,
   UserRole role, {
-  ValueChanged<AppNotificationDestination>? onNotificationOpened,
+  NotificationOpenCallback? onNotificationOpened,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -274,7 +460,7 @@ Future<void> showNotificationCenter(
 
 class _NotificationSheet extends StatelessWidget {
   final UserRole role;
-  final ValueChanged<AppNotificationDestination>? onNotificationOpened;
+  final NotificationOpenCallback? onNotificationOpened;
 
   const _NotificationSheet({required this.role, this.onNotificationOpened});
 
@@ -331,15 +517,15 @@ class _NotificationSheet extends StatelessWidget {
   List<Widget> _items(AppState state) {
     if (role == UserRole.customer) {
       return [
-        for (final booking in state.customerBookings.take(20))
-          if (!state.hasDismissedNotification(
-            role,
-            _bookingNotificationKey(booking),
-          ))
+        for (final event in _bookingNotificationEvents(state, role).take(30))
+          if (!state.hasDismissedNotification(role, event.key))
             _BookingNotification(
-              booking: booking,
+              event: event,
               role: role,
-              onOpen: () => _open(AppNotificationDestination.bookings),
+              onOpen: () => _open(
+                AppNotificationDestination.bookings,
+                bookingId: event.booking.id,
+              ),
             ),
       ];
     }
@@ -358,28 +544,28 @@ class _NotificationSheet extends StatelessWidget {
               onOpen: () => _open(AppNotificationDestination.team),
             ),
         if (barber != null)
-          for (final booking in state.bookingsForBarber(barber.id).take(20))
-            if (!state.hasDismissedNotification(
-              role,
-              _bookingNotificationKey(booking),
-            ))
+          for (final event in _bookingNotificationEvents(state, role).take(30))
+            if (!state.hasDismissedNotification(role, event.key))
               _BookingNotification(
-                booking: booking,
+                event: event,
                 role: role,
-                onOpen: () => _open(AppNotificationDestination.bookings),
+                onOpen: () => _open(
+                  AppNotificationDestination.bookings,
+                  bookingId: event.booking.id,
+                ),
               ),
       ];
     }
     return [
-      for (final booking in state.bookingsForSalon(state.ownerSalonId).take(20))
-        if (!state.hasDismissedNotification(
-          role,
-          _bookingNotificationKey(booking),
-        ))
+      for (final event in _bookingNotificationEvents(state, role).take(30))
+        if (!state.hasDismissedNotification(role, event.key))
           _BookingNotification(
-            booking: booking,
+            event: event,
             role: role,
-            onOpen: () => _open(AppNotificationDestination.bookings),
+            onOpen: () => _open(
+              AppNotificationDestination.bookings,
+              bookingId: event.booking.id,
+            ),
           ),
       for (final request in state.pendingJoinRequests.take(20))
         if (!state.hasDismissedNotification(
@@ -394,18 +580,18 @@ class _NotificationSheet extends StatelessWidget {
     ];
   }
 
-  void _open(AppNotificationDestination destination) {
-    onNotificationOpened?.call(destination);
+  void _open(AppNotificationDestination destination, {String? bookingId}) {
+    onNotificationOpened?.call(destination, bookingId: bookingId);
   }
 }
 
 class _BookingNotification extends StatelessWidget {
-  final Booking booking;
+  final _BookingNotificationEvent event;
   final UserRole role;
   final VoidCallback onOpen;
 
   const _BookingNotification({
-    required this.booking,
+    required this.event,
     required this.role,
     required this.onOpen,
   });
@@ -413,9 +599,10 @@ class _BookingNotification extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = AppStateScope.watch(context);
+    final booking = event.booking;
     final salon = state.getSalon(booking.salonId);
     final service = state.getService(booking.salonId, booking.serviceId);
-    final notificationKey = _bookingNotificationKey(booking);
+    final notificationKey = event.key;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () {
@@ -436,18 +623,19 @@ class _BookingNotification extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    _bookingTitle(booking.status, role),
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
+                  Text(_title, style: Theme.of(context).textTheme.titleMedium),
                   const SizedBox(height: 4),
                   Text(
-                    '${booking.resolvedServiceName(service)} at ${salon?.name ?? 'your salon'} · '
-                    '${state.formatDate(booking.start)}, ${state.formatTime(booking.start)}',
+                    _body(
+                      salonName: salon?.name ?? 'your salon',
+                      serviceName: booking.resolvedServiceName(service),
+                      appointment:
+                          '${state.formatDate(booking.start)}, ${state.formatTime(booking.start)}',
+                    ),
                     style: Theme.of(context).textTheme.bodyMedium,
                   ),
                   const SizedBox(height: 8),
-                  StatusChip(status: booking.status),
+                  StatusChip(status: event.displayStatus),
                 ],
               ),
             ),
@@ -463,34 +651,74 @@ class _BookingNotification extends StatelessWidget {
     );
   }
 
-  String _bookingTitle(BookingStatus status, UserRole role) {
-    if (booking.isInstant && status == BookingStatus.pending) {
-      return role == UserRole.owner
-          ? 'New instant booking request'
-          : 'Instant booking request sent';
-    }
-    if (booking.isInstant && status == BookingStatus.confirmed) {
-      return 'Instant booking accepted';
-    }
-    if (role == UserRole.barber) {
-      return switch (status) {
-        BookingStatus.pending => 'You have a new booking request',
-        BookingStatus.confirmed => 'You are booked for this time',
-        BookingStatus.inProgress => 'Service started',
-        BookingStatus.completed => 'Booking completed',
-        BookingStatus.cancelled => 'Your booking was cancelled',
-        BookingStatus.rejected => 'Booking was rejected',
-      };
-    }
-    return switch (status) {
-      BookingStatus.pending =>
-        role == UserRole.owner ? 'New booking request' : 'Booking request sent',
-      BookingStatus.confirmed => 'Booking confirmed',
-      BookingStatus.inProgress => 'Service started',
-      BookingStatus.completed => 'Visit completed',
-      BookingStatus.cancelled => 'Booking cancelled',
-      BookingStatus.rejected => 'Booking rejected',
+  Booking get booking => event.booking;
+
+  String get _title => switch (event.kind) {
+    _BookingNotificationKind.created =>
+      booking.isInstant
+          ? role == UserRole.owner
+                ? 'New instant booking request'
+                : 'Instant booking request sent'
+          : role == UserRole.owner
+          ? 'New scheduled booking'
+          : 'Booking confirmed',
+    _BookingNotificationKind.accepted => 'Instant booking accepted',
+    _BookingNotificationKind.arrivalReminder =>
+      role == UserRole.owner
+          ? 'Customer arriving within 5 minutes'
+          : booking.isInstant
+          ? 'Your appointment starts in 5 minutes'
+          : 'Your appointment starts soon',
+    _BookingNotificationKind.completed =>
+      role == UserRole.customer ? 'Visit completed' : 'Booking completed',
+    _BookingNotificationKind.cancelled =>
+      booking.cancelledBy == 'customer'
+          ? role == UserRole.customer
+                ? 'You cancelled the booking'
+                : 'Customer cancelled booking'
+          : role == UserRole.customer
+          ? 'Salon cancelled booking'
+          : 'Booking cancelled by salon',
+    _BookingNotificationKind.rejected =>
+      role == UserRole.customer
+          ? 'Booking rejected by salon'
+          : 'Booking rejected',
+  };
+
+  String _body({
+    required String salonName,
+    required String serviceName,
+    required String appointment,
+  }) {
+    final reason = booking.cancellationReason.trim();
+    return switch (event.kind) {
+      _BookingNotificationKind.created =>
+        role == UserRole.owner
+            ? '${booking.customerName} requested $serviceName for $appointment.'
+            : '$serviceName at $salonName · $appointment.',
+      _BookingNotificationKind.accepted =>
+        role == UserRole.owner
+            ? '${booking.customerName}\'s $serviceName request was accepted.'
+            : '$salonName accepted $serviceName. Please arrive by ${stateTime(booking.start)}.',
+      _BookingNotificationKind.arrivalReminder =>
+        role == UserRole.owner
+            ? '${booking.customerName} is expected within 5 minutes for $serviceName.'
+            : booking.isInstant
+            ? '$serviceName at $salonName is scheduled to start in about 5 minutes.'
+            : '$serviceName at $salonName starts in about 30 minutes.',
+      _BookingNotificationKind.completed =>
+        '$serviceName for ${booking.customerName} has been completed.',
+      _BookingNotificationKind.cancelled =>
+        '${booking.cancelledBy == 'customer' ? booking.customerName : salonName} cancelled $serviceName.${reason.isEmpty ? '' : ' Reason: $reason'}',
+      _BookingNotificationKind.rejected =>
+        '$salonName rejected $serviceName.${reason.isEmpty ? '' : ' Reason: $reason'}',
     };
+  }
+
+  String stateTime(DateTime value) {
+    final hour = value.hour % 12 == 0 ? 12 : value.hour % 12;
+    final minute = value.minute.toString().padLeft(2, '0');
+    return '$hour:$minute ${value.hour >= 12 ? 'PM' : 'AM'}';
   }
 }
 

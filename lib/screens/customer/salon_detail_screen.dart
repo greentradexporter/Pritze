@@ -5,18 +5,36 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/booking_status_timeline.dart';
 import '../../widgets/salon_logo.dart';
+import 'my_bookings_screen.dart';
 import 'salon_booking_screen.dart';
 
-class SalonDetailScreen extends StatelessWidget {
-  final String salonId;
+enum SalonDetailEntryAction { instant, service, barber }
 
-  const SalonDetailScreen({super.key, required this.salonId});
+class SalonDetailScreen extends StatefulWidget {
+  final String salonId;
+  final SalonDetailEntryAction? entryAction;
+  final bool directScheduleEntry;
+
+  const SalonDetailScreen({
+    super.key,
+    required this.salonId,
+    this.entryAction,
+    this.directScheduleEntry = false,
+  });
+
+  @override
+  State<SalonDetailScreen> createState() => _SalonDetailScreenState();
+}
+
+class _SalonDetailScreenState extends State<SalonDetailScreen> {
+  bool _openedEntryAction = false;
 
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
-    final salon = appState.getSalon(salonId);
+    final salon = appState.getSalon(widget.salonId);
 
     if (salon == null) {
       return Scaffold(
@@ -30,11 +48,11 @@ class SalonDetailScreen extends StatelessWidget {
     }
 
     final services = salon.availableServices;
-    final availableServiceIds = services.map((service) => service.id).toSet();
-    final barbers = appState
-        .barbersForSalon(salon.id)
-        .where((barber) => barber.serviceIds.any(availableServiceIds.contains))
-        .toList();
+    final isBookable = appState.isSalonBookable(salon.id);
+    final isSetupComplete = appState.isSalonSetupComplete(salon.id);
+    final isCurrentlyOpen = appState.isSalonCurrentlyOpen(salon.id);
+    final canBookNow = isBookable && isCurrentlyOpen;
+    final barbers = appState.barbersForSalon(salon.id);
     final instantServices = services
         .where(
           (service) => appState.isInstantBookingAvailable(
@@ -44,7 +62,34 @@ class SalonDetailScreen extends StatelessWidget {
         )
         .toList();
 
+    if (!_openedEntryAction && widget.entryAction != null) {
+      _openedEntryAction = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        switch (widget.entryAction!) {
+          case SalonDetailEntryAction.instant:
+            _showServicePickerSheet(context, salon, instantOnly: true);
+          case SalonDetailEntryAction.service:
+            final selected = await _showServicePickerSheet(
+              context,
+              salon,
+              replacePageOnSelection: widget.directScheduleEntry,
+            );
+            if (widget.directScheduleEntry && !selected && context.mounted) {
+              Navigator.of(context).maybePop();
+            }
+          case SalonDetailEntryAction.barber:
+            _showBarberPickerSheet(context, salon, barbers);
+        }
+      });
+    }
+
     return Scaffold(
+      bottomNavigationBar: CustomerActiveBookingFooter(
+        onOpenBooking: () => Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const MyBookingsScreen())),
+      ),
       body: CustomScrollView(
         slivers: [
           SliverAppBar(
@@ -52,7 +97,7 @@ class SalonDetailScreen extends StatelessWidget {
             pinned: true,
             backgroundColor: AppColors.canvas,
             surfaceTintColor: Colors.transparent,
-            title: Text(salon.name),
+            title: Text(salon.displayName),
             flexibleSpace: FlexibleSpaceBar(
               background: _DetailHero(salon: salon),
             ),
@@ -65,9 +110,14 @@ class SalonDetailScreen extends StatelessWidget {
                   children: [
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: () {
-                          UrlLauncherUtils.makePhoneCall(context, salon.phone);
-                        },
+                        onPressed: salon.phone.trim().isEmpty
+                            ? null
+                            : () {
+                                UrlLauncherUtils.makePhoneCall(
+                                  context,
+                                  salon.phone,
+                                );
+                              },
                         icon: const Icon(Icons.call),
                         label: const Text('Call'),
                       ),
@@ -87,6 +137,28 @@ class SalonDetailScreen extends StatelessWidget {
                     ),
                   ],
                 ),
+                if (!canBookNow) ...[
+                  const SizedBox(height: 10),
+                  GlassCard(
+                    color: AppColors.champagne.withAlpha(80),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.info_outline,
+                          color: AppColors.goldDeep,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            isSetupComplete
+                                ? 'This salon is currently closed. You can still view its services and team.'
+                                : 'This salon is listed while its booking setup is being completed.',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
                 if (instantServices.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   SizedBox(
@@ -107,87 +179,38 @@ class SalonDetailScreen extends StatelessWidget {
                   _SalonPhotoGallery(photoUrls: salon.photoUrls),
                   const SizedBox(height: 20),
                 ],
-                Text(
-                  'How would you like to book?',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _BookingPathCard(
-                        icon: Icons.design_services_outlined,
-                        title: 'Pick service',
-                        subtitle: '${services.length} available',
-                        color: AppColors.primary,
-                        onTap: () => _showServicePickerSheet(context, salon),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _BookingPathCard(
-                        icon: Icons.badge_outlined,
-                        title: 'Pick barber',
-                        subtitle: '${barbers.length} available',
-                        color: AppColors.coral,
-                        onTap: () =>
-                            _showBarberPickerSheet(context, salon, barbers),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 22),
-                _CollapsibleSection(
-                  title: 'Services',
-                  subtitle: '${services.length} services',
-                  icon: Icons.design_services_outlined,
-                  initiallyExpanded: true,
-                  children: [
-                    for (final service in services) ...[
-                      _ServiceTile(
-                        service: service,
-                        availableBarbers: appState
-                            .barbersForService(salon.id, service.id)
-                            .length,
-                        onTap: () => _openService(context, salon, service),
-                      ),
-                      const SizedBox(height: 10),
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 12),
-                _CollapsibleSection(
-                  title: 'Barbers',
-                  subtitle: '${barbers.length} team members',
-                  icon: Icons.badge_outlined,
-                  children: [
-                    if (barbers.isEmpty)
-                      const EmptyState(
-                        icon: Icons.badge,
-                        title: 'No barbers yet',
-                        message: 'Owner can add staff from partner tools.',
-                      )
-                    else
-                      SizedBox(
-                        height: 158,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          itemCount: barbers.length,
-                          separatorBuilder: (context, index) =>
-                              const SizedBox(width: 10),
-                          itemBuilder: (context, index) {
-                            final barber = barbers[index];
-                            return _BarberCard(
-                              barber: barber,
-                              onTap: () {
-                                _showBarberServiceSheet(context, salon, barber);
-                              },
-                            );
-                          },
+                if (services.isNotEmpty || barbers.isNotEmpty) ...[
+                  Text(
+                    'How would you like to book?',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _BookingPathCard(
+                          icon: Icons.design_services_outlined,
+                          title: 'Pick service',
+                          subtitle: '${services.length} available',
+                          color: AppColors.primary,
+                          onTap: () => _showServicePickerSheet(context, salon),
                         ),
                       ),
-                  ],
-                ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _BookingPathCard(
+                          icon: Icons.badge_outlined,
+                          title: 'Pick barber',
+                          subtitle: '${barbers.length} available',
+                          color: AppColors.coral,
+                          onTap: () =>
+                              _showBarberPickerSheet(context, salon, barbers),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                const SizedBox(height: 22),
               ],
             ),
           ),
@@ -196,21 +219,35 @@ class SalonDetailScreen extends StatelessWidget {
     );
   }
 
-  void _openService(BuildContext context, Salon salon, SalonService service) {
+  void _openService(
+    BuildContext context,
+    Salon salon,
+    SalonService service, {
+    bool instantOnly = false,
+  }) {
     Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) =>
-            SalonBookingScreen(salonId: salon.id, serviceId: service.id),
+        builder: (_) => SalonBookingScreen(
+          salonId: salon.id,
+          serviceId: service.id,
+          instantOnly: instantOnly,
+        ),
       ),
     );
   }
 
-  Future<void> _showServicePickerSheet(
+  Future<bool> _showServicePickerSheet(
     BuildContext context,
     Salon salon, {
     bool instantOnly = false,
+    bool replacePageOnSelection = false,
   }) {
     final appState = AppStateScope.read(context);
+    final pageContext = context;
+    final searchController = TextEditingController();
+    var searchQuery = '';
+    var selectedService = false;
+    final selectedInstantIds = <String>{};
     final services = instantOnly
         ? salon.availableServices
               .where(
@@ -226,59 +263,175 @@ class SalonDetailScreen extends StatelessWidget {
       isScrollControlled: true,
       showDragHandle: true,
       useSafeArea: true,
-      builder: (sheetContext) => FractionallySizedBox(
-        heightFactor: 0.78,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(18, 2, 18, 14),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    instantOnly
-                        ? 'Choose an instant service'
-                        : 'Choose a service',
-                    style: Theme.of(context).textTheme.headlineSmall,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          final normalizedQuery = searchQuery.trim().toLowerCase();
+          final visibleServices = services.where((service) {
+            if (normalizedQuery.isEmpty) {
+              return true;
+            }
+            return service.name.toLowerCase().contains(normalizedQuery) ||
+                service.category.toLowerCase().contains(normalizedQuery);
+          }).toList();
+          return FractionallySizedBox(
+            heightFactor: 0.78,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(18, 2, 18, 14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        instantOnly
+                            ? 'Choose instant services'
+                            : 'Choose a service',
+                        style: Theme.of(context).textTheme.headlineSmall,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        instantOnly
+                            ? 'Select one or more services. The salon will assign one available barber who can perform all of them.'
+                            : 'Pick a service first, then choose an available barber.',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        key: const ValueKey('salon-service-search-field'),
+                        controller: searchController,
+                        textInputAction: TextInputAction.search,
+                        onChanged: (value) {
+                          setSheetState(() => searchQuery = value);
+                        },
+                        decoration: InputDecoration(
+                          hintText: 'Search this salon’s services',
+                          prefixIcon: const Icon(Icons.search),
+                          suffixIcon: searchQuery.isEmpty
+                              ? null
+                              : IconButton(
+                                  tooltip: 'Clear service search',
+                                  onPressed: () {
+                                    searchController.clear();
+                                    setSheetState(() => searchQuery = '');
+                                  },
+                                  icon: const Icon(Icons.close),
+                                ),
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    instantOnly
-                        ? 'These services can be requested right now.'
-                        : 'Pick a service first, then choose an available barber.',
-                    style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: visibleServices.isEmpty
+                      ? const EmptyState(
+                          icon: Icons.search_off,
+                          title: 'No matching services',
+                          message: 'Try another service name or category.',
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.all(18),
+                          itemCount: visibleServices.length,
+                          separatorBuilder: (_, _) =>
+                              const SizedBox(height: 10),
+                          itemBuilder: (context, index) {
+                            final service = visibleServices[index];
+                            return _ServiceTile(
+                              service: service,
+                              availableBarbers: appState
+                                  .barbersForService(salon.id, service.id)
+                                  .length,
+                              selected: selectedInstantIds.contains(service.id),
+                              multiSelect: instantOnly,
+                              onTap: () {
+                                if (!appState.isSalonCurrentlyOpen(salon.id)) {
+                                  _showBookingUnavailable(pageContext, salon);
+                                  return;
+                                }
+                                if (!appState.isSalonBookable(salon.id)) {
+                                  _showBookingUnavailable(pageContext, salon);
+                                  return;
+                                }
+                                if (instantOnly) {
+                                  setSheetState(() {
+                                    if (!selectedInstantIds.add(service.id)) {
+                                      selectedInstantIds.remove(service.id);
+                                    }
+                                  });
+                                  return;
+                                }
+                                selectedService = true;
+                                Navigator.pop(sheetContext);
+                                WidgetsBinding.instance.addPostFrameCallback((
+                                  _,
+                                ) {
+                                  if (pageContext.mounted) {
+                                    if (replacePageOnSelection) {
+                                      Navigator.of(pageContext).pushReplacement(
+                                        MaterialPageRoute(
+                                          builder: (_) => SalonBookingScreen(
+                                            salonId: salon.id,
+                                            serviceId: service.id,
+                                          ),
+                                        ),
+                                      );
+                                    } else {
+                                      _openService(pageContext, salon, service);
+                                    }
+                                  }
+                                });
+                              },
+                            );
+                          },
+                        ),
+                ),
+                if (instantOnly) ...[
+                  const Divider(height: 1),
+                  SafeArea(
+                    top: false,
+                    minimum: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        key: const ValueKey('continue-instant-services'),
+                        onPressed: selectedInstantIds.isEmpty
+                            ? null
+                            : () {
+                                final selected = selectedInstantIds.toList();
+                                Navigator.pop(sheetContext);
+                                WidgetsBinding.instance.addPostFrameCallback((
+                                  _,
+                                ) {
+                                  if (!pageContext.mounted) return;
+                                  Navigator.of(pageContext).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => SalonBookingScreen(
+                                        salonId: salon.id,
+                                        serviceId: selected.first,
+                                        initialInstantServiceIds: selected,
+                                        instantOnly: true,
+                                      ),
+                                    ),
+                                  );
+                                });
+                              },
+                        icon: const Icon(Icons.arrow_forward_rounded),
+                        label: Text(
+                          selectedInstantIds.isEmpty
+                              ? 'Choose at least one service'
+                              : 'Continue with ${selectedInstantIds.length} ${selectedInstantIds.length == 1 ? 'service' : 'services'}',
+                        ),
+                      ),
+                    ),
                   ),
                 ],
-              ),
+              ],
             ),
-            const Divider(height: 1),
-            Expanded(
-              child: ListView.separated(
-                padding: const EdgeInsets.all(18),
-                itemCount: services.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 10),
-                itemBuilder: (context, index) {
-                  final service = services[index];
-                  return _ServiceTile(
-                    service: service,
-                    availableBarbers: appState
-                        .barbersForService(salon.id, service.id)
-                        .length,
-                    onTap: () {
-                      Navigator.pop(sheetContext);
-                      WidgetsBinding.instance.addPostFrameCallback((_) {
-                        _openService(context, salon, service);
-                      });
-                    },
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
+          );
+        },
       ),
-    );
+    ).then((_) => selectedService).whenComplete(searchController.dispose);
   }
 
   Future<void> _showBarberPickerSheet(
@@ -286,6 +439,7 @@ class SalonDetailScreen extends StatelessWidget {
     Salon salon,
     List<Barber> barbers,
   ) {
+    final pageContext = context;
     return showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -325,13 +479,25 @@ class SalonDetailScreen extends StatelessWidget {
                       padding: const EdgeInsets.all(18),
                       itemCount: barbers.length,
                       separatorBuilder: (_, _) => const SizedBox(height: 10),
-                      itemBuilder: (context, index) {
+                      itemBuilder: (itemContext, index) {
                         final barber = barbers[index];
                         return GlassCard(
                           onTap: () {
+                            final appState = AppStateScope.read(pageContext);
+                            if (!appState.isSalonCurrentlyOpen(salon.id) ||
+                                !appState.isSalonBookable(salon.id)) {
+                              _showBookingUnavailable(pageContext, salon);
+                              return;
+                            }
                             Navigator.pop(sheetContext);
                             WidgetsBinding.instance.addPostFrameCallback((_) {
-                              _showBarberServiceSheet(context, salon, barber);
+                              if (pageContext.mounted) {
+                                _showBarberServiceSheet(
+                                  pageContext,
+                                  salon,
+                                  barber,
+                                );
+                              }
                             });
                           },
                           child: Row(
@@ -355,7 +521,7 @@ class SalonDetailScreen extends StatelessWidget {
                                     Text(
                                       barber.name,
                                       style: Theme.of(
-                                        context,
+                                        itemContext,
                                       ).textTheme.titleMedium,
                                     ),
                                     const SizedBox(height: 4),
@@ -364,7 +530,7 @@ class SalonDetailScreen extends StatelessWidget {
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
                                       style: Theme.of(
-                                        context,
+                                        itemContext,
                                       ).textTheme.bodyMedium,
                                     ),
                                   ],
@@ -453,16 +619,27 @@ class SalonDetailScreen extends StatelessWidget {
                   for (final service in services) ...[
                     GlassCard(
                       onTap: () {
+                        final appState = AppStateScope.read(context);
+                        if (!appState.isSalonCurrentlyOpen(salon.id) ||
+                            !appState.isSalonBookable(salon.id)) {
+                          _showBookingUnavailable(context, salon);
+                          return;
+                        }
                         Navigator.of(sheetContext).pop();
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) => SalonBookingScreen(
-                              salonId: salon.id,
-                              serviceId: service.id,
-                              initialBarberId: barber.id,
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (!context.mounted) {
+                            return;
+                          }
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => SalonBookingScreen(
+                                salonId: salon.id,
+                                serviceId: service.id,
+                                initialBarberId: barber.id,
+                              ),
                             ),
-                          ),
-                        );
+                          );
+                        });
                       },
                       child: Row(
                         children: [
@@ -509,6 +686,227 @@ class SalonDetailScreen extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+
+  void _showBookingUnavailable(BuildContext context, Salon salon) {
+    final appState = AppStateScope.read(context);
+    final setupComplete = appState.isSalonSetupComplete(salon.id);
+    final message = setupComplete
+        ? '${salon.displayName} is currently closed. You can browse services and barbers, but appointments can only be placed while the salon is open.'
+        : '${salon.displayName} is still completing its booking setup. You can browse the listing, but appointments are not available yet.';
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.schedule_outlined),
+        title: Text(setupComplete ? 'Salon is closed' : 'Booking unavailable'),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Got it'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class InstantServiceSelectionScreen extends StatefulWidget {
+  final String salonId;
+
+  const InstantServiceSelectionScreen({super.key, required this.salonId});
+
+  @override
+  State<InstantServiceSelectionScreen> createState() =>
+      _InstantServiceSelectionScreenState();
+}
+
+class _InstantServiceSelectionScreenState
+    extends State<InstantServiceSelectionScreen> {
+  final TextEditingController _searchController = TextEditingController();
+  final Set<String> _selectedServiceIds = {};
+  String _searchQuery = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    final salon = appState.getSalon(widget.salonId);
+    if (salon == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Choose services')),
+        body: const EmptyState(
+          icon: Icons.storefront_outlined,
+          title: 'Salon not found',
+          message: 'This salon is no longer available.',
+        ),
+      );
+    }
+
+    final instantServices = salon.availableServices
+        .where(
+          (service) => appState.isInstantBookingAvailable(
+            salon.id,
+            serviceId: service.id,
+          ),
+        )
+        .toList();
+    final normalizedQuery = _searchQuery.trim().toLowerCase();
+    final visibleServices = instantServices.where((service) {
+      return normalizedQuery.isEmpty ||
+          service.name.toLowerCase().contains(normalizedQuery) ||
+          service.category.toLowerCase().contains(normalizedQuery);
+    }).toList();
+
+    return Scaffold(
+      appBar: AppBar(title: Text(salon.displayName)),
+      bottomNavigationBar: CustomerActiveBookingFooter(
+        onOpenBooking: () => Navigator.of(
+          context,
+        ).push(MaterialPageRoute(builder: (_) => const MyBookingsScreen())),
+        action: SafeArea(
+          top: false,
+          minimum: const EdgeInsets.fromLTRB(18, 10, 18, 14),
+          child: FilledButton.icon(
+            key: const ValueKey('continue-instant-services'),
+            onPressed: _selectedServiceIds.isEmpty
+                ? null
+                : () => _continueToBooking(salon),
+            icon: const Icon(Icons.arrow_forward_rounded),
+            label: Text(
+              _selectedServiceIds.isEmpty
+                  ? 'Choose at least one service'
+                  : 'Continue with ${_selectedServiceIds.length} ${_selectedServiceIds.length == 1 ? 'service' : 'services'}',
+            ),
+          ),
+        ),
+      ),
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Choose instant services',
+                    style: Theme.of(context).textTheme.headlineSmall,
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    'Select one or more services. The salon will assign an available barber.',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    key: const ValueKey('salon-service-search-field'),
+                    controller: _searchController,
+                    textInputAction: TextInputAction.search,
+                    onChanged: (value) => setState(() => _searchQuery = value),
+                    decoration: InputDecoration(
+                      hintText: 'Search this salon’s services',
+                      prefixIcon: const Icon(Icons.search),
+                      suffixIcon: _searchQuery.isEmpty
+                          ? null
+                          : IconButton(
+                              tooltip: 'Clear service search',
+                              onPressed: () {
+                                _searchController.clear();
+                                setState(() => _searchQuery = '');
+                              },
+                              icon: const Icon(Icons.close),
+                            ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: visibleServices.isEmpty
+                  ? const EmptyState(
+                      icon: Icons.design_services_outlined,
+                      title: 'No instant services available',
+                      message:
+                          'Try again while the salon is accepting instant bookings.',
+                    )
+                  : ListView.separated(
+                      padding: const EdgeInsets.all(18),
+                      itemCount: visibleServices.length,
+                      separatorBuilder: (_, _) => const SizedBox(height: 10),
+                      itemBuilder: (context, index) {
+                        final service = visibleServices[index];
+                        return _ServiceTile(
+                          service: service,
+                          availableBarbers: appState
+                              .barbersForService(salon.id, service.id)
+                              .length,
+                          selected: _selectedServiceIds.contains(service.id),
+                          multiSelect: true,
+                          onTap: () {
+                            if (!appState.isSalonCurrentlyOpen(salon.id) ||
+                                !appState.isSalonBookable(salon.id)) {
+                              _showBookingUnavailable(context, salon);
+                              return;
+                            }
+                            setState(() {
+                              if (!_selectedServiceIds.add(service.id)) {
+                                _selectedServiceIds.remove(service.id);
+                              }
+                            });
+                          },
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _continueToBooking(Salon salon) {
+    final selected = _selectedServiceIds.toList();
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SalonBookingScreen(
+          salonId: salon.id,
+          serviceId: selected.first,
+          initialInstantServiceIds: selected,
+          instantOnly: true,
+        ),
+      ),
+    );
+  }
+
+  void _showBookingUnavailable(BuildContext context, Salon salon) {
+    final appState = AppStateScope.read(context);
+    final setupComplete = appState.isSalonSetupComplete(salon.id);
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.schedule_outlined),
+        title: Text(setupComplete ? 'Salon is closed' : 'Booking unavailable'),
+        content: Text(
+          setupComplete
+              ? '${salon.displayName} is currently closed. You can browse services, but appointments can only be placed while the salon is open.'
+              : '${salon.displayName} is still completing its booking setup. Appointments are not available yet.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Got it'),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -560,7 +958,7 @@ class _DetailHero extends StatelessWidget {
                               children: [
                                 Expanded(
                                   child: Text(
-                                    salon.name,
+                                    salon.displayName,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     style: Theme.of(
@@ -590,15 +988,15 @@ class _DetailHero extends StatelessWidget {
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 5),
-                            Text(
-                              salon.address.trim().isEmpty
-                                  ? 'Nearby salon'
-                                  : salon.address,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context).textTheme.bodyMedium,
-                            ),
+                            if (salon.address.trim().isNotEmpty) ...[
+                              const SizedBox(height: 5),
+                              Text(
+                                salon.address,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                            ],
                           ],
                         ),
                       ),
@@ -618,15 +1016,6 @@ class _DetailHero extends StatelessWidget {
                         label: '$barberCount barbers',
                         color: AppColors.muted,
                       ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: _DetailFact(
-                          icon: Icons.near_me_outlined,
-                          label: salon.distanceLabel,
-                          color: AppColors.muted,
-                          expanded: true,
-                        ),
-                      ),
                     ],
                   ),
                 ],
@@ -643,13 +1032,11 @@ class _DetailFact extends StatelessWidget {
   final IconData icon;
   final String label;
   final Color color;
-  final bool expanded;
 
   const _DetailFact({
     required this.icon,
     required this.label,
     required this.color,
-    this.expanded = false,
   });
 
   @override
@@ -661,11 +1048,11 @@ class _DetailFact extends StatelessWidget {
       style: const TextStyle(color: AppColors.ink, fontSize: 14),
     );
     return Row(
-      mainAxisSize: expanded ? MainAxisSize.max : MainAxisSize.min,
+      mainAxisSize: MainAxisSize.min,
       children: [
         Icon(icon, color: color, size: 16),
         const SizedBox(width: 5),
-        if (expanded) Expanded(child: labelText) else labelText,
+        labelText,
       ],
     );
   }
@@ -797,61 +1184,25 @@ class _BookingPathCard extends StatelessWidget {
   }
 }
 
-class _CollapsibleSection extends StatelessWidget {
-  final String title;
-  final String subtitle;
-  final IconData icon;
-  final bool initiallyExpanded;
-  final List<Widget> children;
-
-  const _CollapsibleSection({
-    required this.title,
-    required this.subtitle,
-    required this.icon,
-    required this.children,
-    this.initiallyExpanded = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: AppColors.line),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Theme(
-        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
-        child: ExpansionTile(
-          initiallyExpanded: initiallyExpanded,
-          tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-          leading: Icon(icon, color: AppColors.primary, size: 22),
-          title: Text(title, style: Theme.of(context).textTheme.titleMedium),
-          subtitle: Text(subtitle),
-          children: children,
-        ),
-      ),
-    );
-  }
-}
-
 class _ServiceTile extends StatelessWidget {
   final SalonService service;
   final int availableBarbers;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
+  final bool selected;
+  final bool multiSelect;
 
   const _ServiceTile({
     required this.service,
     required this.availableBarbers,
     required this.onTap,
+    this.selected = false,
+    this.multiSelect = false,
   });
 
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: AppColors.surface,
+      color: selected ? AppColors.mint.withAlpha(110) : AppColors.surface,
       child: InkWell(
         onTap: onTap,
         child: Container(
@@ -886,6 +1237,15 @@ class _ServiceTile extends StatelessWidget {
                   fontWeight: FontWeight.w600,
                 ),
               ),
+              if (multiSelect) ...[
+                const SizedBox(width: 8),
+                Icon(
+                  selected
+                      ? Icons.check_circle_rounded
+                      : Icons.add_circle_outline_rounded,
+                  color: selected ? AppColors.primary : AppColors.muted,
+                ),
+              ],
             ],
           ),
         ),
@@ -895,63 +1255,10 @@ class _ServiceTile extends StatelessWidget {
 }
 
 String _compactTimeRange(Salon salon) {
+  if (salon.openTime.trim().isEmpty || salon.closeTime.trim().isEmpty) {
+    return 'Hours pending';
+  }
   String compact(String value) =>
       value.replaceAll(':00', '').replaceAll(' ', '');
   return '${compact(salon.openTime)}-${compact(salon.closeTime)}';
-}
-
-class _BarberCard extends StatelessWidget {
-  final Barber barber;
-  final VoidCallback onTap;
-
-  const _BarberCard({required this.barber, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 172,
-      child: GlassCard(
-        onTap: onTap,
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                CircleAvatar(
-                  radius: 22,
-                  backgroundColor: AppColors.mint,
-                  foregroundColor: AppColors.primary,
-                  child: Text(
-                    barber.name.characters.first,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                ),
-                const Spacer(),
-                const Icon(
-                  Icons.arrow_forward,
-                  color: AppColors.primary,
-                  size: 18,
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            Text(
-              barber.name,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 5),
-            Text(
-              barber.speciality,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }

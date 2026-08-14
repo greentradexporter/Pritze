@@ -29,6 +29,11 @@ class FirebaseBootstrap {
   static Future<FirebaseBootstrap> initialize() async {
     try {
       await Firebase.initializeApp();
+    } catch (error) {
+      return FirebaseBootstrap._(enabled: false, error: error);
+    }
+
+    try {
       await FirebaseAppCheck.instance.activate(
         providerAndroid: kReleaseMode
             ? const AndroidPlayIntegrityProvider()
@@ -37,17 +42,19 @@ class FirebaseBootstrap {
             ? const AppleAppAttestWithDeviceCheckFallbackProvider()
             : const AppleDebugProvider(),
       );
-      final auth = FirebaseAuth.instance;
-      return FirebaseBootstrap._(
-        enabled: true,
-        firestore: FirebaseFirestore.instance,
-        functions: FirebaseFunctions.instance,
-        auth: auth,
-        messaging: FirebaseMessaging.instance,
-        storage: FirebaseStorage.instance,
-      );
     } catch (error) {
-      return FirebaseBootstrap._(enabled: false, error: error);
+      if (kDebugMode) {
+        debugPrint('Firebase App Check activation failed: $error');
+      }
     }
+
+    return FirebaseBootstrap._(
+      enabled: true,
+      firestore: FirebaseFirestore.instance,
+      functions: FirebaseFunctions.instance,
+      auth: FirebaseAuth.instance,
+      messaging: FirebaseMessaging.instance,
+      storage: FirebaseStorage.instance,
+    );
   }
 }

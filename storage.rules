@@ -25,6 +25,22 @@ service firebase.storage {
       allow delete: if ownsSalon(salonId) || ownerSalonId(salonId);
     }
 
+    match /customers/{customerId}/profile/{photoName} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == customerId &&
+        request.resource.size < 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+      allow delete: if signedIn() && request.auth.uid == customerId;
+    }
+
+    match /customers/{customerId}/styles/{photoName} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == customerId &&
+        request.resource.size < 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+      allow delete: if signedIn() && request.auth.uid == customerId;
+    }
+
     match /{allPaths=**} {
       allow read, write: if false;
     }
