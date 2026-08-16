@@ -1250,7 +1250,9 @@ class _OwnerStaff extends StatelessWidget {
 }
 
 class _AddBarberSheet extends StatefulWidget {
-  const _AddBarberSheet();
+  final Barber? barber;
+
+  const _AddBarberSheet({this.barber});
 
   @override
   State<_AddBarberSheet> createState() => _AddBarberSheetState();
@@ -1258,16 +1260,36 @@ class _AddBarberSheet extends StatefulWidget {
 
 class _AddBarberSheetState extends State<_AddBarberSheet> {
   final _formKey = GlobalKey<FormState>();
-  final _nameController = TextEditingController();
-  final _phoneController = TextEditingController();
-  final _experienceController = TextEditingController(text: '2');
-  final _resumeController = TextEditingController();
+  late final TextEditingController _nameController;
+  late final TextEditingController _phoneController;
+  late final TextEditingController _experienceController;
+  late final TextEditingController _resumeController;
   final _serviceSearchController = TextEditingController();
   final Set<String> _selectedServices = {};
-  String _speciality = _barberSpecialities.first;
+  late String _speciality;
   String _serviceQuery = '';
   bool _servicesExpanded = false;
   bool _isSaving = false;
+
+  bool get _isEditing => widget.barber != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final barber = widget.barber;
+    _nameController = TextEditingController(text: barber?.name ?? '');
+    _phoneController = TextEditingController(text: barber?.phone ?? '');
+    _experienceController = TextEditingController(
+      text: '${barber?.experienceYears ?? 2}',
+    );
+    _resumeController = TextEditingController(
+      text: barber?.resumeSummary ?? '',
+    );
+    _speciality = barber?.speciality.trim().isNotEmpty == true
+        ? barber!.speciality.trim()
+        : _barberSpecialities.first;
+    _selectedServices.addAll(barber?.serviceIds ?? const <String>[]);
+  }
 
   @override
   void dispose() {
@@ -1321,7 +1343,7 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                 children: [
                   Expanded(
                     child: Text(
-                      'Add barber',
+                      _isEditing ? 'Edit barber' : 'Add barber',
                       style: Theme.of(context).textTheme.headlineSmall,
                     ),
                   ),
@@ -1337,12 +1359,14 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                 child: ListView(
                   children: [
                     TextFormField(
+                      key: const ValueKey('barber-name-field'),
                       controller: _nameController,
                       decoration: const InputDecoration(labelText: 'Name'),
                       validator: _required,
                     ),
                     const SizedBox(height: 10),
                     TextFormField(
+                      key: const ValueKey('barber-phone-field'),
                       controller: _phoneController,
                       keyboardType: TextInputType.phone,
                       decoration: const InputDecoration(
@@ -1358,7 +1382,10 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                         labelText: 'Speciality',
                       ),
                       items: [
-                        for (final item in _barberSpecialities)
+                        for (final item in {
+                          _speciality,
+                          ..._barberSpecialities,
+                        })
                           DropdownMenuItem(value: item, child: Text(item)),
                       ],
                       onChanged: (value) {
@@ -1381,6 +1408,7 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                     ),
                     const SizedBox(height: 10),
                     TextFormField(
+                      key: const ValueKey('barber-experience-field'),
                       controller: _experienceController,
                       keyboardType: TextInputType.number,
                       decoration: const InputDecoration(
@@ -1389,6 +1417,7 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                     ),
                     const SizedBox(height: 10),
                     TextFormField(
+                      key: const ValueKey('barber-resume-field'),
                       controller: _resumeController,
                       minLines: 2,
                       maxLines: 3,
@@ -1483,6 +1512,9 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
+                  key: ValueKey(
+                    _isEditing ? 'save-barber-changes' : 'add-barber-submit',
+                  ),
                   onPressed: _isSaving ? null : () => _save(appState),
                   icon: _isSaving
                       ? const SizedBox(
@@ -1490,8 +1522,20 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                           width: 18,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
-                      : const Icon(Icons.person_add_alt),
-                  label: Text(_isSaving ? 'Adding...' : 'Add barber'),
+                      : Icon(
+                          _isEditing
+                              ? Icons.save_outlined
+                              : Icons.person_add_alt,
+                        ),
+                  label: Text(
+                    _isSaving
+                        ? _isEditing
+                              ? 'Saving...'
+                              : 'Adding...'
+                        : _isEditing
+                        ? 'Save changes'
+                        : 'Add barber',
+                  ),
                 ),
               ),
             ],
@@ -1522,14 +1566,27 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
     }
     setState(() => _isSaving = true);
     try {
-      await appState.addOwnerBarber(
-        name: _nameController.text,
-        phone: _phoneController.text,
-        speciality: _speciality,
-        experienceYears: int.tryParse(_experienceController.text) ?? 1,
-        resumeSummary: _resumeController.text,
-        serviceIds: _selectedServices.toList(),
-      );
+      final barber = widget.barber;
+      if (barber == null) {
+        await appState.addOwnerBarber(
+          name: _nameController.text,
+          phone: _phoneController.text,
+          speciality: _speciality,
+          experienceYears: int.tryParse(_experienceController.text) ?? 1,
+          resumeSummary: _resumeController.text,
+          serviceIds: _selectedServices.toList(),
+        );
+      } else {
+        await appState.updateOwnerBarber(
+          barberId: barber.id,
+          name: _nameController.text,
+          phone: _phoneController.text,
+          speciality: _speciality,
+          experienceYears: int.tryParse(_experienceController.text) ?? 1,
+          resumeSummary: _resumeController.text,
+          serviceIds: _selectedServices.toList(),
+        );
+      }
       if (mounted) {
         Navigator.pop(context);
       }
@@ -1783,12 +1840,27 @@ class _StaffCard extends StatelessWidget {
             ),
           ),
           IconButton(
+            key: ValueKey('edit-barber-${barber.id}'),
+            onPressed: () => _showEditBarberDialog(context),
+            icon: const Icon(Icons.edit_outlined),
+            tooltip: 'Edit barber',
+          ),
+          IconButton(
             onPressed: () => _confirmRemove(context, barber),
             icon: const Icon(Icons.person_remove_outlined),
             tooltip: 'Remove barber',
           ),
         ],
       ),
+    );
+  }
+
+  void _showEditBarberDialog(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (context) => _AddBarberSheet(barber: barber),
     );
   }
 

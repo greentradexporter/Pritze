@@ -46,6 +46,23 @@ void main() {
   test('app update prompt compares platform build numbers', () {
     expect(shouldShowAppUpdate(installedBuild: 24, latestBuild: 25), isTrue);
     expect(shouldShowAppUpdate(installedBuild: 24, latestBuild: 24), isFalse);
+    expect(appUpdateRetryDelays, const [
+      Duration(seconds: 4),
+      Duration(seconds: 15),
+    ]);
+  });
+
+  test('app update prompt compares published iOS versions', () {
+    expect(isNewerAppVersion(installed: '1.0.15', available: '1.0.16'), isTrue);
+    expect(isNewerAppVersion(installed: '1.0.15', available: '1.1.0'), isTrue);
+    expect(
+      isNewerAppVersion(installed: '1.0.15', available: '1.0.15'),
+      isFalse,
+    );
+    expect(
+      isNewerAppVersion(installed: '1.0.15', available: '1.0.14'),
+      isFalse,
+    );
   });
 
   test('push permission policy handles iOS and Android first launch', () {
@@ -828,6 +845,54 @@ void main() {
     expect(find.text('Join requests'), findsNothing);
     expect(find.text('No pending requests right now.'), findsNothing);
     expect(find.text('Team members'), findsOneWidget);
+  });
+
+  testWidgets('owner can open and save an existing barber profile', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final serviceId = state.ownerSalon.services.single.id;
+    await state.addOwnerBarber(
+      name: 'Original barber',
+      phone: '9000000011',
+      speciality: 'Haircut specialist',
+      experienceYears: 2,
+      resumeSummary: 'Original profile.',
+      serviceIds: [serviceId],
+    );
+    final barber = state.barbersForSalon(state.ownerSalon.id).single;
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Team'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(ValueKey('edit-barber-${barber.id}')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Edit barber'), findsOneWidget);
+    final nameField = find.byKey(const ValueKey('barber-name-field'));
+    expect(
+      tester.widget<TextFormField>(nameField).controller?.text,
+      'Original barber',
+    );
+    await tester.enterText(nameField, 'Updated barber');
+    await tester.enterText(
+      find.byKey(const ValueKey('barber-experience-field')),
+      '6',
+    );
+    await tester.tap(find.byKey(const ValueKey('save-barber-changes')));
+    await tester.pumpAndSettle();
+
+    final updated = state.getBarber(barber.id)!;
+    expect(updated.name, 'Updated barber');
+    expect(updated.experienceYears, 6);
+    expect(updated.phone, '+919000000011');
+    expect(find.text('Updated barber'), findsWidgets);
   });
 
   testWidgets('iOS booking matches Android controls without overflow', (
@@ -2000,7 +2065,10 @@ void main() {
       ),
     );
 
-    expect(find.textContaining('Accept or reject this request'), findsOneWidget);
+    expect(
+      find.textContaining('Accept or reject this request'),
+      findsOneWidget,
+    );
     expect(find.textContaining('Expect customer by'), findsNothing);
     expect(find.textContaining('remaining'), findsNothing);
   });
@@ -2122,6 +2190,43 @@ void main() {
     expect(barber.serviceIds, contains(serviceId));
     expect(state.joinRequests, isEmpty);
   });
+
+  test(
+    'owner can edit barber details without changing barber identity',
+    () async {
+      final state = await _stateWithSalonService(signOut: false);
+      final serviceId = state.ownerSalon.services.first.id;
+      await state.addOwnerBarber(
+        name: 'Ravi',
+        phone: '9000000022',
+        speciality: 'Haircut specialist',
+        experienceYears: 2,
+        resumeSummary: 'Old details.',
+        serviceIds: [serviceId],
+      );
+      final original = state.barbersForSalon(state.ownerSalon.id).single;
+
+      await state.updateOwnerBarber(
+        barberId: original.id,
+        name: 'Ravi Kumar',
+        phone: '9000000033',
+        speciality: 'Fade specialist',
+        experienceYears: 7,
+        resumeSummary: 'Updated details.',
+        serviceIds: [serviceId],
+      );
+
+      final updated = state.getBarber(original.id)!;
+      expect(updated.id, original.id);
+      expect(updated.salonId, original.salonId);
+      expect(updated.name, 'Ravi Kumar');
+      expect(updated.phone, '+919000000033');
+      expect(updated.speciality, 'Fade specialist');
+      expect(updated.experienceYears, 7);
+      expect(updated.resumeSummary, 'Updated details.');
+      expect(updated.serviceIds, [serviceId]);
+    },
+  );
 
   test('adding more than three barbers never overwrites staff', () async {
     final state = await _stateWithSalonService(signOut: false);
@@ -2269,8 +2374,8 @@ void main() {
         ownerName: 'Owner',
         address: 'Main Road',
         phone: '9555555555',
-        openTime: '9:00 AM',
-        closeTime: '8:00 PM',
+        openTime: '12:00 AM',
+        closeTime: '11:59 PM',
       );
       await state.addOwnerService(
         name: 'Keratin treatment',
@@ -3735,6 +3840,15 @@ void main() {
     'salon open badge follows operating hours, not only owner switch',
     () async {
       final state = await _stateWithSalonService(signOut: false);
+      await state.updateOwnerSalon(
+        name: state.ownerSalon.name,
+        ownerName: state.ownerSalon.ownerName,
+        address: state.ownerSalon.address,
+        directionsUrl: state.ownerSalon.directionsUrl,
+        phone: state.ownerSalon.phone,
+        openTime: '9:00 AM',
+        closeTime: '8:00 PM',
+      );
       await state.addOwnerBarber(
         name: 'Aman',
         phone: '9876543210',
@@ -3790,8 +3904,8 @@ Future<AppState> _stateWithSalonService({
     address: 'Nashik Road',
     directionsUrl: 'https://maps.app.goo.gl/example',
     phone: '9888888888',
-    openTime: '9:00 AM',
-    closeTime: '8:00 PM',
+    openTime: '12:00 AM',
+    closeTime: '11:59 PM',
   );
   expect(state.ownerSalon.directionsUrl, 'https://maps.app.goo.gl/example');
   await state.addOwnerService(

@@ -61,10 +61,16 @@ const OWNER_BOOKING_REQUEST_SOUND = "owner_booking_request";
 const IOS_OWNER_BOOKING_REQUEST_CATEGORY = "PRITZE_BOOKING_REQUEST_V2";
 const OWNER_ALERT_REPEAT_DELAY_MS = 25_000;
 const OWNER_ALERT_ATTEMPTS = 4;
-const ANDROID_CURRENT_VERSION_CODE = 25;
+const ANDROID_CURRENT_VERSION_CODE = 29;
 const ANDROID_PLAY_STORE_URL =
   "https://play.google.com/store/apps/details?id=com.trimtime.app";
-const IOS_CURRENT_BUILD_NUMBER = 14;
+// Keep this aligned with the newest build that is publicly downloadable.
+// Do not advance it merely because a newer build was uploaded for review.
+const IOS_CURRENT_BUILD_NUMBER = 28;
+const IOS_NEXT_VERSION = "1.0.16";
+const IOS_NEXT_BUILD_NUMBER = 29;
+const IOS_APP_STORE_LOOKUP_URL =
+  "https://itunes.apple.com/lookup?id=6792811282&country=in";
 const IOS_APP_STORE_URL =
   "https://apps.apple.com/in/app/pritze/id6792811282";
 
@@ -89,10 +95,30 @@ exports.getIosAppUpdate = onCall({invoker: "public"}, async () => {
     .doc("ios")
     .get();
   const configured = snapshot.data() || {};
-  const latestBuildNumber = positiveInteger(
+  const configuredBuildNumber = positiveInteger(
     configured.latestBuildNumber || configured.latestVersionCode,
     IOS_CURRENT_BUILD_NUMBER,
   );
+  let publicBuildNumber = IOS_CURRENT_BUILD_NUMBER;
+  try {
+    const response = await fetch(IOS_APP_STORE_LOOKUP_URL, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (response.ok) {
+      const payload = await response.json();
+      const publicVersion = String(payload?.results?.[0]?.version || "");
+      if (versionAtLeast(publicVersion, IOS_NEXT_VERSION)) {
+        publicBuildNumber = IOS_NEXT_BUILD_NUMBER;
+      }
+    }
+  } catch (error) {
+    console.warn("App Store version lookup failed", {
+      message: error?.message || String(error),
+    });
+  }
+  const latestBuildNumber = publicBuildNumber >= IOS_NEXT_BUILD_NUMBER ?
+    Math.max(configuredBuildNumber, publicBuildNumber) :
+    Math.min(configuredBuildNumber, IOS_CURRENT_BUILD_NUMBER);
   const appStoreUrl = String(configured.appStoreUrl || "").trim() ||
     IOS_APP_STORE_URL;
   return {latestBuildNumber, appStoreUrl};
@@ -1683,6 +1709,24 @@ function requireStoredRole(user, expectedRole) {
 function positiveInteger(value, fallback) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function versionAtLeast(value, minimum) {
+  const parts = (version) => String(version || "")
+    .split(/[+-]/, 1)[0]
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0);
+  const actual = parts(value);
+  const required = parts(minimum);
+  const length = Math.max(actual.length, required.length);
+  for (let index = 0; index < length; index++) {
+    const actualPart = actual[index] || 0;
+    const requiredPart = required[index] || 0;
+    if (actualPart !== requiredPart) {
+      return actualPart > requiredPart;
+    }
+  }
+  return true;
 }
 
 function normalizedOptionalString(value) {

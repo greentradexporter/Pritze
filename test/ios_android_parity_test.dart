@@ -38,6 +38,8 @@ void main() {
     expect(updatePrompt, contains("'getIosAppUpdate'"));
     expect(updatePrompt, contains("'getAndroidAppUpdate'"));
     expect(updatePrompt, contains("_iosAppId = '6792811282'"));
+    expect(updatePrompt, contains("Uri.https('itunes.apple.com', '/lookup'"));
+    expect(updatePrompt, contains("'trackViewUrl'"));
   });
 
   test('iOS owner notifications expose the Android booking decisions', () {

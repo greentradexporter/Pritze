@@ -2362,6 +2362,63 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> updateOwnerBarber({
+    required String barberId,
+    required String name,
+    String phone = '',
+    required String speciality,
+    required int experienceYears,
+    required String resumeSummary,
+    required List<String> serviceIds,
+  }) async {
+    final index = _barbers.indexWhere(
+      (barber) =>
+          barber.id == barberId &&
+          barber.salonId == ownerSalonId &&
+          barber.isActive,
+    );
+    if (index == -1) {
+      throw StateError('This barber is not part of your active salon team.');
+    }
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) {
+      throw StateError('Barber name is required.');
+    }
+    final normalizedPhone = normalizePhone(phone);
+    if (_barbers.any(
+      (barber) =>
+          barber.id != barberId &&
+          barber.isActive &&
+          normalizedPhone.isNotEmpty &&
+          barber.phone == normalizedPhone,
+    )) {
+      throw StateError('A barber with this phone number already exists.');
+    }
+    final availableServiceIds = ownerSalon.services
+        .map((service) => service.id)
+        .toSet();
+    final assignedServiceIds = serviceIds.isEmpty
+        ? availableServiceIds.toList()
+        : serviceIds
+              .where(availableServiceIds.contains)
+              .toSet()
+              .toList(growable: false);
+    final existing = _barbers[index];
+    _barbers[index] = existing.copyWith(
+      name: trimmedName,
+      phone: normalizedPhone,
+      speciality: speciality.trim().isEmpty
+          ? 'Grooming expert'
+          : speciality.trim(),
+      experienceYears: experienceYears < 0 ? 0 : experienceYears,
+      resumeSummary: resumeSummary.trim().isEmpty
+          ? 'Customer-first grooming professional.'
+          : resumeSummary.trim(),
+      serviceIds: assignedServiceIds,
+    );
+    notifyListeners();
+  }
+
   Future<void> submitJoinRequest({
     required String salonId,
     required String barberName,
@@ -4677,6 +4734,33 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       );
       if (_barbers.length > before) {
         await _setBarber(_barbers.last);
+      }
+    });
+  }
+
+  @override
+  Future<void> updateOwnerBarber({
+    required String barberId,
+    required String name,
+    String phone = '',
+    required String speciality,
+    required int experienceYears,
+    required String resumeSummary,
+    required List<String> serviceIds,
+  }) async {
+    await _runFirebaseSave(() async {
+      await super.updateOwnerBarber(
+        barberId: barberId,
+        name: name,
+        phone: phone,
+        speciality: speciality,
+        experienceYears: experienceYears,
+        resumeSummary: resumeSummary,
+        serviceIds: serviceIds,
+      );
+      final barber = _barbers.where((item) => item.id == barberId).firstOrNull;
+      if (barber != null) {
+        await _setBarber(barber);
       }
     });
   }

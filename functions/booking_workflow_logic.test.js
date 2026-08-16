@@ -202,7 +202,7 @@ test("Android update lookup has a safe current-build fallback", () => {
     "utf8",
   );
   assert.match(functionSource, /exports\.getAndroidAppUpdate = onCall/);
-  assert.match(functionSource, /ANDROID_CURRENT_VERSION_CODE = 25/);
+  assert.match(functionSource, /ANDROID_CURRENT_VERSION_CODE = 29/);
   assert.match(functionSource, /collection\("appConfig"\)/);
   assert.match(functionSource, /details\?id=com\.trimtime\.app/);
 });
@@ -213,7 +213,11 @@ test("iOS update lookup has a safe App Store fallback", () => {
     "utf8",
   );
   assert.match(functionSource, /exports\.getIosAppUpdate = onCall/);
-  assert.match(functionSource, /IOS_CURRENT_BUILD_NUMBER = 14/);
+  assert.match(functionSource, /IOS_CURRENT_BUILD_NUMBER = 28/);
+  assert.match(functionSource, /IOS_NEXT_VERSION = "1\.0\.16"/);
+  assert.match(functionSource, /IOS_NEXT_BUILD_NUMBER = 29/);
+  assert.match(functionSource, /itunes\.apple\.com\/lookup/);
+  assert.match(functionSource, /versionAtLeast\(publicVersion, IOS_NEXT_VERSION\)/);
   assert.match(functionSource, /doc\("ios"\)/);
   assert.match(functionSource, /apps\.apple\.com\/in\/app\/pritze\/id6792811282/);
 });
