@@ -5,10 +5,18 @@ import '../state/app_state.dart';
 import '../state/app_state_scope.dart';
 import '../theme/app_theme.dart';
 import '../utils/url_launcher_utils.dart';
+import '../screens/referrals/referral_screen.dart';
 import 'app_ui.dart';
 import 'status_chip.dart';
 
-enum _AccountAction { notifications, support, logout }
+enum _AccountAction {
+  notifications,
+  revenueDetails,
+  promotionalCredits,
+  referrals,
+  support,
+  logout,
+}
 
 typedef NotificationOpenCallback =
     void Function(AppNotificationDestination destination, {String? bookingId});
@@ -67,6 +75,8 @@ class AccountOverflowMenu extends StatelessWidget {
   final bool canLogout;
   final Future<void> Function()? onLoggedOut;
   final NotificationOpenCallback? onNotificationOpened;
+  final Future<void> Function()? onRevenueDetailsOpened;
+  final Future<void> Function()? onPromotionalCreditsOpened;
 
   const AccountOverflowMenu({
     super.key,
@@ -74,6 +84,8 @@ class AccountOverflowMenu extends StatelessWidget {
     required this.canLogout,
     this.onLoggedOut,
     this.onNotificationOpened,
+    this.onRevenueDetailsOpened,
+    this.onPromotionalCreditsOpened,
   });
 
   @override
@@ -115,6 +127,14 @@ class AccountOverflowMenu extends StatelessWidget {
               role,
               onNotificationOpened: onNotificationOpened,
             );
+          case _AccountAction.revenueDetails:
+            await onRevenueDetailsOpened?.call();
+          case _AccountAction.promotionalCredits:
+            await onPromotionalCreditsOpened?.call();
+          case _AccountAction.referrals:
+            await Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => ReferralScreen(role: role)),
+            );
           case _AccountAction.support:
             await showSupportSheet(context);
           case _AccountAction.logout:
@@ -155,6 +175,33 @@ class AccountOverflowMenu extends StatelessWidget {
             title: Text('Notifications'),
           ),
         ),
+        if (role == UserRole.owner && onRevenueDetailsOpened != null)
+          const PopupMenuItem(
+            value: _AccountAction.revenueDetails,
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.query_stats_outlined),
+              title: Text('Revenue details'),
+            ),
+          ),
+        if (role == UserRole.owner && onPromotionalCreditsOpened != null)
+          const PopupMenuItem(
+            value: _AccountAction.promotionalCredits,
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.toll_outlined),
+              title: Text('Promotional credits'),
+            ),
+          ),
+        if (role == UserRole.owner)
+          const PopupMenuItem(
+            value: _AccountAction.referrals,
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.redeem_outlined),
+              title: Text('Refer and invite'),
+            ),
+          ),
         const PopupMenuItem(
           value: _AccountAction.support,
           child: ListTile(

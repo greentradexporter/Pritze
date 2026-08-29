@@ -522,6 +522,17 @@ class _SalonCard extends StatelessWidget {
                                   fontWeight: FontWeight.w600,
                                 ),
                           ),
+                          if (appState.hasActiveCustomerSession &&
+                              matchedServices.isNotEmpty) ...[
+                            const SizedBox(height: 5),
+                            _PersonalDiscountPreview(
+                              salonId: salon.id,
+                              serviceIds: matchedServices
+                                  .take(6)
+                                  .map((service) => service.id)
+                                  .toList(growable: false),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -585,6 +596,68 @@ class _SalonCard extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _PersonalDiscountPreview extends StatefulWidget {
+  final String salonId;
+  final List<String> serviceIds;
+
+  const _PersonalDiscountPreview({
+    required this.salonId,
+    required this.serviceIds,
+  });
+
+  @override
+  State<_PersonalDiscountPreview> createState() =>
+      _PersonalDiscountPreviewState();
+}
+
+class _PersonalDiscountPreviewState extends State<_PersonalDiscountPreview> {
+  Future<List<CheckoutDiscountOffer>>? _future;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _future ??= AppStateScope.read(context).listCheckoutDiscountOffers(
+      salonId: widget.salonId,
+      serviceIds: widget.serviceIds,
+      prefetchOnly: true,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<CheckoutDiscountOffer>>(
+      future: _future,
+      builder: (context, snapshot) {
+        final offer = snapshot.data?.firstOrNull;
+        if (offer == null || !offer.hasSaving) {
+          return const SizedBox.shrink();
+        }
+        return Row(
+          children: [
+            const Icon(
+              Icons.local_offer_rounded,
+              color: AppColors.success,
+              size: 15,
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                'Offers available: save up to ₹${offer.discountAmount}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: AppColors.success,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -826,12 +899,7 @@ class _SalonRating extends StatelessWidget {
 }
 
 String _compactTimeRange(Salon salon) {
-  if (salon.openTime.trim().isEmpty || salon.closeTime.trim().isEmpty) {
-    return 'Hours pending';
-  }
-  String compact(String value) =>
-      value.replaceAll(':00', '').replaceAll(' ', '');
-  return '${compact(salon.openTime)}-${compact(salon.closeTime)}';
+  return formatSalonHoursRange(salon);
 }
 
 class _ServiceCategory {

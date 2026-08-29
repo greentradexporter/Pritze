@@ -7,6 +7,24 @@ enum BookingStatus {
   rejected,
 }
 
+enum CustomerArrivalStatus {
+  notStarted,
+  leavingNow,
+  onTheWay,
+  runningLate,
+  arrived,
+}
+
+extension CustomerArrivalStatusLabel on CustomerArrivalStatus {
+  String get label => switch (this) {
+    CustomerArrivalStatus.notStarted => 'Not started',
+    CustomerArrivalStatus.leavingNow => 'Leaving now',
+    CustomerArrivalStatus.onTheWay => 'On the way',
+    CustomerArrivalStatus.runningLate => 'Running late',
+    CustomerArrivalStatus.arrived => 'Arrived',
+  };
+}
+
 enum BarberBookingBucket { upcoming, active, history, cancelled }
 
 enum SalonBookingBucket { requests, upcoming, active, history, cancelled }
@@ -77,6 +95,244 @@ extension UserRoleLabel on UserRole {
 }
 
 enum LoginProvider { email, google, phone }
+
+class ReferralCodes {
+  final String customerInviteCode;
+  final String salonInviteCode;
+
+  const ReferralCodes({
+    required this.customerInviteCode,
+    this.salonInviteCode = '',
+  });
+}
+
+class ReferralSummary {
+  final int pendingCustomerCount;
+  final int qualifiedCustomerCount;
+  final int pendingSalonCount;
+  final int qualifiedSalonCount;
+  final int customerInviterRewardProin;
+  final int customerReferredRewardProin;
+  final int salonInviterRewardProin;
+  final int salonReferredRewardProin;
+  final int earnedCustomerReferralProin;
+  final int earnedSalonReferralProin;
+  final int earnedReferralProin;
+
+  const ReferralSummary({
+    this.pendingCustomerCount = 0,
+    this.qualifiedCustomerCount = 0,
+    this.pendingSalonCount = 0,
+    this.qualifiedSalonCount = 0,
+    this.customerInviterRewardProin = 0,
+    this.customerReferredRewardProin = 0,
+    this.salonInviterRewardProin = 0,
+    this.salonReferredRewardProin = 0,
+    this.earnedCustomerReferralProin = 0,
+    this.earnedSalonReferralProin = 0,
+    this.earnedReferralProin = 0,
+  });
+}
+
+class DiscountQuote {
+  final String quoteId;
+  final String campaignId;
+  final String campaignName;
+  final String discountType;
+  final double discountPercent;
+  final int fixedDiscountAmount;
+  final bool voucherApplied;
+  final String voucherMaskedCode;
+  final int originalAmount;
+  final int discountBaseAmount;
+  final int discountAmount;
+  final int customerPayableAmount;
+  final int pritzePayoutAmount;
+  final int salonTotalEarning;
+  final DateTime? expiresAt;
+  final DateTime? campaignEndsAt;
+
+  const DiscountQuote({
+    this.quoteId = '',
+    this.campaignId = '',
+    this.campaignName = '',
+    this.discountType = 'percent',
+    this.discountPercent = 0,
+    this.fixedDiscountAmount = 0,
+    this.voucherApplied = false,
+    this.voucherMaskedCode = '',
+    required this.originalAmount,
+    this.discountBaseAmount = 0,
+    this.discountAmount = 0,
+    int? customerPayableAmount,
+    this.pritzePayoutAmount = 0,
+    int? salonTotalEarning,
+    this.expiresAt,
+    this.campaignEndsAt,
+  }) : customerPayableAmount = customerPayableAmount ?? originalAmount,
+       salonTotalEarning = salonTotalEarning ?? originalAmount;
+
+  bool get hasDiscount => discountAmount > 0 && campaignId.isNotEmpty;
+}
+
+class CheckoutCouponResult {
+  final String benefitType;
+  final String message;
+  final int amountProin;
+  final bool alreadyClaimed;
+  final DiscountQuote? discountQuote;
+
+  const CheckoutCouponResult({
+    required this.benefitType,
+    required this.message,
+    this.amountProin = 0,
+    this.alreadyClaimed = false,
+    this.discountQuote,
+  });
+
+  bool get grantsProin => benefitType == 'proin';
+  bool get appliesDiscount => discountQuote?.hasDiscount == true;
+}
+
+class CheckoutDiscountOffer {
+  final String campaignId;
+  final String campaignName;
+  final String discountType;
+  final double discountPercent;
+  final int fixedDiscountAmount;
+  final String voucherMaskedCode;
+  final int originalAmount;
+  final int discountAmount;
+  final int customerPayableAmount;
+  final DateTime? campaignEndsAt;
+
+  const CheckoutDiscountOffer({
+    required this.campaignId,
+    required this.campaignName,
+    required this.discountType,
+    required this.discountPercent,
+    required this.fixedDiscountAmount,
+    required this.voucherMaskedCode,
+    required this.originalAmount,
+    required this.discountAmount,
+    required this.customerPayableAmount,
+    this.campaignEndsAt,
+  });
+
+  bool get hasSaving => discountAmount > 0 && campaignId.isNotEmpty;
+
+  String get offerLabel {
+    if (discountType == 'fixed') return '₹$fixedDiscountAmount off';
+    final percent = discountPercent % 1 == 0
+        ? discountPercent.toInt().toString()
+        : discountPercent.toStringAsFixed(2);
+    return '$percent% off';
+  }
+}
+
+class ProinWalletSummary {
+  final int availableProin;
+  final int reservedProin;
+  final int creditLimitProin;
+  final int spendableProin;
+  final int lifetimeGrantedProin;
+  final int lifetimeRedeemedProin;
+  final int lifetimeExpiredProin;
+  final DateTime? nextExpiryAt;
+  final List<ProinExpiringLot> expiringLots;
+
+  const ProinWalletSummary({
+    this.availableProin = 0,
+    this.reservedProin = 0,
+    this.creditLimitProin = 0,
+    this.spendableProin = 0,
+    this.lifetimeGrantedProin = 0,
+    this.lifetimeRedeemedProin = 0,
+    this.lifetimeExpiredProin = 0,
+    this.nextExpiryAt,
+    this.expiringLots = const [],
+  });
+
+  int get effectiveSpendableProin {
+    if (spendableProin > 0) return spendableProin;
+    final computed = availableProin + creditLimitProin;
+    return computed < 0 ? 0 : computed;
+  }
+
+  bool get hasCreditLine => creditLimitProin > 0;
+
+  bool get isUsingCreditLine => availableProin < 0;
+
+  int get creditLineUsedProin => isUsingCreditLine ? -availableProin : 0;
+}
+
+class ProinExpiringLot {
+  final String lotId;
+  final int amountProin;
+  final DateTime expiresAt;
+  final String sourceType;
+
+  const ProinExpiringLot({
+    this.lotId = '',
+    required this.amountProin,
+    required this.expiresAt,
+    this.sourceType = '',
+  });
+}
+
+class ProinBookingQuote {
+  final int availableProin;
+  final int maximumRedeemableProin;
+  final int payableBeforeProin;
+  final int customerPayableAmount;
+
+  const ProinBookingQuote({
+    this.availableProin = 0,
+    this.maximumRedeemableProin = 0,
+    required this.payableBeforeProin,
+    required this.customerPayableAmount,
+  });
+
+  bool get canUseProin => maximumRedeemableProin > 0;
+}
+
+class ProinCouponClaimResult {
+  final int amountProin;
+  final int availableProin;
+  final DateTime? expiresAt;
+  final bool alreadyClaimed;
+
+  const ProinCouponClaimResult({
+    required this.amountProin,
+    required this.availableProin,
+    this.expiresAt,
+    this.alreadyClaimed = false,
+  });
+}
+
+class ProinActivityEntry {
+  final String transactionId;
+  final String type;
+  final String direction;
+  final int amountProin;
+  final int restoredProin;
+  final int expiredProin;
+  final String sourceType;
+  final String bookingId;
+  final DateTime createdAt;
+
+  const ProinActivityEntry({
+    required this.transactionId,
+    required this.type,
+    required this.direction,
+    required this.amountProin,
+    this.restoredProin = 0,
+    this.expiredProin = 0,
+    this.sourceType = '',
+    this.bookingId = '',
+    required this.createdAt,
+  });
+}
 
 extension LoginProviderLabel on LoginProvider {
   String get label {
@@ -195,6 +451,7 @@ class SalonService {
   final int durationMinutes;
   final bool isAvailable;
   final bool instantBookingEnabled;
+  final bool isCustom;
 
   const SalonService({
     required this.id,
@@ -204,6 +461,7 @@ class SalonService {
     required this.durationMinutes,
     this.isAvailable = true,
     this.instantBookingEnabled = true,
+    this.isCustom = false,
   });
 
   SalonService copyWith({
@@ -214,6 +472,7 @@ class SalonService {
     int? durationMinutes,
     bool? isAvailable,
     bool? instantBookingEnabled,
+    bool? isCustom,
   }) {
     return SalonService(
       id: id ?? this.id,
@@ -224,6 +483,7 @@ class SalonService {
       isAvailable: isAvailable ?? this.isAvailable,
       instantBookingEnabled:
           instantBookingEnabled ?? this.instantBookingEnabled,
+      isCustom: isCustom ?? this.isCustom,
     );
   }
 }
@@ -414,9 +674,27 @@ class Booking {
   final int durationMinutes;
   final String serviceName;
   final int servicePrice;
+  final Map<String, int> servicePriceBreakdown;
   final int bookingFee;
   final bool paymentRequired;
   final String paymentStatus;
+  final String discountCampaignId;
+  final String discountCampaignName;
+  final double discountPercent;
+  final int discountBaseAmount;
+  final int discountAmount;
+  final int customerPayableBeforeProin;
+  final int customerPayableAmount;
+  final int pritzePayoutAmount;
+  final int salonTotalEarning;
+  final String discountStatus;
+  final String proinStatus;
+  final int proinRequestedAmount;
+  final int proinReservedAmount;
+  final int proinRedeemedAmount;
+  final int proinReleasedAmount;
+  final int proinExpiredOnReleaseAmount;
+  final String proinReimbursementStatus;
   final BookingStatus status;
   final DateTime createdAt;
   final bool isInstant;
@@ -430,6 +708,10 @@ class Booking {
   final int arrivalMinutes;
   final String cancellationReason;
   final String cancelledBy;
+  final CustomerArrivalStatus arrivalStatus;
+  final DateTime? arrivalStatusUpdatedAt;
+  final bool arrivalSharingActive;
+  final DateTime? arrivalSharingExpiresAt;
 
   const Booking({
     required this.id,
@@ -444,9 +726,27 @@ class Booking {
     this.durationMinutes = 30,
     this.serviceName = '',
     this.servicePrice = 0,
+    this.servicePriceBreakdown = const {},
     this.bookingFee = 0,
     this.paymentRequired = false,
     this.paymentStatus = 'not_required',
+    this.discountCampaignId = '',
+    this.discountCampaignName = '',
+    this.discountPercent = 0,
+    this.discountBaseAmount = 0,
+    this.discountAmount = 0,
+    int? customerPayableBeforeProin,
+    int? customerPayableAmount,
+    this.pritzePayoutAmount = 0,
+    int? salonTotalEarning,
+    this.discountStatus = 'none',
+    this.proinStatus = 'none',
+    this.proinRequestedAmount = 0,
+    this.proinReservedAmount = 0,
+    this.proinRedeemedAmount = 0,
+    this.proinReleasedAmount = 0,
+    this.proinExpiredOnReleaseAmount = 0,
+    this.proinReimbursementStatus = 'none',
     required this.status,
     required this.createdAt,
     this.isInstant = false,
@@ -460,7 +760,26 @@ class Booking {
     this.arrivalMinutes = 0,
     this.cancellationReason = '',
     this.cancelledBy = '',
-  });
+    this.arrivalStatus = CustomerArrivalStatus.notStarted,
+    this.arrivalStatusUpdatedAt,
+    this.arrivalSharingActive = false,
+    this.arrivalSharingExpiresAt,
+  }) : customerPayableBeforeProin =
+           customerPayableBeforeProin ?? customerPayableAmount ?? servicePrice,
+       customerPayableAmount = customerPayableAmount ?? servicePrice,
+       salonTotalEarning = salonTotalEarning ?? servicePrice;
+
+  bool get hasDiscount => discountAmount > 0 && discountCampaignId.isNotEmpty;
+
+  bool get hasProin =>
+      proinRequestedAmount > 0 ||
+      proinReservedAmount > 0 ||
+      proinRedeemedAmount > 0;
+
+  int get proinAppliedAmount =>
+      proinRedeemedAmount > 0 ? proinRedeemedAmount : proinReservedAmount;
+
+  int get totalPritzeContribution => pritzePayoutAmount + proinAppliedAmount;
 
   int get customerArrivalMinutes {
     if (arrivalMinutes > 0) {
@@ -509,9 +828,27 @@ class Booking {
     int? durationMinutes,
     String? serviceName,
     int? servicePrice,
+    Map<String, int>? servicePriceBreakdown,
     int? bookingFee,
     bool? paymentRequired,
     String? paymentStatus,
+    String? discountCampaignId,
+    String? discountCampaignName,
+    double? discountPercent,
+    int? discountBaseAmount,
+    int? discountAmount,
+    int? customerPayableBeforeProin,
+    int? customerPayableAmount,
+    int? pritzePayoutAmount,
+    int? salonTotalEarning,
+    String? discountStatus,
+    String? proinStatus,
+    int? proinRequestedAmount,
+    int? proinReservedAmount,
+    int? proinRedeemedAmount,
+    int? proinReleasedAmount,
+    int? proinExpiredOnReleaseAmount,
+    String? proinReimbursementStatus,
     BookingStatus? status,
     DateTime? createdAt,
     bool? isInstant,
@@ -525,6 +862,10 @@ class Booking {
     int? arrivalMinutes,
     String? cancellationReason,
     String? cancelledBy,
+    CustomerArrivalStatus? arrivalStatus,
+    DateTime? arrivalStatusUpdatedAt,
+    bool? arrivalSharingActive,
+    DateTime? arrivalSharingExpiresAt,
   }) {
     return Booking(
       id: id ?? this.id,
@@ -539,9 +880,32 @@ class Booking {
       durationMinutes: durationMinutes ?? this.durationMinutes,
       serviceName: serviceName ?? this.serviceName,
       servicePrice: servicePrice ?? this.servicePrice,
+      servicePriceBreakdown:
+          servicePriceBreakdown ?? this.servicePriceBreakdown,
       bookingFee: bookingFee ?? this.bookingFee,
       paymentRequired: paymentRequired ?? this.paymentRequired,
       paymentStatus: paymentStatus ?? this.paymentStatus,
+      discountCampaignId: discountCampaignId ?? this.discountCampaignId,
+      discountCampaignName: discountCampaignName ?? this.discountCampaignName,
+      discountPercent: discountPercent ?? this.discountPercent,
+      discountBaseAmount: discountBaseAmount ?? this.discountBaseAmount,
+      discountAmount: discountAmount ?? this.discountAmount,
+      customerPayableBeforeProin:
+          customerPayableBeforeProin ?? this.customerPayableBeforeProin,
+      customerPayableAmount:
+          customerPayableAmount ?? this.customerPayableAmount,
+      pritzePayoutAmount: pritzePayoutAmount ?? this.pritzePayoutAmount,
+      salonTotalEarning: salonTotalEarning ?? this.salonTotalEarning,
+      discountStatus: discountStatus ?? this.discountStatus,
+      proinStatus: proinStatus ?? this.proinStatus,
+      proinRequestedAmount: proinRequestedAmount ?? this.proinRequestedAmount,
+      proinReservedAmount: proinReservedAmount ?? this.proinReservedAmount,
+      proinRedeemedAmount: proinRedeemedAmount ?? this.proinRedeemedAmount,
+      proinReleasedAmount: proinReleasedAmount ?? this.proinReleasedAmount,
+      proinExpiredOnReleaseAmount:
+          proinExpiredOnReleaseAmount ?? this.proinExpiredOnReleaseAmount,
+      proinReimbursementStatus:
+          proinReimbursementStatus ?? this.proinReimbursementStatus,
       status: status ?? this.status,
       createdAt: createdAt ?? this.createdAt,
       isInstant: isInstant ?? this.isInstant,
@@ -557,6 +921,12 @@ class Booking {
       arrivalMinutes: arrivalMinutes ?? this.arrivalMinutes,
       cancellationReason: cancellationReason ?? this.cancellationReason,
       cancelledBy: cancelledBy ?? this.cancelledBy,
+      arrivalStatus: arrivalStatus ?? this.arrivalStatus,
+      arrivalStatusUpdatedAt:
+          arrivalStatusUpdatedAt ?? this.arrivalStatusUpdatedAt,
+      arrivalSharingActive: arrivalSharingActive ?? this.arrivalSharingActive,
+      arrivalSharingExpiresAt:
+          arrivalSharingExpiresAt ?? this.arrivalSharingExpiresAt,
     );
   }
 }

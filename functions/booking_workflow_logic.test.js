@@ -4,17 +4,35 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  INSTANT_RESPONSE_TIMEOUT_MS,
   SALON_ARRIVAL_GRACE_MS,
+  SERVICE_AUTO_COMPLETE_GRACE_MS,
   bookingArrivalReminderDue,
   bookingTransitionError,
   canRescheduleBooking,
   isBlockingBooking,
   isWithinSalonHours,
   parseClockMinutes,
+  serviceAutoCompleteAtMillis,
+  shouldAutoCompleteService,
   slotSegmentMillis,
 } = require("./booking_workflow_logic");
 
 const start = Date.parse("2026-08-02T10:00:00.000Z");
+
+test("instant requests have a strict 150-second response window", () => {
+  assert.equal(INSTANT_RESPONSE_TIMEOUT_MS, 150 * 1000);
+  const functionSource = fs.readFileSync(
+    path.join(__dirname, "index.js"),
+    "utf8",
+  );
+  assert.match(functionSource, /OWNER_ALERT_ATTEMPTS = 6/);
+  assert.match(functionSource, /expirePendingInstantBooking/);
+  assert.match(functionSource, /No response from salon within 150 seconds/);
+  assert.match(functionSource, /Oops, looks like the salon is busy/);
+  assert.match(functionSource, /see other nearby salons/);
+  assert.match(functionSource, /resolvedStatus: "cancelled"/);
+});
 
 test("scheduled bookings are registered confirmed and never accepted", () => {
   const booking = {
@@ -79,6 +97,33 @@ test("only instant requests support owner accept or reject", () => {
   );
 });
 
+test("platform administrators follow the salon booking transition rules", () => {
+  const instant = {
+    status: "pending",
+    isInstant: true,
+    start,
+    durationMinutes: 30,
+  };
+  assert.equal(bookingTransitionError({
+    booking: instant,
+    actorRole: "admin",
+    nextStatus: "confirmed",
+    nowMillis: start,
+  }), null);
+  assert.equal(bookingTransitionError({
+    booking: {...instant, status: "confirmed"},
+    actorRole: "admin",
+    nextStatus: "inProgress",
+    nowMillis: start,
+  }), null);
+  assert.match(bookingTransitionError({
+    booking: {...instant, status: "completed"},
+    actorRole: "admin",
+    nextStatus: "cancelled",
+    nowMillis: start,
+  }), /cannot be changed/);
+});
+
 test("rescheduling closes exactly two hours before scheduled start", () => {
   const booking = {status: "confirmed", isInstant: false, start};
   assert.equal(canRescheduleBooking(booking, start - 2 * 60 * 60 * 1000 - 1), true);
@@ -133,6 +178,31 @@ test("active markers stop blocking after a confirmed booking has ended", () => {
   assert.equal(isBlockingBooking({...booking, status: "pending", isInstant: true}, start + 99_000_000), true);
 });
 
+test("started services auto-complete after duration plus five minutes", () => {
+  const booking = {
+    status: "inProgress",
+    startedAt: start,
+    durationMinutes: 30,
+  };
+  const deadline = start + 30 * 60 * 1000 + 5 * 60 * 1000;
+  assert.equal(SERVICE_AUTO_COMPLETE_GRACE_MS, 5 * 60 * 1000);
+  assert.equal(serviceAutoCompleteAtMillis(booking), deadline);
+  assert.equal(shouldAutoCompleteService(booking, deadline - 1), false);
+  assert.equal(shouldAutoCompleteService(booking, deadline), true);
+  assert.equal(shouldAutoCompleteService({
+    ...booking,
+    status: "completed",
+  }, deadline), false);
+
+  const functionSource = fs.readFileSync(
+    path.join(__dirname, "index.js"),
+    "utf8",
+  );
+  assert.match(functionSource, /exports\.completeOverdueServices = onSchedule/);
+  assert.match(functionSource, /\{systemActor: true\}/);
+  assert.match(functionSource, /completionSource = systemActor/);
+});
+
 test("clock parsing, salon hours, and five-minute locks are deterministic", () => {
   assert.equal(parseClockMinutes("9:30 AM"), 570);
   assert.equal(parseClockMinutes("18:15"), 1095);
@@ -157,6 +227,10 @@ test("booking writes are server-only and all authoritative callables exist", () 
     "utf8",
   );
   for (const callable of [
+    "getDiscountQuote",
+    "listCheckoutDiscountOffers",
+    "applyCheckoutCoupon",
+    "applyVisibleCheckoutDiscount",
     "createBooking",
     "updateBookingStatus",
     "rescheduleBooking",
@@ -172,6 +246,16 @@ test("booking writes are server-only and all authoritative callables exist", () 
     "activeInstantBookings",
     "activeCustomerBookings",
     "bookings",
+    "discountCampaigns",
+    "discountCampaignUsage",
+    "discountSalonUsage",
+    "discountCustomerUsage",
+    "discountQuoteAttempts",
+    "discountOfferAttempts",
+    "voucherCodeRegistry",
+    "platformFinance",
+    "salonWallets",
+    "salonSettlements",
   ]) {
     assert.match(
       ruleSource,
@@ -196,13 +280,19 @@ test("instant bookings validate and preserve grouped services", () => {
   assert.match(functionSource, /This salon is currently closed\./);
 });
 
-test("Android update lookup has a safe current-build fallback", () => {
+test("Android update lookup activates only a Play-published candidate", () => {
   const functionSource = fs.readFileSync(
     path.join(__dirname, "index.js"),
     "utf8",
   );
   assert.match(functionSource, /exports\.getAndroidAppUpdate = onCall/);
-  assert.match(functionSource, /ANDROID_CURRENT_VERSION_CODE = 29/);
+  assert.match(
+    functionSource,
+    /ANDROID_LAST_CONFIRMED_PUBLIC_VERSION_CODE = 31/,
+  );
+  assert.match(functionSource, /getPlayPublishedAndroidVersion/);
+  assert.match(functionSource, /resolveAndroidUpdateVersion/);
+  assert.match(functionSource, /android_release\.json/);
   assert.match(functionSource, /collection\("appConfig"\)/);
   assert.match(functionSource, /details\?id=com\.trimtime\.app/);
 });

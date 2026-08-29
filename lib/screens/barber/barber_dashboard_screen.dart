@@ -6,6 +6,7 @@ import '../../models/app_models.dart';
 import '../../models/service_catalog.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/app_error_dialog.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/booking_status_timeline.dart';
@@ -572,7 +573,14 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
     } catch (error) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not withdraw request: $error')),
+          SnackBar(
+            content: Text(
+              friendlyErrorMessage(
+                error,
+                fallback: 'The join request could not be withdrawn. Try again.',
+              ),
+            ),
+          ),
         );
       }
     } finally {
@@ -625,9 +633,16 @@ class _BarberJoinViewState extends State<_BarberJoinView> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Request failed: $error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            friendlyErrorMessage(
+              error,
+              fallback: 'The join request could not be sent. Try again.',
+            ),
+          ),
+        ),
+      );
     }
   }
 }
@@ -1271,9 +1286,16 @@ class _BarberBookingCard extends StatelessWidget {
       await AppStateScope.read(context).updateBookingStatus(booking.id, status);
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Status update failed: $error')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              friendlyErrorMessage(
+                error,
+                fallback: 'Your status could not be updated. Try again.',
+              ),
+            ),
+          ),
+        );
       }
     }
   }

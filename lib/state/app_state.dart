@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:firebase_storage/firebase_storage.dart';
@@ -28,6 +29,7 @@ const _suppressedOwnerAlertsPreferenceKey =
     'pritze.notifications.suppressedOwnerAlerts';
 const _ownerAlertSuppressionDuration = Duration(minutes: 10);
 const instantArrivalMinuteOptions = <int>[15, 20, 25];
+const instantBookingResponseTimeout = Duration(seconds: 150);
 const scheduledBookingHorizonDays = 30;
 const customerCancellationReasons = <String>[
   'Plans changed',
@@ -387,6 +389,7 @@ UserRole resolveLaunchRole({
 
 class AppState extends ChangeNotifier {
   final List<Salon> _salons = [];
+  final List<SalonService> _ownerDraftServices = [];
   final List<Barber> _barbers = [];
   final List<Booking> _bookings = [];
   final List<JoinRequest> _joinRequests = [];
@@ -400,6 +403,10 @@ class AppState extends ChangeNotifier {
   final Map<String, UserRole> _mockPhoneRoles = {};
   final Map<String, String> _mockPhoneAccountIds = {};
   final Map<String, String> _mockCustomerNames = {};
+  final Set<String> _mockRegisteredAccountIds = {};
+  final Map<String, ReferralCodes> _mockReferralCodes = {};
+  final Map<String, ({String ownerUid, UserRole targetRole})>
+  _mockReferralCodeRegistry = {};
   final Map<String, String> _pendingCustomerCancellations = {};
   String? _pendingMockCustomerPhone;
   UserAccount? _pendingMockGoogleCustomer;
@@ -419,8 +426,20 @@ class AppState extends ChangeNotifier {
   UserRole? _activeRole;
   String? _lastSyncError;
   bool _isSaving = false;
+  bool _referralOnboardingRequired = false;
+  int _referralCodeCounter = 1;
+  int _mockDiscountPercent = 0;
+  int _mockMaximumDiscountAmount = 0;
+  String _mockDiscountSalonId = '';
+  final List<_MockVisibleCheckoutDiscountCampaign>
+  _mockVisibleDiscountCampaigns = [];
+  final Map<String, DiscountQuote> _mockLockedDiscountQuotes = {};
+  ProinWalletSummary _customerProinWallet = const ProinWalletSummary();
+  final Map<String, ProinWalletSummary> _salonProinWallets = {};
+  final List<ProinActivityEntry> _customerProinActivity = [];
   AppNotificationNavigation? _pendingNotificationNavigation;
   Future<void> _rolePersistenceQueue = Future<void>.value();
+  Timer? _customerInstantExpiryTimer;
 
   AppState() {
     unawaited(_restoreActiveRole());
@@ -435,6 +454,8 @@ class AppState extends ChangeNotifier {
   String? get lastSyncError => _lastSyncError;
 
   bool get isSaving => _isSaving;
+
+  bool get referralOnboardingRequired => _referralOnboardingRequired;
 
   Stream<String> get autoVerifiedPhoneNumbers => const Stream.empty();
 
@@ -487,11 +508,595 @@ class AppState extends ChangeNotifier {
 
   UserAccount? get customerAccount => _customerAccount;
 
+  ProinWalletSummary get customerProinWallet => _customerProinWallet;
+
+  ProinWalletSummary salonProinWallet(String salonId) =>
+      _salonProinWallets[salonId] ??
+      const ProinWalletSummary(creditLimitProin: 1000, spendableProin: 1000);
+
+  List<ProinActivityEntry> get customerProinActivity =>
+      List.unmodifiable(_customerProinActivity);
+
   UserAccount? get ownerAccount => _ownerAccount;
 
   UserAccount? get barberAccount => _barberAccount;
 
   bool get ownerProfileCompleted => _ownerProfileCompleted;
+
+  List<String> _normalizedDiscountServiceIds(Iterable<String> serviceIds) {
+    final ids =
+        serviceIds
+            .map((id) => id.trim())
+            .where((id) => id.isNotEmpty)
+            .toSet()
+            .toList(growable: false)
+          ..sort();
+    return ids;
+  }
+
+  int _mockServiceTotal(String salonId, Iterable<String> serviceIds) {
+    return _normalizedDiscountServiceIds(serviceIds)
+        .map((id) => getService(salonId, id)?.price ?? 0)
+        .fold<int>(0, (total, price) => total + price);
+  }
+
+  bool _mockVisibleCampaignMatches(
+    _MockVisibleCheckoutDiscountCampaign campaign,
+    String salonId,
+    Iterable<String> serviceIds,
+  ) {
+    final ids = _normalizedDiscountServiceIds(serviceIds);
+    if (!campaign.active) return false;
+    if (campaign.salonId.isNotEmpty && campaign.salonId != salonId) {
+      return false;
+    }
+    if (campaign.serviceIds.isEmpty) return ids.isNotEmpty;
+    return ids.any(campaign.serviceIds.contains);
+  }
+
+  DiscountQuote _mockCampaignQuote({
+    required String quotePrefix,
+    required String campaignId,
+    required String campaignName,
+    required String salonId,
+    required Iterable<String> serviceIds,
+    String discountType = 'percent',
+    double discountPercent = 0,
+    int fixedDiscountAmount = 0,
+    int maximumDiscountAmount = 0,
+    Iterable<String> eligibleServiceIds = const [],
+    bool voucherApplied = false,
+    String voucherMaskedCode = '',
+    bool lockQuote = true,
+  }) {
+    final ids = _normalizedDiscountServiceIds(serviceIds);
+    final eligibleIds = eligibleServiceIds
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final originalAmount = _mockServiceTotal(salonId, ids);
+    final discountBaseAmount = _mockServiceTotal(
+      salonId,
+      eligibleIds.isEmpty ? ids : ids.where(eligibleIds.contains),
+    );
+    if (campaignId.isEmpty ||
+        campaignName.isEmpty ||
+        originalAmount <= 0 ||
+        discountBaseAmount <= 0) {
+      return DiscountQuote(originalAmount: originalAmount);
+    }
+    var discountAmount = discountType == 'fixed'
+        ? fixedDiscountAmount
+        : (discountBaseAmount * discountPercent / 100).floor();
+    if (maximumDiscountAmount > 0 && discountAmount > maximumDiscountAmount) {
+      discountAmount = maximumDiscountAmount;
+    }
+    if (discountAmount > discountBaseAmount) {
+      discountAmount = discountBaseAmount;
+    }
+    if (discountAmount < 0) {
+      discountAmount = 0;
+    }
+    if (discountAmount <= 0) {
+      return DiscountQuote(originalAmount: originalAmount);
+    }
+    final pritzePayout = discountAmount * 2;
+    final quote = DiscountQuote(
+      quoteId: '$quotePrefix-${DateTime.now().microsecondsSinceEpoch}',
+      campaignId: campaignId,
+      campaignName: campaignName,
+      discountType: discountType,
+      discountPercent: discountPercent,
+      fixedDiscountAmount: fixedDiscountAmount,
+      voucherApplied: voucherApplied,
+      voucherMaskedCode: voucherMaskedCode,
+      originalAmount: originalAmount,
+      discountBaseAmount: discountBaseAmount,
+      discountAmount: discountAmount,
+      customerPayableAmount: originalAmount - discountAmount,
+      pritzePayoutAmount: pritzePayout,
+      salonTotalEarning: originalAmount - discountAmount + pritzePayout,
+    );
+    if (lockQuote && quote.quoteId.isNotEmpty) {
+      _mockLockedDiscountQuotes[quote.quoteId] = quote;
+    }
+    return quote;
+  }
+
+  Future<DiscountQuote> getDiscountQuote({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    bool lockQuote = true,
+  }) async {
+    final ids = _normalizedDiscountServiceIds(serviceIds);
+    final originalAmount = _mockServiceTotal(salonId, ids);
+    if (lockQuote) {
+      return DiscountQuote(originalAmount: originalAmount);
+    }
+    if (_activeRole != UserRole.customer ||
+        _customerAccount == null ||
+        _mockDiscountPercent <= 0 ||
+        (_mockDiscountSalonId.isNotEmpty && _mockDiscountSalonId != salonId)) {
+      return DiscountQuote(originalAmount: originalAmount);
+    }
+    return _mockCampaignQuote(
+      quotePrefix: 'mock-quote',
+      campaignId: 'mock-campaign',
+      campaignName: 'Pritze offer',
+      salonId: salonId,
+      serviceIds: ids,
+      discountPercent: _mockDiscountPercent.toDouble(),
+      maximumDiscountAmount: _mockMaximumDiscountAmount,
+      lockQuote: lockQuote,
+    );
+  }
+
+  Future<List<CheckoutDiscountOffer>> listCheckoutDiscountOffers({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    bool prefetchOnly = false,
+  }) async {
+    final ids = _normalizedDiscountServiceIds(serviceIds);
+    if (_activeRole != UserRole.customer ||
+        _customerAccount == null ||
+        ids.isEmpty) {
+      return const [];
+    }
+    final offers = _mockVisibleDiscountCampaigns
+        .where(
+          (campaign) => _mockVisibleCampaignMatches(campaign, salonId, ids),
+        )
+        .map((campaign) {
+          final quote = _mockCampaignQuote(
+            quotePrefix: 'mock-visible-offer',
+            campaignId: campaign.campaignId,
+            campaignName: campaign.campaignName,
+            salonId: salonId,
+            serviceIds: ids,
+            discountType: campaign.discountType,
+            discountPercent: campaign.discountPercent,
+            fixedDiscountAmount: campaign.fixedDiscountAmount,
+            maximumDiscountAmount: campaign.maximumDiscountAmount,
+            eligibleServiceIds: campaign.serviceIds,
+            voucherApplied: true,
+            voucherMaskedCode: campaign.voucherMaskedCode,
+            lockQuote: false,
+          );
+          return CheckoutDiscountOffer(
+            campaignId: quote.campaignId,
+            campaignName: quote.campaignName,
+            discountType: quote.discountType,
+            discountPercent: quote.discountPercent,
+            fixedDiscountAmount: quote.fixedDiscountAmount,
+            voucherMaskedCode: quote.voucherMaskedCode,
+            originalAmount: quote.originalAmount,
+            discountAmount: quote.discountAmount,
+            customerPayableAmount: quote.customerPayableAmount,
+            campaignEndsAt: quote.campaignEndsAt,
+          );
+        })
+        .where((offer) => offer.hasSaving)
+        .toList();
+    if (_mockDiscountPercent > 0 &&
+        (_mockDiscountSalonId.isEmpty || _mockDiscountSalonId == salonId)) {
+      final quote = _mockCampaignQuote(
+        quotePrefix: 'mock-campaign-preview',
+        campaignId: 'mock-campaign',
+        campaignName: 'Pritze offer',
+        salonId: salonId,
+        serviceIds: ids,
+        discountPercent: _mockDiscountPercent.toDouble(),
+        maximumDiscountAmount: _mockMaximumDiscountAmount,
+        lockQuote: false,
+      );
+      if (quote.hasDiscount) {
+        offers.add(
+          CheckoutDiscountOffer(
+            campaignId: quote.campaignId,
+            campaignName: quote.campaignName,
+            discountType: quote.discountType,
+            discountPercent: quote.discountPercent,
+            fixedDiscountAmount: quote.fixedDiscountAmount,
+            voucherMaskedCode: '',
+            originalAmount: quote.originalAmount,
+            discountAmount: quote.discountAmount,
+            customerPayableAmount: quote.customerPayableAmount,
+          ),
+        );
+      }
+    }
+    offers.sort((left, right) {
+      final discountCompare = right.discountAmount.compareTo(
+        left.discountAmount,
+      );
+      if (discountCompare != 0) return discountCompare;
+      return left.campaignName.compareTo(right.campaignName);
+    });
+    return offers;
+  }
+
+  Future<CheckoutCouponResult> applyVisibleCheckoutDiscount({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    required String campaignId,
+  }) async {
+    final ids = _normalizedDiscountServiceIds(serviceIds);
+    if (_activeRole != UserRole.customer ||
+        _customerAccount == null ||
+        ids.isEmpty) {
+      throw StateError('Sign in as a customer before applying a discount.');
+    }
+    if (campaignId == 'mock-campaign' &&
+        _mockDiscountPercent > 0 &&
+        (_mockDiscountSalonId.isEmpty || _mockDiscountSalonId == salonId)) {
+      final quote = _mockCampaignQuote(
+        quotePrefix: 'mock-selected-quote',
+        campaignId: 'mock-campaign',
+        campaignName: 'Pritze offer',
+        salonId: salonId,
+        serviceIds: ids,
+        discountPercent: _mockDiscountPercent.toDouble(),
+        maximumDiscountAmount: _mockMaximumDiscountAmount,
+      );
+      return CheckoutCouponResult(
+        benefitType: 'discount',
+        message: 'Pritze offer applied. You save ₹${quote.discountAmount}.',
+        discountQuote: quote,
+      );
+    }
+    final campaign = _mockVisibleDiscountCampaigns
+        .where(
+          (item) =>
+              item.campaignId == campaignId &&
+              _mockVisibleCampaignMatches(item, salonId, ids),
+        )
+        .firstOrNull;
+    if (campaign == null) {
+      throw StateError('This offer is no longer available for this booking.');
+    }
+    final quote = _mockCampaignQuote(
+      quotePrefix: 'mock-visible-quote',
+      campaignId: campaign.campaignId,
+      campaignName: campaign.campaignName,
+      salonId: salonId,
+      serviceIds: ids,
+      discountType: campaign.discountType,
+      discountPercent: campaign.discountPercent,
+      fixedDiscountAmount: campaign.fixedDiscountAmount,
+      maximumDiscountAmount: campaign.maximumDiscountAmount,
+      eligibleServiceIds: campaign.serviceIds,
+      voucherApplied: true,
+      voucherMaskedCode: campaign.voucherMaskedCode,
+    );
+    if (!quote.hasDiscount) {
+      throw StateError('This offer is no longer available for this booking.');
+    }
+    return CheckoutCouponResult(
+      benefitType: 'discount',
+      message:
+          '${quote.campaignName} applied. You save ₹${quote.discountAmount}.',
+      discountQuote: quote,
+    );
+  }
+
+  Future<ProinWalletSummary> refreshCustomerProinWallet() async {
+    return _customerProinWallet;
+  }
+
+  Future<ProinWalletSummary> refreshSalonProinWallet(String salonId) async {
+    return salonProinWallet(salonId);
+  }
+
+  Future<ProinCouponClaimResult> claimSalonProinCoupon({
+    required String salonId,
+    required String code,
+  }) async {
+    final normalizedSalonId = salonId.trim();
+    final normalized = code.trim().toUpperCase();
+    if (normalizedSalonId.isEmpty ||
+        _activeRole != UserRole.owner ||
+        ownerSalonOrNull?.id != normalizedSalonId) {
+      throw StateError('Sign in as this salon owner to apply a coupon.');
+    }
+    if (!RegExp(r'^(?=.*[A-Z])[A-Z\d]{4,20}$').hasMatch(normalized)) {
+      throw StateError('Enter a 4-20 character coupon code with a letter.');
+    }
+    final current = salonProinWallet(normalizedSalonId);
+    final expiry = DateTime.now().add(const Duration(days: 30));
+    final updated = ProinWalletSummary(
+      availableProin: current.availableProin + 100,
+      reservedProin: current.reservedProin,
+      creditLimitProin: current.creditLimitProin,
+      spendableProin: current.availableProin + 100 + current.creditLimitProin,
+      lifetimeGrantedProin: current.lifetimeGrantedProin + 100,
+      lifetimeRedeemedProin: current.lifetimeRedeemedProin,
+      lifetimeExpiredProin: current.lifetimeExpiredProin,
+      nextExpiryAt: current.nextExpiryAt ?? expiry,
+      expiringLots: [
+        ...current.expiringLots,
+        ProinExpiringLot(
+          amountProin: 100,
+          expiresAt: expiry,
+          sourceType: 'coupon',
+        ),
+      ]..sort((left, right) => left.expiresAt.compareTo(right.expiresAt)),
+    );
+    _salonProinWallets[normalizedSalonId] = updated;
+    notifyListeners();
+    return ProinCouponClaimResult(
+      amountProin: 100,
+      availableProin: updated.availableProin,
+      expiresAt: expiry,
+    );
+  }
+
+  Future<List<ProinActivityEntry>> refreshCustomerProinActivity() async {
+    return customerProinActivity;
+  }
+
+  Future<ProinBookingQuote> getProinBookingQuote({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    required DiscountQuote discountQuote,
+  }) async {
+    final payableBeforeProin = discountQuote.customerPayableAmount;
+    final maximum = <int>[
+      _customerProinWallet.availableProin,
+      (payableBeforeProin * 0.25).floor(),
+      250,
+    ].reduce((left, right) => left < right ? left : right);
+    return ProinBookingQuote(
+      availableProin: _customerProinWallet.availableProin,
+      maximumRedeemableProin: maximum,
+      payableBeforeProin: payableBeforeProin,
+      customerPayableAmount: payableBeforeProin - maximum,
+    );
+  }
+
+  Future<ProinCouponClaimResult> claimProinCoupon(String code) async {
+    final normalized = code.trim().toUpperCase();
+    if (!RegExp(r'^(?=.*[A-Z])[A-Z\d]{4,20}$').hasMatch(normalized)) {
+      throw StateError('Enter a 4-20 character coupon code with a letter.');
+    }
+    final expiry = DateTime.now().add(const Duration(days: 30));
+    _customerProinWallet = ProinWalletSummary(
+      availableProin: _customerProinWallet.availableProin + 100,
+      reservedProin: _customerProinWallet.reservedProin,
+      lifetimeGrantedProin: _customerProinWallet.lifetimeGrantedProin + 100,
+      lifetimeRedeemedProin: _customerProinWallet.lifetimeRedeemedProin,
+      lifetimeExpiredProin: _customerProinWallet.lifetimeExpiredProin,
+      nextExpiryAt: _customerProinWallet.nextExpiryAt ?? expiry,
+      expiringLots: [
+        ..._customerProinWallet.expiringLots,
+        ProinExpiringLot(
+          amountProin: 100,
+          expiresAt: expiry,
+          sourceType: 'coupon',
+        ),
+      ]..sort((left, right) => left.expiresAt.compareTo(right.expiresAt)),
+    );
+    _customerProinActivity.insert(
+      0,
+      ProinActivityEntry(
+        transactionId: 'mock-coupon-${DateTime.now().microsecondsSinceEpoch}',
+        type: 'grant',
+        direction: 'credit',
+        amountProin: 100,
+        sourceType: 'coupon',
+        createdAt: DateTime.now(),
+      ),
+    );
+    notifyListeners();
+    return ProinCouponClaimResult(
+      amountProin: 100,
+      availableProin: _customerProinWallet.availableProin,
+      expiresAt: expiry,
+    );
+  }
+
+  Future<CheckoutCouponResult> applyCheckoutCoupon({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    required String code,
+  }) async {
+    final normalized = code.trim().toUpperCase();
+    if (!RegExp(r'^(?=.*[A-Z])[A-Z\d]{4,20}$').hasMatch(normalized)) {
+      throw StateError('Enter a 4-20 character coupon code with a letter.');
+    }
+    if (normalized.startsWith('PROIN')) {
+      final claim = await claimProinCoupon(normalized);
+      return CheckoutCouponResult(
+        benefitType: 'proin',
+        message: '${claim.amountProin} Proin added to your account.',
+        amountProin: claim.amountProin,
+        alreadyClaimed: claim.alreadyClaimed,
+      );
+    }
+    final quote = _mockCampaignQuote(
+      quotePrefix: 'mock-voucher',
+      campaignId: 'mock-voucher-campaign',
+      campaignName: 'Voucher offer',
+      salonId: salonId,
+      serviceIds: serviceIds,
+      discountPercent: 10,
+      voucherApplied: true,
+      voucherMaskedCode: normalized,
+    );
+    return CheckoutCouponResult(
+      benefitType: 'discount',
+      message: 'Voucher applied. You save ₹${quote.discountAmount}.',
+      discountQuote: quote,
+    );
+  }
+
+  @visibleForTesting
+  void configureMockDiscountCampaign({
+    required int discountPercent,
+    int maximumDiscountAmount = 0,
+    String salonId = '',
+  }) {
+    _mockDiscountPercent = discountPercent.clamp(0, 100);
+    _mockMaximumDiscountAmount = maximumDiscountAmount.clamp(0, 1000000);
+    _mockDiscountSalonId = salonId;
+  }
+
+  @visibleForTesting
+  void configureMockVisibleCheckoutDiscountOffer({
+    required String campaignId,
+    String campaignName = 'Pritze checkout offer',
+    String salonId = '',
+    Iterable<String> serviceIds = const [],
+    String discountType = 'percent',
+    int discountPercent = 10,
+    int fixedDiscountAmount = 0,
+    int maximumDiscountAmount = 0,
+    String voucherMaskedCode = '••••',
+    bool active = true,
+  }) {
+    final normalizedCampaignId = campaignId.trim();
+    if (normalizedCampaignId.isEmpty) {
+      throw ArgumentError.value(campaignId, 'campaignId', 'cannot be empty');
+    }
+    _mockVisibleDiscountCampaigns.removeWhere(
+      (campaign) => campaign.campaignId == normalizedCampaignId,
+    );
+    _mockVisibleDiscountCampaigns.add(
+      _MockVisibleCheckoutDiscountCampaign(
+        campaignId: normalizedCampaignId,
+        campaignName: campaignName.trim().isEmpty
+            ? 'Pritze checkout offer'
+            : campaignName.trim(),
+        salonId: salonId.trim(),
+        serviceIds: _normalizedDiscountServiceIds(serviceIds).toSet(),
+        discountType: discountType == 'fixed' ? 'fixed' : 'percent',
+        discountPercent: discountPercent.clamp(0, 100).toDouble(),
+        fixedDiscountAmount: fixedDiscountAmount.clamp(0, 1000000),
+        maximumDiscountAmount: maximumDiscountAmount.clamp(0, 1000000),
+        voucherMaskedCode: voucherMaskedCode.trim().isEmpty
+            ? '••••'
+            : voucherMaskedCode.trim(),
+        active: active,
+      ),
+    );
+  }
+
+  Future<ReferralCodes> ensureReferralCodes() async {
+    final role = _activeRole;
+    final account = role == UserRole.customer
+        ? _customerAccount
+        : role == UserRole.owner
+        ? _ownerAccount
+        : null;
+    if (account == null ||
+        (role != UserRole.customer && role != UserRole.owner)) {
+      throw StateError('Sign in before opening referrals.');
+    }
+    final existing = _mockReferralCodes[account.id];
+    if (existing != null) {
+      return existing;
+    }
+
+    final customerCode = _newMockReferralCode();
+    final salonCode = role == UserRole.owner ? _newMockReferralCode() : '';
+    final codes = ReferralCodes(
+      customerInviteCode: customerCode,
+      salonInviteCode: salonCode,
+    );
+    _mockReferralCodes[account.id] = codes;
+    _mockReferralCodeRegistry[customerCode] = (
+      ownerUid: account.id,
+      targetRole: UserRole.customer,
+    );
+    if (salonCode.isNotEmpty) {
+      _mockReferralCodeRegistry[salonCode] = (
+        ownerUid: account.id,
+        targetRole: UserRole.owner,
+      );
+    }
+    notifyListeners();
+    return codes;
+  }
+
+  Future<ReferralSummary> getReferralSummary() async {
+    if (_activeRole == null) {
+      throw StateError('Sign in before opening referrals.');
+    }
+    return ReferralSummary(
+      customerInviterRewardProin: 40,
+      customerReferredRewardProin: 40,
+      salonInviterRewardProin: _activeRole == UserRole.owner ? 500 : 0,
+      salonReferredRewardProin: _activeRole == UserRole.owner ? 500 : 0,
+    );
+  }
+
+  Future<void> completeReferralOnboarding({String referralCode = ''}) async {
+    if (!_referralOnboardingRequired) {
+      return;
+    }
+    final role = _activeRole;
+    final account = role == UserRole.customer
+        ? _customerAccount
+        : role == UserRole.owner
+        ? _ownerAccount
+        : null;
+    if (account == null || role == null) {
+      throw StateError('Sign in again before continuing.');
+    }
+    final normalizedCode = referralCode.trim().toUpperCase();
+    if (normalizedCode.isNotEmpty) {
+      if (!RegExp(
+        r'^(?=.*[A-Z])(?=.*\d)[A-Z\d]{6}$',
+      ).hasMatch(normalizedCode)) {
+        throw StateError('Enter a valid 6-character referral code.');
+      }
+      final referral = _mockReferralCodeRegistry[normalizedCode];
+      if (referral == null) {
+        throw StateError('This referral code is not valid.');
+      }
+      if (referral.ownerUid == account.id) {
+        throw StateError('You cannot use your own referral code.');
+      }
+      if (referral.targetRole != role) {
+        throw StateError(
+          role == UserRole.customer
+              ? 'This code cannot be used for a customer account.'
+              : 'This code cannot be used for a salon account.',
+        );
+      }
+    }
+    _referralOnboardingRequired = false;
+    notifyListeners();
+  }
+
+  String _newMockReferralCode() {
+    while (true) {
+      final code =
+          'R${(_referralCodeCounter++).toRadixString(36).toUpperCase().padLeft(5, '0')}';
+      if (!_mockReferralCodeRegistry.containsKey(code)) {
+        return code;
+      }
+    }
+  }
 
   bool get hasActiveCustomerSession =>
       _activeRole == UserRole.customer && _customerAccount != null;
@@ -689,13 +1294,47 @@ class AppState extends ChangeNotifier {
     final end = booking.start.add(Duration(minutes: booking.durationMinutes));
     return switch (booking.status) {
       BookingStatus.pending =>
-        booking.isInstant ? true : reference.isBefore(booking.start),
+        booking.isInstant
+            ? reference.isBefore(
+                booking.createdAt.add(instantBookingResponseTimeout),
+              )
+            : reference.isBefore(booking.start),
       BookingStatus.confirmed => reference.isBefore(end),
       BookingStatus.inProgress => true,
       BookingStatus.completed ||
       BookingStatus.cancelled ||
       BookingStatus.rejected => false,
     };
+  }
+
+  void _syncCustomerInstantExpiryTimer() {
+    _customerInstantExpiryTimer?.cancel();
+    _customerInstantExpiryTimer = null;
+    if (_activeRole != UserRole.customer || _customerAccount == null) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final deadlines =
+        customerBookings
+            .where(
+              (booking) =>
+                  booking.isInstant && booking.status == BookingStatus.pending,
+            )
+            .map(
+              (booking) => booking.createdAt.add(instantBookingResponseTimeout),
+            )
+            .where((deadline) => deadline.isAfter(now))
+            .toList()
+          ..sort();
+    if (deadlines.isEmpty) {
+      return;
+    }
+
+    _customerInstantExpiryTimer = Timer(
+      deadlines.first.difference(now),
+      notifyListeners,
+    );
   }
 
   Salon? getSalon(String id) {
@@ -1351,9 +1990,14 @@ class AppState extends ChangeNotifier {
     _activeRole = null;
     _customerAccount = null;
     _ownerAccount = null;
+    _ownerDraftServices.clear();
     _barberAccount = null;
     _currentBarberId = null;
     _currentJoinRequestId = null;
+    _referralOnboardingRequired = false;
+    _customerProinWallet = const ProinWalletSummary();
+    _salonProinWallets.clear();
+    _customerProinActivity.clear();
     await _persistActiveRole(null);
     notifyListeners();
   }
@@ -1428,15 +2072,17 @@ class AppState extends ChangeNotifier {
         'already registered as a $existingLabel.';
   }
 
-  Future<Booking> createBooking({required TimeSlot slot}) async {
+  Future<Booking> createBooking({
+    required TimeSlot slot,
+    String quoteId = '',
+    int requestedProin = 0,
+  }) async {
     final account = _customerAccount;
     if (_activeRole != UserRole.customer || account == null) {
       throw StateError('Customer login is required before booking.');
     }
     if (hasActiveCustomerBooking) {
-      throw StateError(
-        'Cancel or complete your current booking before making another.',
-      );
+      throw StateError('You already have an active booking.');
     }
     if (!isSalonCurrentlyOpen(slot.salonId)) {
       throw StateError('The salon is currently closed.');
@@ -1457,6 +2103,13 @@ class AppState extends ChangeNotifier {
         'This slot was just booked. Please choose another time.',
       );
     }
+    final quoteKey = quoteId.trim();
+    final discount = quoteKey.isNotEmpty
+        ? _mockLockedDiscountQuotes.remove(quoteKey) ??
+              (throw StateError(
+                'This discount expired. Select the offer again.',
+              ))
+        : DiscountQuote(originalAmount: service.price);
     final booking = Booking(
       id: 'booking-${_bookingCounter++}',
       customerUid: _customerAccount?.id,
@@ -1469,9 +2122,25 @@ class AppState extends ChangeNotifier {
       durationMinutes: service.durationMinutes,
       serviceName: service.name,
       servicePrice: service.price,
+      servicePriceBreakdown: {service.id: service.price},
       bookingFee: _zeroBookingFee,
       paymentRequired: false,
       paymentStatus: _zeroBookingFeeStatus,
+      discountCampaignId: discount.campaignId,
+      discountCampaignName: discount.campaignName,
+      discountPercent: discount.discountPercent,
+      discountBaseAmount: discount.discountBaseAmount,
+      discountAmount: discount.discountAmount,
+      pritzePayoutAmount: discount.pritzePayoutAmount,
+      salonTotalEarning: discount.salonTotalEarning,
+      discountStatus: discount.hasDiscount ? 'reserved' : 'none',
+      customerPayableBeforeProin: discount.customerPayableAmount,
+      customerPayableAmount: (discount.customerPayableAmount - requestedProin)
+          .clamp(0, 1000000000)
+          .toInt(),
+      proinStatus: requestedProin > 0 ? 'reserved' : 'none',
+      proinRequestedAmount: requestedProin,
+      proinReservedAmount: requestedProin,
       status: BookingStatus.confirmed,
       createdAt: DateTime.now(),
     );
@@ -1491,6 +2160,8 @@ class AppState extends ChangeNotifier {
     String? serviceId,
     Iterable<String>? serviceIds,
     int arrivalMinutes = 15,
+    String quoteId = '',
+    int requestedProin = 0,
   }) async {
     final account = _customerAccount;
     if (_activeRole != UserRole.customer || account == null) {
@@ -1500,9 +2171,7 @@ class AppState extends ChangeNotifier {
       throw StateError('Choose an arrival time of 15, 20, or 25 minutes.');
     }
     if (hasActiveCustomerBooking) {
-      throw StateError(
-        'Cancel or complete your current booking before making another.',
-      );
+      throw StateError('You already have an active booking.');
     }
     final requestedIds = <String>{
       ...?serviceIds?.map((id) => id.trim()),
@@ -1552,6 +2221,13 @@ class AppState extends ChangeNotifier {
     if (eligibleBarbers.isEmpty) {
       throw StateError('No barber is available for this instant service.');
     }
+    final quoteKey = quoteId.trim();
+    final discount = quoteKey.isNotEmpty
+        ? _mockLockedDiscountQuotes.remove(quoteKey) ??
+              (throw StateError(
+                'This discount expired. Select the offer again.',
+              ))
+        : DiscountQuote(originalAmount: totalPrice);
     final booking = Booking(
       id: 'booking-${_bookingCounter++}',
       customerUid: _customerAccount?.id,
@@ -1565,9 +2241,27 @@ class AppState extends ChangeNotifier {
       durationMinutes: totalDuration,
       serviceName: services.map((service) => service.name).join(', '),
       servicePrice: totalPrice,
+      servicePriceBreakdown: {
+        for (final service in services) service.id: service.price,
+      },
       bookingFee: _zeroBookingFee,
       paymentRequired: false,
       paymentStatus: _zeroBookingFeeStatus,
+      discountCampaignId: discount.campaignId,
+      discountCampaignName: discount.campaignName,
+      discountPercent: discount.discountPercent,
+      discountBaseAmount: discount.discountBaseAmount,
+      discountAmount: discount.discountAmount,
+      pritzePayoutAmount: discount.pritzePayoutAmount,
+      salonTotalEarning: discount.salonTotalEarning,
+      discountStatus: discount.hasDiscount ? 'reserved' : 'none',
+      customerPayableBeforeProin: discount.customerPayableAmount,
+      customerPayableAmount: (discount.customerPayableAmount - requestedProin)
+          .clamp(0, 1000000000)
+          .toInt(),
+      proinStatus: requestedProin > 0 ? 'reserved' : 'none',
+      proinRequestedAmount: requestedProin,
+      proinReservedAmount: requestedProin,
       status: BookingStatus.pending,
       createdAt: now,
       isInstant: true,
@@ -1633,7 +2327,7 @@ class AppState extends ChangeNotifier {
     final account = pending.copyWith(contact: normalizedPhone);
     _pendingMockGoogleCustomer = null;
     _mockCustomerNames[normalizedPhone] = account.name;
-    _activateRole(UserRole.customer, account);
+    _activateMockRegistration(UserRole.customer, account);
     return account;
   }
 
@@ -1677,7 +2371,7 @@ class AppState extends ChangeNotifier {
       contact: normalizedPhone,
       provider: LoginProvider.phone,
     );
-    _activateRole(UserRole.customer, account);
+    _activateMockRegistration(UserRole.customer, account);
     return account;
   }
 
@@ -1718,7 +2412,7 @@ class AppState extends ChangeNotifier {
       contact: contact,
       provider: LoginProvider.google,
     );
-    _activateRole(UserRole.owner, account);
+    _activateMockRegistration(UserRole.owner, account);
     return account;
   }
 
@@ -1734,7 +2428,7 @@ class AppState extends ChangeNotifier {
       contact: contact,
       provider: LoginProvider.email,
     );
-    _activateRole(UserRole.owner, account);
+    _activateMockRegistration(UserRole.owner, account);
     return account;
   }
 
@@ -1752,7 +2446,7 @@ class AppState extends ChangeNotifier {
       contact: contact,
       provider: LoginProvider.phone,
     );
-    _activateRole(UserRole.owner, account);
+    _activateMockRegistration(UserRole.owner, account);
     return account;
   }
 
@@ -1792,6 +2486,59 @@ class AppState extends ChangeNotifier {
       cancellationReason: cancellationReason,
       cancelledBy: cancelledBy,
     );
+  }
+
+  Future<void> updateCustomerArrivalStatus(
+    String bookingId,
+    CustomerArrivalStatus status,
+  ) async {
+    final index = _bookings.indexWhere((booking) => booking.id == bookingId);
+    if (index < 0) throw StateError('Booking not found.');
+    _bookings[index] = _bookings[index].copyWith(
+      arrivalStatus: status,
+      arrivalStatusUpdatedAt: DateTime.now(),
+      arrivalSharingActive: status == CustomerArrivalStatus.arrived
+          ? false
+          : _bookings[index].arrivalSharingActive,
+    );
+    notifyListeners();
+  }
+
+  Future<DateTime> startCustomerArrivalSharing(
+    String bookingId, {
+    required double latitude,
+    required double longitude,
+    required double accuracyMeters,
+    required double speedMetersPerSecond,
+    required DateTime capturedAt,
+  }) async {
+    final expiresAt = DateTime.now().add(const Duration(hours: 1));
+    final index = _bookings.indexWhere((booking) => booking.id == bookingId);
+    if (index < 0) throw StateError('Booking not found.');
+    _bookings[index] = _bookings[index].copyWith(
+      arrivalStatus: CustomerArrivalStatus.onTheWay,
+      arrivalStatusUpdatedAt: DateTime.now(),
+      arrivalSharingActive: true,
+      arrivalSharingExpiresAt: expiresAt,
+    );
+    notifyListeners();
+    return expiresAt;
+  }
+
+  Future<void> updateCustomerArrivalLocation(
+    String bookingId, {
+    required double latitude,
+    required double longitude,
+    required double accuracyMeters,
+    required double speedMetersPerSecond,
+    required DateTime capturedAt,
+  }) async {}
+
+  Future<void> stopCustomerArrivalSharing(String bookingId) async {
+    final index = _bookings.indexWhere((booking) => booking.id == bookingId);
+    if (index < 0) throw StateError('Booking not found.');
+    _bookings[index] = _bookings[index].copyWith(arrivalSharingActive: false);
+    notifyListeners();
   }
 
   Future<void> cancelBooking(String bookingId, {required String reason}) async {
@@ -2165,6 +2912,7 @@ class AppState extends ChangeNotifier {
       UserRole.owner,
       accountId: ownerAccount.id,
     );
+    final wasDraft = ownerSalonOrNull == null;
     final salon = ownerSalon.copyWith(
       name: name.trim(),
       ownerName: ownerName.trim(),
@@ -2177,10 +2925,13 @@ class AppState extends ChangeNotifier {
           ?.map((url) => url.trim())
           .where((url) => url.isNotEmpty)
           .toList(),
-      openTime: openTime.trim(),
-      closeTime: closeTime.trim(),
+      openTime: formatSalonClockTime(openTime),
+      closeTime: formatSalonClockTime(closeTime),
     );
     _replaceSalon(salon);
+    if (wasDraft) {
+      _ownerDraftServices.clear();
+    }
     _ownerProfileCompleted = true;
     notifyListeners();
   }
@@ -2219,7 +2970,6 @@ class AppState extends ChangeNotifier {
     if (price <= 0 || durationMinutes <= 0) {
       throw ArgumentError('Price and duration must be greater than zero.');
     }
-    final salon = ownerSalon;
     final service = SalonService(
       id: 'service-${_serviceCounter++}',
       name: name.trim(),
@@ -2228,8 +2978,9 @@ class AppState extends ChangeNotifier {
       durationMinutes: durationMinutes,
       isAvailable: isAvailable,
       instantBookingEnabled: instantBookingEnabled,
+      isCustom: true,
     );
-    _replaceSalon(salon.copyWith(services: [...salon.services, service]));
+    _replaceOwnerServices([...ownerSalon.services, service]);
     notifyListeners();
   }
 
@@ -2264,29 +3015,21 @@ class AppState extends ChangeNotifier {
       isAvailable: isAvailable,
       instantBookingEnabled: instantBookingEnabled,
     );
-    _replaceSalon(salon.copyWith(services: services));
+    _replaceOwnerServices(services);
     notifyListeners();
   }
 
   Future<int> addOwnerServicesFromCatalog({
-    Iterable<String>? categories,
+    Iterable<String>? serviceNames,
   }) async {
     final salon = ownerSalon;
-    final selectedCategories = categories
-        ?.map((category) => category.trim().toLowerCase())
-        .where((category) => category.isNotEmpty)
-        .toSet();
     final existingNames = salon.services
-        .map((service) => service.name.trim().toLowerCase())
+        .map((service) => normalizeServiceName(service.name))
         .toSet();
     final servicesToAdd = <SalonService>[];
     for (final template in serviceCatalog) {
-      if (selectedCategories != null &&
-          selectedCategories.isNotEmpty &&
-          !selectedCategories.contains(template.category.toLowerCase())) {
-        continue;
-      }
-      if (existingNames.contains(template.name.trim().toLowerCase())) {
+      final normalizedName = normalizeServiceName(template.name);
+      if (existingNames.contains(normalizedName)) {
         continue;
       }
       servicesToAdd.add(
@@ -2302,9 +3045,7 @@ class AppState extends ChangeNotifier {
     if (servicesToAdd.isEmpty) {
       return 0;
     }
-    _replaceSalon(
-      salon.copyWith(services: [...salon.services, ...servicesToAdd]),
-    );
+    _replaceOwnerServices([...salon.services, ...servicesToAdd]);
     notifyListeners();
     return servicesToAdd.length;
   }
@@ -2314,7 +3055,7 @@ class AppState extends ChangeNotifier {
     final nextServices = salon.services
         .where((service) => service.id != serviceId)
         .toList();
-    _replaceSalon(salon.copyWith(services: nextServices));
+    _replaceOwnerServices(nextServices);
     for (var i = 0; i < _barbers.length; i++) {
       _barbers[i] = _barbers[i].copyWith(
         serviceIds: _barbers[i].serviceIds
@@ -2516,15 +3257,36 @@ class AppState extends ChangeNotifier {
               booking.status == BookingStatus.completed,
         )
         .fold(0, (total, booking) {
-          return total + _bookingPrice(booking);
+          return total + booking.salonTotalEarning;
         });
   }
 
   int totalCollection(String salonId) {
     return bookingsForSalon(salonId)
         .where((booking) => booking.status == BookingStatus.completed)
-        .fold(0, (total, booking) => total + _bookingPrice(booking));
+        .fold(0, (total, booking) => total + booking.salonTotalEarning);
   }
+
+  int totalOriginalServiceValue(String salonId) => bookingsForSalon(salonId)
+      .where((booking) => booking.status == BookingStatus.completed)
+      .fold(0, (total, booking) => total + _bookingPrice(booking));
+
+  int totalCustomerCounterCollection(String salonId) =>
+      bookingsForSalon(salonId)
+          .where((booking) => booking.status == BookingStatus.completed)
+          .fold(0, (total, booking) => total + booking.customerPayableAmount);
+
+  int totalPritzeEarnings(String salonId) => bookingsForSalon(salonId)
+      .where((booking) => booking.status == BookingStatus.completed)
+      .fold(0, (total, booking) => total + booking.totalPritzeContribution);
+
+  int totalDiscountPritzeEarnings(String salonId) => bookingsForSalon(salonId)
+      .where((booking) => booking.status == BookingStatus.completed)
+      .fold(0, (total, booking) => total + booking.pritzePayoutAmount);
+
+  int totalProinReimbursements(String salonId) => bookingsForSalon(salonId)
+      .where((booking) => booking.status == BookingStatus.completed)
+      .fold(0, (total, booking) => total + booking.proinRedeemedAmount);
 
   int barberTotalEarnings(String barberId) {
     return bookingsForBarber(barberId)
@@ -2557,7 +3319,7 @@ class AppState extends ChangeNotifier {
         .fold(0, (total, booking) => total + _bookingPrice(booking));
   }
 
-  int bookingEarning(Booking booking) => _bookingPrice(booking);
+  int bookingEarning(Booking booking) => booking.salonTotalEarning;
 
   int todayBookingCount(String salonId) {
     return bookingsForSalon(salonId).where((booking) {
@@ -2638,13 +3400,30 @@ class AppState extends ChangeNotifier {
       if (booking.status != BookingStatus.completed) {
         continue;
       }
-      final service = getService(salonId, booking.serviceId);
-      final price = _bookingPrice(booking);
-      if (price <= 0) {
+      final totalEarning = booking.salonTotalEarning;
+      if (totalEarning <= 0) {
         continue;
       }
-      final serviceId = service?.id ?? booking.serviceId;
-      result[serviceId] = (result[serviceId] ?? 0) + price;
+      final breakdown = booking.servicePriceBreakdown.isNotEmpty
+          ? booking.servicePriceBreakdown
+          : <String, int>{booking.serviceId: booking.servicePrice};
+      final originalTotal = breakdown.values.fold<int>(
+        0,
+        (total, price) => total + price,
+      );
+      if (originalTotal <= 0) {
+        continue;
+      }
+      var assigned = 0;
+      final entries = breakdown.entries.toList(growable: false);
+      for (var index = 0; index < entries.length; index++) {
+        final entry = entries[index];
+        final earning = index == entries.length - 1
+            ? totalEarning - assigned
+            : (totalEarning * entry.value / originalTotal).floor();
+        assigned += earning;
+        result[entry.key] = (result[entry.key] ?? 0) + earning;
+      }
     }
     return result;
   }
@@ -2719,6 +3498,11 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _activateMockRegistration(UserRole role, UserAccount account) {
+    _referralOnboardingRequired = _mockRegisteredAccountIds.add(account.id);
+    _activateRole(role, account);
+  }
+
   String _stableAccountId(UserRole role, String contact) {
     final safeContact = contact
         .trim()
@@ -2776,6 +3560,9 @@ class AppState extends ChangeNotifier {
     if (role != UserRole.barber) {
       _currentBarberId = null;
       _currentJoinRequestId = null;
+    }
+    if (role != UserRole.owner) {
+      _ownerDraftServices.clear();
     }
   }
 
@@ -2844,6 +3631,7 @@ class AppState extends ChangeNotifier {
   void notifyListeners() {
     _slotCache.clear();
     _slotCacheCreatedAt = null;
+    _syncCustomerInstantExpiryTimer();
     super.notifyListeners();
   }
 
@@ -2960,6 +3748,7 @@ class AppState extends ChangeNotifier {
       return booking.copyWith(
         status: status,
         completedAt: now,
+        discountStatus: booking.hasDiscount ? 'redeemed' : 'none',
         cancellationReason: cancellationReason,
         cancelledBy: cancelledBy,
       );
@@ -2968,6 +3757,7 @@ class AppState extends ChangeNotifier {
       return booking.copyWith(
         status: status,
         cancelledAt: now,
+        discountStatus: booking.hasDiscount ? 'released' : 'none',
         cancellationReason: cancellationReason,
         cancelledBy: cancelledBy,
       );
@@ -2976,6 +3766,7 @@ class AppState extends ChangeNotifier {
       return booking.copyWith(
         status: status,
         rejectedAt: now,
+        discountStatus: booking.hasDiscount ? 'released' : 'none',
         cancellationReason: cancellationReason,
         cancelledBy: cancelledBy,
       );
@@ -3010,6 +3801,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  void _replaceOwnerServices(List<SalonService> services) {
+    final persistedSalon = ownerSalonOrNull;
+    if (persistedSalon == null) {
+      _ownerDraftServices
+        ..clear()
+        ..addAll(services);
+      return;
+    }
+    _replaceSalon(persistedSalon.copyWith(services: services));
+  }
+
   Salon _draftOwnerSalon() {
     final owner = _ownerAccount;
     return Salon(
@@ -3029,9 +3831,41 @@ class AppState extends ChangeNotifier {
       isOpen: true,
       instantBookingsEnabled: true,
       instantBookingsPausedDate: '',
-      services: const [],
+      services: List.unmodifiable(_ownerDraftServices),
     );
   }
+
+  @override
+  void dispose() {
+    _customerInstantExpiryTimer?.cancel();
+    super.dispose();
+  }
+}
+
+class _MockVisibleCheckoutDiscountCampaign {
+  final String campaignId;
+  final String campaignName;
+  final String salonId;
+  final Set<String> serviceIds;
+  final String discountType;
+  final double discountPercent;
+  final int fixedDiscountAmount;
+  final int maximumDiscountAmount;
+  final String voucherMaskedCode;
+  final bool active;
+
+  const _MockVisibleCheckoutDiscountCampaign({
+    required this.campaignId,
+    required this.campaignName,
+    required this.salonId,
+    required this.serviceIds,
+    required this.discountType,
+    required this.discountPercent,
+    required this.fixedDiscountAmount,
+    required this.maximumDiscountAmount,
+    required this.voucherMaskedCode,
+    required this.active,
+  });
 }
 
 class FirebaseAppState extends AppState with WidgetsBindingObserver {
@@ -3071,6 +3905,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   Timer? _ownerBookingAlarmTimer;
   bool _isRestoringSession = true;
   int _accountRestoreGeneration = 0;
+  DateTime? _lastCallableCredentialRefreshAt;
 
   FirebaseAppState({
     required this.firestore,
@@ -3087,6 +3922,499 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
   @override
   bool get usesFirebase => true;
+
+  @override
+  bool get hasActiveCustomerSession =>
+      super.hasActiveCustomerSession &&
+      auth.currentUser?.uid == customerAccount?.id;
+
+  @override
+  bool get hasActiveOwnerSession =>
+      super.hasActiveOwnerSession && auth.currentUser?.uid == ownerAccount?.id;
+
+  @override
+  bool get hasActiveBarberSession =>
+      super.hasActiveBarberSession &&
+      auth.currentUser?.uid == barberAccount?.id;
+
+  @override
+  Future<ReferralCodes> ensureReferralCodes() {
+    return _runFirebaseSave(() async {
+      final response = await functions
+          .httpsCallable('getReferralCodes')
+          .call<Map<String, dynamic>>();
+      final customerCode =
+          response.data['customerInviteCode']
+              ?.toString()
+              .trim()
+              .toUpperCase() ??
+          '';
+      final salonCode =
+          response.data['salonInviteCode']?.toString().trim().toUpperCase() ??
+          '';
+      if (!RegExp(r'^(?=.*[A-Z])(?=.*\d)[A-Z\d]{6}$').hasMatch(customerCode)) {
+        throw StateError('The server did not return a valid referral code.');
+      }
+      return ReferralCodes(
+        customerInviteCode: customerCode,
+        salonInviteCode: salonCode,
+      );
+    });
+  }
+
+  @override
+  Future<ReferralSummary> getReferralSummary() {
+    return _runFirebaseSave(() async {
+      final response = await functions
+          .httpsCallable('getReferralSummary')
+          .call<Map<String, dynamic>>();
+      final data = response.data;
+      return ReferralSummary(
+        pendingCustomerCount: _int(data['pendingCustomerCount'], 0),
+        qualifiedCustomerCount: _int(data['qualifiedCustomerCount'], 0),
+        pendingSalonCount: _int(data['pendingSalonCount'], 0),
+        qualifiedSalonCount: _int(data['qualifiedSalonCount'], 0),
+        customerInviterRewardProin: _int(data['customerInviterRewardProin'], 0),
+        customerReferredRewardProin: _int(
+          data['customerReferredRewardProin'],
+          0,
+        ),
+        salonInviterRewardProin: _int(data['salonInviterRewardProin'], 0),
+        salonReferredRewardProin: _int(data['salonReferredRewardProin'], 0),
+        earnedCustomerReferralProin: _int(
+          data['earnedCustomerReferralProin'],
+          0,
+        ),
+        earnedSalonReferralProin: _int(data['earnedSalonReferralProin'], 0),
+        earnedReferralProin: _int(data['earnedReferralProin'], 0),
+      );
+    });
+  }
+
+  @override
+  Future<void> completeReferralOnboarding({String referralCode = ''}) {
+    return _runFirebaseSave(() async {
+      await functions
+          .httpsCallable('completeReferralOnboarding')
+          .call<Map<String, dynamic>>({
+            'referralCode': referralCode.trim().toUpperCase(),
+          });
+      _referralOnboardingRequired = false;
+      notifyListeners();
+    });
+  }
+
+  @override
+  Future<DiscountQuote> getDiscountQuote({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    bool lockQuote = true,
+  }) async {
+    final ids = serviceIds.toSet().toList(growable: false);
+    if (auth.currentUser == null ||
+        _activeRole != UserRole.customer ||
+        ids.isEmpty) {
+      return super.getDiscountQuote(
+        salonId: salonId,
+        serviceIds: ids,
+        lockQuote: lockQuote,
+      );
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('getDiscountQuote')
+          .call<Map<String, dynamic>>({
+            'salonId': salonId,
+            'serviceIds': ids,
+            if (!lockQuote) 'previewOnly': true,
+          }),
+    );
+    final data = response.data;
+    return _discountQuoteFromData(data);
+  }
+
+  @override
+  Future<List<CheckoutDiscountOffer>> listCheckoutDiscountOffers({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    bool prefetchOnly = false,
+  }) async {
+    final ids = serviceIds.toSet().toList(growable: false);
+    if (auth.currentUser == null ||
+        _activeRole != UserRole.customer ||
+        ids.isEmpty) {
+      return super.listCheckoutDiscountOffers(
+        salonId: salonId,
+        serviceIds: ids,
+        prefetchOnly: prefetchOnly,
+      );
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('listCheckoutDiscountOffers')
+          .call<Map<String, dynamic>>({
+            'salonId': salonId,
+            'serviceIds': ids,
+            if (prefetchOnly) 'prefetchOnly': true,
+          }),
+    );
+    final offers = response.data['offers'];
+    if (offers is! List) return const [];
+    return offers
+        .whereType<Map>()
+        .map((value) => _checkoutDiscountOfferFromData(value))
+        .where((offer) => offer.hasSaving)
+        .toList(growable: false);
+  }
+
+  @override
+  Future<CheckoutCouponResult> applyVisibleCheckoutDiscount({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    required String campaignId,
+  }) {
+    return _runFirebaseSave(() async {
+      final ids = serviceIds.toSet().toList(growable: false);
+      final response = await _callProtectedFunction(
+        () => functions
+            .httpsCallable('applyVisibleCheckoutDiscount')
+            .call<Map<String, dynamic>>({
+              'salonId': salonId,
+              'serviceIds': ids,
+              'campaignId': campaignId.trim(),
+            }),
+      );
+      final data = response.data;
+      final quoteData = data['quote'];
+      DiscountQuote? quote;
+      if (quoteData is Map) {
+        quote = _discountQuoteFromData(Map<String, dynamic>.from(quoteData));
+      }
+      return CheckoutCouponResult(
+        benefitType: _string(data['benefitType'], ''),
+        message: _string(data['message'], 'Offer applied.'),
+        discountQuote: quote,
+      );
+    });
+  }
+
+  @override
+  Future<CheckoutCouponResult> applyCheckoutCoupon({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    required String code,
+  }) {
+    return _runFirebaseSave(() async {
+      if (!hasActiveCustomerSession) {
+        throw StateError('Sign in as a customer to apply coupons.');
+      }
+      final ids = serviceIds.toSet().toList(growable: false);
+      final response = await _callProtectedFunction(
+        () => functions
+            .httpsCallable('applyCheckoutCoupon')
+            .call<Map<String, dynamic>>({
+              'salonId': salonId,
+              'serviceIds': ids,
+              'couponCode': code.trim().toUpperCase(),
+            }),
+      );
+      final data = response.data;
+      final quoteData = data['quote'];
+      DiscountQuote? quote;
+      if (quoteData is Map) {
+        final value = Map<String, dynamic>.from(quoteData);
+        quote = _discountQuoteFromData(value);
+      }
+      if (_string(data['benefitType'], '') == 'proin') {
+        await refreshCustomerProinWallet();
+        await refreshCustomerProinActivity();
+      }
+      return CheckoutCouponResult(
+        benefitType: _string(data['benefitType'], ''),
+        message: _string(data['message'], 'Coupon applied.'),
+        amountProin: _int(data['amountProin'], 0),
+        alreadyClaimed: data['alreadyClaimed'] == true,
+        discountQuote: quote,
+      );
+    });
+  }
+
+  DiscountQuote _discountQuoteFromData(Map<String, dynamic> data) {
+    return DiscountQuote(
+      quoteId: _string(data['quoteId'], ''),
+      campaignId: _string(data['campaignId'], ''),
+      campaignName: _string(data['campaignName'], ''),
+      discountType: _string(data['discountType'], 'percent'),
+      discountPercent: _double(data['discountPercent'], 0),
+      fixedDiscountAmount: _int(data['fixedDiscountAmount'], 0),
+      voucherApplied: data['voucherOnly'] == true,
+      voucherMaskedCode: _string(data['voucherMaskedCode'], ''),
+      originalAmount: _int(data['originalAmount'], 0),
+      discountBaseAmount: _int(data['discountBaseAmount'], 0),
+      discountAmount: _int(data['discountAmount'], 0),
+      customerPayableAmount: _int(data['customerPayableAmount'], 0),
+      pritzePayoutAmount: _int(data['pritzePayoutAmount'], 0),
+      salonTotalEarning: _int(data['salonTotalEarning'], 0),
+      expiresAt: _int(data['expiresAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['expiresAtMillis'], 0),
+            ),
+      campaignEndsAt: _int(data['campaignEndsAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['campaignEndsAtMillis'], 0),
+            ),
+    );
+  }
+
+  CheckoutDiscountOffer _checkoutDiscountOfferFromData(Map data) {
+    return CheckoutDiscountOffer(
+      campaignId: _string(data['campaignId'], ''),
+      campaignName: _string(data['campaignName'], 'Pritze offer'),
+      discountType: _string(data['discountType'], 'percent'),
+      discountPercent: _double(data['discountPercent'], 0),
+      fixedDiscountAmount: _int(data['fixedDiscountAmount'], 0),
+      voucherMaskedCode: _string(data['voucherMaskedCode'], ''),
+      originalAmount: _int(data['originalAmount'], 0),
+      discountAmount: _int(data['discountAmount'], 0),
+      customerPayableAmount: _int(data['customerPayableAmount'], 0),
+      campaignEndsAt: _int(data['campaignEndsAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['campaignEndsAtMillis'], 0),
+            ),
+    );
+  }
+
+  @override
+  Future<ProinWalletSummary> refreshCustomerProinWallet() async {
+    if (!hasActiveCustomerSession) {
+      _customerProinWallet = const ProinWalletSummary();
+      notifyListeners();
+      return _customerProinWallet;
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('getCustomerProinWallet')
+          .call<Map<String, dynamic>>(),
+    );
+    final data = response.data;
+    _customerProinWallet = ProinWalletSummary(
+      availableProin: _int(data['availableProin'], 0),
+      reservedProin: _int(data['reservedProin'], 0),
+      creditLimitProin: _int(data['creditLimitProin'], 0),
+      spendableProin: _int(
+        data['spendableProin'],
+        _int(data['availableProin'], 0),
+      ),
+      lifetimeGrantedProin: _int(data['lifetimeGrantedProin'], 0),
+      lifetimeRedeemedProin: _int(data['lifetimeRedeemedProin'], 0),
+      lifetimeExpiredProin: _int(data['lifetimeExpiredProin'], 0),
+      nextExpiryAt: _int(data['nextExpiryAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['nextExpiryAtMillis'], 0),
+            ),
+      expiringLots: _proinExpiringLots(data['expiringLots']),
+    );
+    notifyListeners();
+    return _customerProinWallet;
+  }
+
+  @override
+  Future<ProinWalletSummary> refreshSalonProinWallet(String salonId) async {
+    final normalizedSalonId = salonId.trim();
+    if (!hasActiveOwnerSession || normalizedSalonId.isEmpty) {
+      _salonProinWallets.remove(normalizedSalonId);
+      notifyListeners();
+      return const ProinWalletSummary();
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('getSalonProinWallet')
+          .call<Map<String, dynamic>>({'salonId': normalizedSalonId}),
+    );
+    final data = response.data;
+    final availableProin = _int(data['availableProin'], 0);
+    final creditLimitProin = _int(data['creditLimitProin'], 1000);
+    final computedSpendableProin = availableProin + creditLimitProin;
+    final wallet = ProinWalletSummary(
+      availableProin: availableProin,
+      reservedProin: _int(data['reservedProin'], 0),
+      creditLimitProin: creditLimitProin,
+      spendableProin: _int(
+        data['spendableProin'],
+        computedSpendableProin < 0 ? 0 : computedSpendableProin,
+      ),
+      lifetimeGrantedProin: _int(data['lifetimeGrantedProin'], 0),
+      lifetimeRedeemedProin: _int(data['lifetimeRedeemedProin'], 0),
+      lifetimeExpiredProin: _int(data['lifetimeExpiredProin'], 0),
+      nextExpiryAt: _int(data['nextExpiryAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['nextExpiryAtMillis'], 0),
+            ),
+      expiringLots: _proinExpiringLots(data['expiringLots']),
+    );
+    _salonProinWallets[normalizedSalonId] = wallet;
+    notifyListeners();
+    return wallet;
+  }
+
+  @override
+  Future<List<ProinActivityEntry>> refreshCustomerProinActivity() async {
+    if (!hasActiveCustomerSession) {
+      _customerProinActivity.clear();
+      notifyListeners();
+      return customerProinActivity;
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('getCustomerProinActivity')
+          .call<Map<String, dynamic>>({'limit': 50}),
+    );
+    final rawEntries = response.data['entries'];
+    final entries = rawEntries is List ? rawEntries : const [];
+    _customerProinActivity
+      ..clear()
+      ..addAll(
+        entries.whereType<Map>().map((raw) {
+          final data = Map<String, dynamic>.from(raw);
+          final createdAtMillis = _int(data['createdAtMillis'], 0);
+          return ProinActivityEntry(
+            transactionId: _string(data['transactionId'], ''),
+            type: _string(data['type'], ''),
+            direction: _string(data['direction'], ''),
+            amountProin: _int(data['amountProin'], 0),
+            restoredProin: _int(data['restoredProin'], 0),
+            expiredProin: _int(data['expiredProin'], 0),
+            sourceType: _string(data['sourceType'], ''),
+            bookingId: _string(data['bookingId'], ''),
+            createdAt: createdAtMillis <= 0
+                ? DateTime.now()
+                : DateTime.fromMillisecondsSinceEpoch(createdAtMillis),
+          );
+        }),
+      );
+    notifyListeners();
+    return customerProinActivity;
+  }
+
+  @override
+  Future<ProinBookingQuote> getProinBookingQuote({
+    required String salonId,
+    required Iterable<String> serviceIds,
+    required DiscountQuote discountQuote,
+  }) async {
+    final ids = serviceIds.toSet().toList(growable: false);
+    if (ids.isEmpty) {
+      return super.getProinBookingQuote(
+        salonId: salonId,
+        serviceIds: ids,
+        discountQuote: discountQuote,
+      );
+    }
+    if (!hasActiveCustomerSession) {
+      throw StateError('Sign in as a customer to use Proin.');
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('getProinBookingQuote')
+          .call<Map<String, dynamic>>({
+            'salonId': salonId,
+            'serviceIds': ids,
+            if (discountQuote.quoteId.isNotEmpty)
+              'quoteId': discountQuote.quoteId,
+          }),
+    );
+    final data = response.data;
+    return ProinBookingQuote(
+      availableProin: _int(data['availableProin'], 0),
+      maximumRedeemableProin: _int(data['allocatedProin'], 0),
+      payableBeforeProin: _int(
+        data['payableBeforeProin'],
+        discountQuote.customerPayableAmount,
+      ),
+      customerPayableAmount: _int(
+        data['customerPayableAmount'],
+        discountQuote.customerPayableAmount,
+      ),
+    );
+  }
+
+  @override
+  Future<ProinCouponClaimResult> claimProinCoupon(String code) async {
+    final normalized = code.trim().toUpperCase();
+    if (normalized.isEmpty) {
+      throw StateError('Enter a coupon code.');
+    }
+    if (!hasActiveCustomerSession) {
+      throw StateError('Sign in as a customer to claim Proin coupons.');
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('claimProinCoupon')
+          .call<Map<String, dynamic>>({'couponCode': normalized}),
+    );
+    final data = response.data;
+    await refreshCustomerProinWallet();
+    await refreshCustomerProinActivity();
+    return ProinCouponClaimResult(
+      amountProin: _int(data['amountProin'], 0),
+      availableProin: _int(
+        data['availableProin'],
+        _customerProinWallet.availableProin,
+      ),
+      expiresAt: _int(data['expiresAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['expiresAtMillis'], 0),
+            ),
+      alreadyClaimed: data['alreadyClaimed'] == true,
+    );
+  }
+
+  @override
+  Future<ProinCouponClaimResult> claimSalonProinCoupon({
+    required String salonId,
+    required String code,
+  }) async {
+    final normalizedSalonId = salonId.trim();
+    final normalized = code.trim().toUpperCase();
+    if (normalizedSalonId.isEmpty) {
+      throw StateError('Choose a salon before applying a coupon.');
+    }
+    if (normalized.isEmpty) {
+      throw StateError('Enter a salon coupon code.');
+    }
+    if (!hasActiveOwnerSession) {
+      throw StateError('Sign in as the salon owner to claim salon coupons.');
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('claimSalonProinCoupon')
+          .call<Map<String, dynamic>>({
+            'salonId': normalizedSalonId,
+            'couponCode': normalized,
+          }),
+    );
+    final data = response.data;
+    await refreshSalonProinWallet(normalizedSalonId);
+    return ProinCouponClaimResult(
+      amountProin: _int(data['amountProin'], 0),
+      availableProin: _int(
+        data['availableProin'],
+        salonProinWallet(normalizedSalonId).availableProin,
+      ),
+      expiresAt: _int(data['expiresAtMillis'], 0) <= 0
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              _int(data['expiresAtMillis'], 0),
+            ),
+      alreadyClaimed: data['alreadyClaimed'] == true,
+    );
+  }
 
   @override
   bool get isRestoringSession => _isRestoringSession;
@@ -3240,12 +4568,20 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   @override
-  Future<Booking> createBooking({required TimeSlot slot}) async {
+  Future<Booking> createBooking({
+    required TimeSlot slot,
+    String quoteId = '',
+    int requestedProin = 0,
+  }) async {
     if (!isSalonCurrentlyOpen(slot.salonId)) {
       throw StateError('The salon is currently closed.');
     }
     if (auth.currentUser != null) {
-      return _createBookingWithFunction(slot);
+      return _createBookingWithFunction(
+        slot,
+        quoteId: quoteId,
+        requestedProin: requestedProin,
+      );
     }
     return _runFirebaseSave(() async {
       final account = _customerAccount;
@@ -3257,9 +4593,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         throw StateError('Please sign in again before booking this slot.');
       }
       if (hasActiveCustomerBooking) {
-        throw StateError(
-          'Cancel or complete your current booking before making another.',
-        );
+        throw StateError('You already have an active booking.');
       }
       final service = getService(slot.salonId, slot.serviceId);
       final selectedBarber = getBarber(slot.barberId);
@@ -3318,6 +4652,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         durationMinutes: service.durationMinutes,
         serviceName: service.name,
         servicePrice: service.price,
+        servicePriceBreakdown: {service.id: service.price},
         bookingFee: _zeroBookingFee,
         paymentRequired: false,
         paymentStatus: _zeroBookingFeeStatus,
@@ -3335,9 +4670,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         }
         if (activeCustomerSnapshot.data()?['active'] == true ||
             legacyActiveInstantSnapshot.data()?['active'] == true) {
-          throw StateError(
-            'Cancel or complete your current booking before making another.',
-          );
+          throw StateError('You already have an active booking.');
         }
         if (lockSnapshots.any(
           (snapshot) => snapshot.exists && snapshot.data()?['active'] != false,
@@ -3398,6 +4731,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     String? serviceId,
     Iterable<String>? serviceIds,
     int arrivalMinutes = 15,
+    String quoteId = '',
+    int requestedProin = 0,
   }) async {
     if (auth.currentUser != null) {
       return _createInstantBookingWithFunction(
@@ -3405,6 +4740,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         serviceId: serviceId,
         serviceIds: serviceIds,
         arrivalMinutes: arrivalMinutes,
+        quoteId: quoteId,
+        requestedProin: requestedProin,
       );
     }
     return _runFirebaseSave(() async {
@@ -3420,9 +4757,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         throw StateError('Choose an arrival time of 15, 20, or 25 minutes.');
       }
       if (hasActiveCustomerBooking) {
-        throw StateError(
-          'Cancel or complete your current booking before making another.',
-        );
+        throw StateError('You already have an active booking.');
       }
       final requestedIds = <String>{
         ...?serviceIds?.map((id) => id.trim()),
@@ -3509,6 +4844,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         durationMinutes: totalDuration,
         serviceName: services.map((service) => service.name).join(', '),
         servicePrice: totalPrice,
+        servicePriceBreakdown: {
+          for (final service in services) service.id: service.price,
+        },
         bookingFee: _zeroBookingFee,
         paymentRequired: false,
         paymentStatus: _zeroBookingFeeStatus,
@@ -3522,9 +4860,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         final activeInstantSnapshot = await transaction.get(activeInstantDoc);
         if (activeCustomerSnapshot.data()?['active'] == true ||
             activeInstantSnapshot.data()?['active'] == true) {
-          throw StateError(
-            'Cancel or complete your current booking before making another.',
-          );
+          throw StateError('You already have an active booking.');
         }
         transaction.set(
           bookingDoc,
@@ -3561,7 +4897,11 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     });
   }
 
-  Future<Booking> _createBookingWithFunction(TimeSlot slot) {
+  Future<Booking> _createBookingWithFunction(
+    TimeSlot slot, {
+    String quoteId = '',
+    int requestedProin = 0,
+  }) {
     return _runFirebaseSave(() async {
       final result = await functions
           .httpsCallable('createBooking')
@@ -3571,6 +4911,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
             'barberId': slot.barberId,
             'startMillis': slot.start.millisecondsSinceEpoch,
             'isInstant': false,
+            if (quoteId.isNotEmpty) 'quoteId': quoteId,
+            if (requestedProin > 0) 'requestedProin': requestedProin,
           });
       return _loadServerBooking(_string(result.data['bookingId'], ''));
     });
@@ -3581,6 +4923,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     String? serviceId,
     Iterable<String>? serviceIds,
     required int arrivalMinutes,
+    String quoteId = '',
+    int requestedProin = 0,
   }) {
     final requestedIds = <String>{
       ...?serviceIds?.map((id) => id.trim()),
@@ -3595,6 +4939,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
             'serviceIds': requestedIds,
             'arrivalMinutes': arrivalMinutes,
             'isInstant': true,
+            if (quoteId.isNotEmpty) 'quoteId': quoteId,
+            if (requestedProin > 0) 'requestedProin': requestedProin,
           });
       return _loadServerBooking(_string(result.data['bookingId'], ''));
     });
@@ -3617,6 +4963,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       _bookings.add(booking);
     } else {
       _bookings[index] = booking;
+    }
+    if (_activeRole == UserRole.customer && booking.hasProin) {
+      unawaited(_refreshCustomerProinWalletInBackground());
     }
     notifyListeners();
     return booking;
@@ -3988,6 +5337,95 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     required String smsCode,
   }) async {
     throw StateError('Barbers do not have login accounts.');
+  }
+
+  @override
+  Future<void> updateCustomerArrivalStatus(
+    String bookingId,
+    CustomerArrivalStatus status,
+  ) async {
+    if (auth.currentUser == null) {
+      return super.updateCustomerArrivalStatus(bookingId, status);
+    }
+    await _runFirebaseSave(() async {
+      await functions.httpsCallable('updateCustomerArrivalStatus').call<void>({
+        'bookingId': bookingId,
+        'arrivalStatus': status.name,
+      });
+      await _loadServerBooking(bookingId);
+    });
+  }
+
+  @override
+  Future<DateTime> startCustomerArrivalSharing(
+    String bookingId, {
+    required double latitude,
+    required double longitude,
+    required double accuracyMeters,
+    required double speedMetersPerSecond,
+    required DateTime capturedAt,
+  }) async {
+    if (auth.currentUser == null) {
+      return super.startCustomerArrivalSharing(
+        bookingId,
+        latitude: latitude,
+        longitude: longitude,
+        accuracyMeters: accuracyMeters,
+        speedMetersPerSecond: speedMetersPerSecond,
+        capturedAt: capturedAt,
+      );
+    }
+    late DateTime expiresAt;
+    await _runFirebaseSave(() async {
+      final response = await functions
+          .httpsCallable('startCustomerArrivalSharing')
+          .call<Map<String, dynamic>>({
+            'bookingId': bookingId,
+            'latitude': latitude,
+            'longitude': longitude,
+            'accuracyMeters': accuracyMeters,
+            'speedMetersPerSecond': speedMetersPerSecond,
+            'capturedAtMillis': capturedAt.millisecondsSinceEpoch,
+          });
+      expiresAt = DateTime.fromMillisecondsSinceEpoch(
+        _int(response.data['expiresAtMillis'], 0),
+      );
+      await _loadServerBooking(bookingId);
+    });
+    return expiresAt;
+  }
+
+  @override
+  Future<void> updateCustomerArrivalLocation(
+    String bookingId, {
+    required double latitude,
+    required double longitude,
+    required double accuracyMeters,
+    required double speedMetersPerSecond,
+    required DateTime capturedAt,
+  }) async {
+    if (auth.currentUser == null) return;
+    await functions.httpsCallable('updateCustomerArrivalLocation').call<void>({
+      'bookingId': bookingId,
+      'latitude': latitude,
+      'longitude': longitude,
+      'accuracyMeters': accuracyMeters,
+      'speedMetersPerSecond': speedMetersPerSecond,
+      'capturedAtMillis': capturedAt.millisecondsSinceEpoch,
+    });
+  }
+
+  @override
+  Future<void> stopCustomerArrivalSharing(String bookingId) async {
+    if (auth.currentUser == null) {
+      return super.stopCustomerArrivalSharing(bookingId);
+    }
+    await _runFirebaseSave(() async {
+      await functions.httpsCallable('stopCustomerArrivalSharing').call<void>({
+        'bookingId': bookingId,
+      });
+      await _loadServerBooking(bookingId);
+    });
   }
 
   @override
@@ -4650,16 +6088,25 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     bool isAvailable = true,
     bool instantBookingEnabled = true,
   }) async {
+    if (!isApprovedServiceName(name)) {
+      throw ArgumentError(
+        'Choose a service from the standard Pritze service menu.',
+      );
+    }
+    final template = serviceTemplateForName(name)!;
+    final shouldPersist = ownerSalonOrNull != null;
     await _runFirebaseSave(() async {
       await super.addOwnerService(
-        name: name,
-        category: category,
+        name: template.name,
+        category: template.category,
         price: price,
         durationMinutes: durationMinutes,
         isAvailable: isAvailable,
         instantBookingEnabled: instantBookingEnabled,
       );
-      await _setSalon(ownerSalon);
+      if (shouldPersist) {
+        await _setSalon(ownerSalon);
+      }
     });
   }
 
@@ -4673,29 +6120,42 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     bool? isAvailable,
     bool? instantBookingEnabled,
   }) async {
+    final currentService = ownerSalon.services
+        .where((service) => service.id == serviceId)
+        .firstOrNull;
+    final template = currentService == null
+        ? null
+        : serviceTemplateForName(currentService.name);
+    if (template == null) {
+      throw StateError('This service is not in the standard service menu.');
+    }
+    final shouldPersist = ownerSalonOrNull != null;
     await _runFirebaseSave(() async {
       await super.updateOwnerService(
         serviceId: serviceId,
-        name: name,
-        category: category,
+        name: template.name,
+        category: template.category,
         price: price,
         durationMinutes: durationMinutes,
         isAvailable: isAvailable,
         instantBookingEnabled: instantBookingEnabled,
       );
-      await _setSalon(ownerSalon);
+      if (shouldPersist) {
+        await _setSalon(ownerSalon);
+      }
     });
   }
 
   @override
   Future<int> addOwnerServicesFromCatalog({
-    Iterable<String>? categories,
+    Iterable<String>? serviceNames,
   }) async {
+    final shouldPersist = ownerSalonOrNull != null;
     return _runFirebaseSave(() async {
       final added = await super.addOwnerServicesFromCatalog(
-        categories: categories,
+        serviceNames: serviceCatalog.map((service) => service.name),
       );
-      if (added > 0) {
+      if (added > 0 && shouldPersist) {
         await _setSalon(ownerSalon);
       }
       return added;
@@ -4704,13 +6164,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
   @override
   Future<void> removeOwnerService(String serviceId) async {
-    await _runFirebaseSave(() async {
-      await super.removeOwnerService(serviceId);
-      await _setSalon(ownerSalon);
-      for (final barber in _barbers) {
-        await _setBarber(barber);
-      }
-    });
+    throw StateError(
+      'Standard services cannot be removed. Mark the service unavailable instead.',
+    );
   }
 
   @override
@@ -5055,15 +6511,16 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     final payload = _decodeNotificationPayload(response.payload);
     final bookingId = payload['bookingId']?.toString().trim() ?? '';
     final destination = _notificationDestination(payload['destination']);
-    if (bookingId.isNotEmpty && payload['isInstant']?.toString() == 'true') {
-      silenceOwnerBookingAlert(bookingId);
-    }
-    queueNotificationNavigation(destination, bookingId: bookingId);
-
     final actionId = response.actionId?.trim() ?? '';
     final isBookingDecision =
         actionId == _acceptInstantBookingNotificationAction ||
         actionId == _rejectInstantBookingNotificationAction;
+    if (isBookingDecision &&
+        bookingId.isNotEmpty &&
+        payload['isInstant']?.toString() == 'true') {
+      silenceOwnerBookingAlert(bookingId);
+    }
+    queueNotificationNavigation(destination, bookingId: bookingId);
     if (!isBookingDecision || bookingId.isEmpty) {
       return;
     }
@@ -5478,6 +6935,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     _joinRequests.clear();
     _salonFeedback.clear();
     _customerSalonRatings.clear();
+    _customerProinWallet = const ProinWalletSummary();
+    _salonProinWallets.clear();
+    _customerProinActivity.clear();
     _stopOwnerBookingAlarm();
     notifyListeners();
 
@@ -5486,6 +6946,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       _activeRole = null;
       _customerAccount = null;
       _ownerAccount = null;
+      _ownerDraftServices.clear();
       _barberAccount = null;
       _currentBarberId = null;
       _currentJoinRequestId = null;
@@ -5508,10 +6969,14 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         }
         final account = _accountFromFirebaseUser(user, data);
         final role = _roleFromName(data['role'] as String?);
+        _referralOnboardingRequired =
+            data['referralOnboardingCompleted'] == false;
         if (role == UserRole.customer && _activeRole == UserRole.customer) {
           _customerAccount = account;
         } else if (role == UserRole.owner && _activeRole == UserRole.owner) {
           _ownerAccount = account;
+          unawaited(_saveMessagingToken(user.uid));
+          _syncOwnerBookingAlarm();
         }
         notifyListeners();
       }),
@@ -5586,6 +7051,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
           .limit(1)
           .get();
       final data = doc.data() ?? {};
+      _referralOnboardingRequired =
+          data['referralOnboardingCompleted'] == false;
       final roles = _rolesFromData(data['roles']);
       final storedRole = _roleFromName(data['activeRole'] as String?);
       final authoritativeRole = _roleFromName(data['role'] as String?);
@@ -5617,6 +7084,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         return;
       }
       _activateRole(role, account);
+      if (role == UserRole.customer) {
+        unawaited(_refreshCustomerProinWalletInBackground());
+      }
       await _saveMessagingToken(user.uid);
       if (restoreGeneration != _accountRestoreGeneration ||
           auth.currentUser?.uid != user.uid) {
@@ -5694,6 +7164,57 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     } finally {
       _setSaving(false);
     }
+  }
+
+  Future<void> _refreshCallableCredentials({bool force = false}) async {
+    final now = DateTime.now();
+    final last = _lastCallableCredentialRefreshAt;
+    if (!force &&
+        last != null &&
+        now.difference(last) < const Duration(minutes: 2)) {
+      return;
+    }
+    _lastCallableCredentialRefreshAt = now;
+
+    final user = auth.currentUser;
+    if (user != null) {
+      try {
+        await user.getIdToken(true);
+      } catch (error) {
+        _lastCallableCredentialRefreshAt = null;
+        if (kDebugMode) {
+          debugPrint('Firebase Auth token refresh failed: $error');
+        }
+        rethrow;
+      }
+    }
+
+    try {
+      await FirebaseAppCheck.instance.getToken(force);
+    } catch (error) {
+      _lastCallableCredentialRefreshAt = null;
+      if (kDebugMode) {
+        debugPrint('Firebase App Check token refresh failed: $error');
+      }
+    }
+  }
+
+  Future<T> _callProtectedFunction<T>(Future<T> Function() operation) async {
+    await _refreshCallableCredentials();
+    try {
+      return await operation();
+    } catch (error) {
+      if (_isCallableUnauthenticated(error)) {
+        await _refreshCallableCredentials(force: true);
+        return operation();
+      }
+      rethrow;
+    }
+  }
+
+  bool _isCallableUnauthenticated(Object error) {
+    return error is FirebaseFunctionsException &&
+        error.code.toLowerCase() == 'unauthenticated';
   }
 
   Future<T> _withPendingLoginRole<T>(
@@ -5899,12 +7420,23 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
     _accountRestoreGeneration += 1;
     _activateRole(role, resolvedAccount);
+    if (role == UserRole.customer) {
+      unawaited(_refreshCustomerProinWalletInBackground());
+    }
     try {
       await _upsertUser(resolvedAccount, role: role);
     } catch (error) {
       _setSyncError(error);
     }
     return resolvedAccount;
+  }
+
+  Future<void> _refreshCustomerProinWalletInBackground() async {
+    try {
+      await refreshCustomerProinWallet();
+    } catch (error) {
+      _setSyncError(error);
+    }
   }
 
   Future<String> _claimLoginRole(
@@ -5929,6 +7461,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     if (response.data['requiresName'] == true) {
       throw const CustomerNameRequiredException();
     }
+    _referralOnboardingRequired =
+        response.data['requiresReferralOnboarding'] == true;
     return response.data['name']?.toString().trim() ?? '';
   }
 
@@ -6001,7 +7535,9 @@ Map<String, Object?> _salonToMap(Salon salon) {
     'isOpen': salon.isOpen,
     'instantBookingsEnabled': salon.instantBookingsEnabled,
     'instantBookingsPausedDate': salon.instantBookingsPausedDate ?? '',
-    'services': salon.services.map(_serviceToMap).toList(),
+    'services': canonicalSalonServices(
+      salon.services,
+    ).map(_serviceToMap).toList(),
     'updatedAt': FieldValue.serverTimestamp(),
   };
 }
@@ -6015,6 +7551,7 @@ Map<String, Object?> _serviceToMap(SalonService service) {
     'durationMinutes': service.durationMinutes,
     'isAvailable': service.isAvailable,
     'instantBookingEnabled': service.instantBookingEnabled,
+    'isCustom': service.isCustom,
   };
 }
 
@@ -6054,9 +7591,27 @@ Map<String, Object?> _bookingToFirestore(
     'durationMinutes': booking.durationMinutes,
     'serviceName': booking.serviceName,
     'servicePrice': booking.servicePrice,
+    'servicePriceBreakdown': booking.servicePriceBreakdown,
     'bookingFee': booking.bookingFee,
     'paymentRequired': booking.paymentRequired,
     'paymentStatus': booking.paymentStatus,
+    'discountCampaignId': booking.discountCampaignId,
+    'discountCampaignName': booking.discountCampaignName,
+    'discountPercent': booking.discountPercent,
+    'discountBaseAmount': booking.discountBaseAmount,
+    'discountAmount': booking.discountAmount,
+    'customerPayableAmount': booking.customerPayableAmount,
+    'pritzePayoutAmount': booking.pritzePayoutAmount,
+    'salonTotalEarning': booking.salonTotalEarning,
+    'discountStatus': booking.discountStatus,
+    'customerPayableBeforeProin': booking.customerPayableBeforeProin,
+    'proinStatus': booking.proinStatus,
+    'proinRequestedAmount': booking.proinRequestedAmount,
+    'proinReservedAmount': booking.proinReservedAmount,
+    'proinRedeemedAmount': booking.proinRedeemedAmount,
+    'proinReleasedAmount': booking.proinReleasedAmount,
+    'proinExpiredOnReleaseAmount': booking.proinExpiredOnReleaseAmount,
+    'proinReimbursementStatus': booking.proinReimbursementStatus,
     'status': _bookingStatusName(booking.status),
     'createdAt': Timestamp.fromDate(booking.createdAt),
     'isInstant': booking.isInstant,
@@ -6111,6 +7666,13 @@ Map<String, Object?> _bookingStatusUpdateToFirestore(Booking booking) {
         : Timestamp.fromDate(booking.rejectedAt!),
     'cancellationReason': booking.cancellationReason,
     'cancelledBy': booking.cancelledBy,
+    'discountStatus': booking.discountStatus,
+    'proinStatus': booking.proinStatus,
+    'proinReservedAmount': booking.proinReservedAmount,
+    'proinRedeemedAmount': booking.proinRedeemedAmount,
+    'proinReleasedAmount': booking.proinReleasedAmount,
+    'proinExpiredOnReleaseAmount': booking.proinExpiredOnReleaseAmount,
+    'proinReimbursementStatus': booking.proinReimbursementStatus,
     'updatedAt': FieldValue.serverTimestamp(),
   };
 }
@@ -6138,10 +7700,12 @@ Map<String, Object?> _joinRequestToFirestore(
 
 Salon _salonFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
   final data = doc.data() ?? {};
-  final services = (data['services'] as List<dynamic>? ?? [])
-      .whereType<Map<dynamic, dynamic>>()
-      .map((item) => _serviceFromMap(Map<String, dynamic>.from(item)))
-      .toList();
+  final services = canonicalSalonServices(
+    (data['services'] as List<dynamic>? ?? [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map((item) => _serviceFromMap(Map<String, dynamic>.from(item)))
+        .toList(),
+  );
   return Salon(
     id: doc.id,
     name: _string(data['name'], ''),
@@ -6165,14 +7729,16 @@ Salon _salonFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
 }
 
 SalonService _serviceFromMap(Map<String, dynamic> data) {
+  final name = _string(data['name'], 'Service');
   return SalonService(
     id: _string(data['id'], 'service-${DateTime.now().microsecondsSinceEpoch}'),
-    name: _string(data['name'], 'Service'),
+    name: name,
     category: _string(data['category'], 'Grooming'),
     price: _int(data['price'], 0),
     durationMinutes: _int(data['durationMinutes'], 30),
     isAvailable: data['isAvailable'] != false,
     instantBookingEnabled: data['instantBookingEnabled'] != false,
+    isCustom: inferServiceIsCustom(name, data['isCustom']),
   );
 }
 
@@ -6211,9 +7777,36 @@ Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
     durationMinutes: _int(data['durationMinutes'], 30),
     serviceName: _string(data['serviceName'], ''),
     servicePrice: _int(data['servicePrice'], 0),
+    servicePriceBreakdown: _intMap(data['servicePriceBreakdown']),
     bookingFee: _int(data['bookingFee'], _zeroBookingFee),
     paymentRequired: data['paymentRequired'] == true,
     paymentStatus: _string(data['paymentStatus'], _zeroBookingFeeStatus),
+    discountCampaignId: _string(data['discountCampaignId'], ''),
+    discountCampaignName: _string(data['discountCampaignName'], ''),
+    discountPercent: _double(data['discountPercent'], 0),
+    discountBaseAmount: _int(data['discountBaseAmount'], 0),
+    discountAmount: _int(data['discountAmount'], 0),
+    customerPayableAmount: _int(
+      data['customerPayableAmount'],
+      _int(data['servicePrice'], 0),
+    ),
+    pritzePayoutAmount: _int(data['pritzePayoutAmount'], 0),
+    salonTotalEarning: _int(
+      data['salonTotalEarning'],
+      _int(data['servicePrice'], 0),
+    ),
+    discountStatus: _string(data['discountStatus'], 'none'),
+    customerPayableBeforeProin: _int(
+      data['customerPayableBeforeProin'],
+      _int(data['customerPayableAmount'], _int(data['servicePrice'], 0)),
+    ),
+    proinStatus: _string(data['proinStatus'], 'none'),
+    proinRequestedAmount: _int(data['proinRequestedAmount'], 0),
+    proinReservedAmount: _int(data['proinReservedAmount'], 0),
+    proinRedeemedAmount: _int(data['proinRedeemedAmount'], 0),
+    proinReleasedAmount: _int(data['proinReleasedAmount'], 0),
+    proinExpiredOnReleaseAmount: _int(data['proinExpiredOnReleaseAmount'], 0),
+    proinReimbursementStatus: _string(data['proinReimbursementStatus'], 'none'),
     status: _bookingStatusFromName(_string(data['status'], 'pending')),
     createdAt: _date(data['createdAt']),
     isInstant: data['isInstant'] == true,
@@ -6234,6 +7827,12 @@ Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
     ),
     cancellationReason: _string(data['cancellationReason'], ''),
     cancelledBy: _string(data['cancelledBy'], ''),
+    arrivalStatus: _customerArrivalStatusFromName(
+      _string(data['arrivalStatus'], 'notStarted'),
+    ),
+    arrivalStatusUpdatedAt: _nullableDate(data['arrivalStatusUpdatedAt']),
+    arrivalSharingActive: data['arrivalSharingActive'] == true,
+    arrivalSharingExpiresAt: _nullableDate(data['arrivalSharingExpiresAt']),
   );
 }
 
@@ -6301,6 +7900,13 @@ BookingStatus _bookingStatusFromName(String value) {
   );
 }
 
+CustomerArrivalStatus _customerArrivalStatusFromName(String value) {
+  return CustomerArrivalStatus.values.firstWhere(
+    (status) => status.name == value,
+    orElse: () => CustomerArrivalStatus.notStarted,
+  );
+}
+
 String _joinRequestStatusName(JoinRequestStatus status) {
   return status.name;
 }
@@ -6358,6 +7964,38 @@ List<String> _stringList(Object? value) {
   );
 }
 
+List<ProinExpiringLot> _proinExpiringLots(Object? value) {
+  if (value is! List) return const [];
+  final lots = <ProinExpiringLot>[];
+  for (final raw in value.whereType<Map>()) {
+    final data = Map<String, dynamic>.from(raw);
+    final expiresAtMillis = _int(data['expiresAtMillis'], 0);
+    final amountProin = _int(data['amountProin'], 0);
+    if (expiresAtMillis <= 0 || amountProin <= 0) continue;
+    lots.add(
+      ProinExpiringLot(
+        lotId: _string(data['lotId'], ''),
+        amountProin: amountProin,
+        expiresAt: DateTime.fromMillisecondsSinceEpoch(expiresAtMillis),
+        sourceType: _string(data['sourceType'], ''),
+      ),
+    );
+  }
+  lots.sort((left, right) => left.expiresAt.compareTo(right.expiresAt));
+  return List.unmodifiable(lots);
+}
+
+Map<String, int> _intMap(Object? value) {
+  if (value is! Map) {
+    return const {};
+  }
+  return Map.unmodifiable({
+    for (final entry in value.entries)
+      if (entry.key.toString().trim().isNotEmpty)
+        entry.key.toString(): _int(entry.value, 0),
+  });
+}
+
 String _dateKey(DateTime date) {
   return '${date.year.toString().padLeft(4, '0')}-'
       '${date.month.toString().padLeft(2, '0')}-'
@@ -6413,6 +8051,24 @@ int? _parseClockMinutes(String value) {
     return null;
   }
   return hour * 60 + minute;
+}
+
+String formatSalonClockTime(String value) {
+  final minutes = _parseClockMinutes(value);
+  if (minutes == null) return value.trim();
+  final hour24 = minutes ~/ 60;
+  final minute = (minutes % 60).toString().padLeft(2, '0');
+  final period = hour24 >= 12 ? 'PM' : 'AM';
+  final hour12 = hour24 == 0 ? 12 : (hour24 > 12 ? hour24 - 12 : hour24);
+  return '$hour12:$minute $period';
+}
+
+String formatSalonHoursRange(Salon salon) {
+  if (salon.openTime.trim().isEmpty || salon.closeTime.trim().isEmpty) {
+    return 'Hours pending';
+  }
+  return '${formatSalonClockTime(salon.openTime)} – '
+      '${formatSalonClockTime(salon.closeTime)}';
 }
 
 bool _isValidEmail(String value) {

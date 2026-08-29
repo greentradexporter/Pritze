@@ -1,6 +1,12 @@
 const crypto = require("node:crypto");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
+const {GoogleAuth} = require("google-auth-library");
+const androidRelease = require("./android_release.json");
+const {
+  highestPublishedVersionCode,
+  resolveAndroidUpdateVersion,
+} = require("./android_update_logic");
 const {
   inferStoredRole,
   loginRoleConflictMessage,
@@ -13,16 +19,28 @@ const {
   sameRolePhoneConflictMessage,
 } = require("./auth_login_logic");
 const {
+  ADMIN_PASSWORD_LOCKOUT_MS,
+  adminCredentialId,
+  createAdminPasswordHash,
+  nextAdminPasswordFailure,
+  normalizeAdminPassword,
+  normalizeAdminUserId,
+  verifyAdminPassword,
+} = require("./admin_password_auth_logic");
+const {
   bookingRecipientRoles,
   bookingStatusRecipients,
 } = require("./booking_notification_logic");
 const {
   INSTANT_ARRIVAL_MINUTES,
+  INSTANT_RESPONSE_TIMEOUT_MS,
   bookingArrivalReminderDue,
   bookingTransitionError,
   canRescheduleBooking,
   isBlockingBooking,
   isWithinSalonHours,
+  serviceAutoCompleteAtMillis,
+  shouldAutoCompleteService,
   slotSegmentMillis,
   zonedDateParts,
 } = require("./booking_workflow_logic");
@@ -34,6 +52,52 @@ const {
   sanitizePhotoUrls,
   sanitizeShortList,
 } = require("./customer_profile_logic");
+const {
+  generateReferralCode,
+  normalizeReferralCode,
+  referralRewardSummary,
+  referralTargetAllowed,
+} = require("./referral_logic");
+const {
+  calculateDiscountQuote,
+  DEFAULT_SALON_PROMOTION_CREDIT_LIMIT,
+  discountBaseAmount,
+  discountBudgetAllows,
+  discountCampaignEligible,
+  discountCampaignSelectableAtCheckout,
+  discountFundingSource,
+  emptyDiscountQuote,
+  money,
+  signedMoney,
+} = require("./discount_logic");
+const {
+  DiscountAdminValidationError,
+  normalizeDiscountCampaignInput,
+  normalizeSalonPromotionCreditLimit,
+  normalizeDiscountVaultBudget,
+} = require("./discount_admin_logic");
+const {
+  ProinValidationError,
+} = require("./proin_logic");
+const {
+  normalizeProinCouponCode,
+  proinCouponHash,
+} = require("./proin_coupon_logic");
+const {createProinBackend} = require("./proin_backend");
+const {
+  DEFAULT_ADMIN_AUTOMATION_RULES,
+  evaluateOperationalAlerts,
+  normalizedRules,
+} = require("./admin_intelligence_logic");
+const {
+  coordinatesFromSalon,
+  distanceMeters,
+  estimatedArrivalMinutes,
+  sharingExpiresAtMillis,
+  validArrivalStatus,
+  validCoordinates,
+  validLocationUpdate,
+} = require("./arrival_tracking_logic");
 const {HttpsError, onCall} = require("firebase-functions/v2/https");
 const {
   onDocumentCreated,
@@ -43,6 +107,8 @@ const {defineSecret} = require("firebase-functions/params");
 const {onSchedule} = require("firebase-functions/v2/scheduler");
 
 admin.initializeApp();
+
+const proinBackend = createProinBackend({admin, HttpsError});
 
 const smtpHost = defineSecret("SMTP_HOST");
 const smtpPort = defineSecret("SMTP_PORT");
@@ -60,10 +126,24 @@ const LEGACY_OWNER_BOOKING_REQUEST_CHANNEL =
 const OWNER_BOOKING_REQUEST_SOUND = "owner_booking_request";
 const IOS_OWNER_BOOKING_REQUEST_CATEGORY = "PRITZE_BOOKING_REQUEST_V2";
 const OWNER_ALERT_REPEAT_DELAY_MS = 25_000;
-const OWNER_ALERT_ATTEMPTS = 4;
-const ANDROID_CURRENT_VERSION_CODE = 29;
+const OWNER_ALERT_ATTEMPTS = 6;
+const DISCOUNT_QUOTE_TTL_MS = 10 * 60 * 1000;
+const REFERRAL_ATTEMPT_WINDOW_MS = 60 * 60 * 1000;
+const REFERRAL_ATTEMPT_LIMIT = 10;
+const DISCOUNT_QUOTE_LIMIT = 60;
+const PROIN_COUPON_ATTEMPT_LIMIT = 10;
+const PROIN_QUOTE_ATTEMPT_LIMIT = 60;
+// This stays at the last version known to be publicly downloadable. Release
+// builds update android_release.json automatically, while Google Play remains
+// the authority that decides when the candidate can be advertised to users.
+const ANDROID_LAST_CONFIRMED_PUBLIC_VERSION_CODE = 31;
 const ANDROID_PLAY_STORE_URL =
   "https://play.google.com/store/apps/details?id=com.trimtime.app";
+const ANDROID_RELEASES_API_URL =
+  "https://androidpublisher.googleapis.com/androidpublisher/v3/" +
+  "applications/com.trimtime.app/tracks/production/releases";
+const ANDROID_RELEASE_CACHE_MS = 5 * 60 * 1000;
+let androidReleaseCache = {expiresAt: 0, versionCode: null};
 // Keep this aligned with the newest build that is publicly downloadable.
 // Do not advance it merely because a newer build was uploaded for review.
 const IOS_CURRENT_BUILD_NUMBER = 28;
@@ -73,23 +153,82 @@ const IOS_APP_STORE_LOOKUP_URL =
   "https://itunes.apple.com/lookup?id=6792811282&country=in";
 const IOS_APP_STORE_URL =
   "https://apps.apple.com/in/app/pritze/id6792811282";
+const PLATFORM_ADMIN_EMAIL_HASHES = new Set([
+  "7f3bb1d3b9445a8dafcfa10873b7ffc4221ecc4e3234acad83dddb7f021f2c20",
+]);
+const ADMIN_PASSWORD_ATTEMPT_LIMIT = 12;
+const ADMIN_PASSWORD_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const DUMMY_ADMIN_PASSWORD_HASH = createAdminPasswordHash(
+  "InvalidPassword1",
+  Buffer.alloc(16),
+);
 
-exports.getAndroidAppUpdate = onCall({invoker: "public"}, async () => {
+exports.getAndroidAppUpdate = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  async () => {
   const snapshot = await admin.firestore()
     .collection("appConfig")
     .doc("android")
     .get();
   const configured = snapshot.data() || {};
-  const latestVersionCode = positiveInteger(
+  const configuredVersionCode = positiveInteger(
     configured.latestVersionCode || configured.latestBuildNumber,
-    ANDROID_CURRENT_VERSION_CODE,
+    ANDROID_LAST_CONFIRMED_PUBLIC_VERSION_CODE,
   );
+  const playPublishedVersionCode = await getPlayPublishedAndroidVersion();
+  const latestVersionCode = resolveAndroidUpdateVersion({
+    lastConfirmedPublicVersion:
+      ANDROID_LAST_CONFIRMED_PUBLIC_VERSION_CODE,
+    candidateVersion: androidRelease.candidateVersionCode,
+    configuredVersion: configuredVersionCode,
+    playPublishedVersion: playPublishedVersionCode,
+  });
   const playStoreUrl = String(configured.playStoreUrl || "").trim() ||
     ANDROID_PLAY_STORE_URL;
-  return {latestVersionCode, playStoreUrl};
-});
+  return {
+    latestVersionCode,
+    playStoreUrl,
+    playStoreVerified: playPublishedVersionCode !== null,
+  };
+  },
+);
 
-exports.getIosAppUpdate = onCall({invoker: "public"}, async () => {
+async function getPlayPublishedAndroidVersion() {
+  const now = Date.now();
+  if (androidReleaseCache.expiresAt > now) {
+    return androidReleaseCache.versionCode;
+  }
+  try {
+    const auth = new GoogleAuth({
+      scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+    });
+    const client = await auth.getClient();
+    const response = await client.request({
+      url: ANDROID_RELEASES_API_URL,
+      method: "GET",
+      timeout: 8000,
+    });
+    const versionCode = highestPublishedVersionCode(response.data);
+    androidReleaseCache = {
+      expiresAt: now + ANDROID_RELEASE_CACHE_MS,
+      versionCode,
+    };
+    return versionCode;
+  } catch (error) {
+    console.warn("Google Play release verification failed", {
+      message: error?.message || String(error),
+    });
+    androidReleaseCache = {
+      expiresAt: now + 60 * 1000,
+      versionCode: null,
+    };
+    return null;
+  }
+}
+
+exports.getIosAppUpdate = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  async () => {
   const snapshot = await admin.firestore()
     .collection("appConfig")
     .doc("ios")
@@ -122,9 +261,2701 @@ exports.getIosAppUpdate = onCall({invoker: "public"}, async () => {
   const appStoreUrl = String(configured.appStoreUrl || "").trim() ||
     IOS_APP_STORE_URL;
   return {latestBuildNumber, appStoreUrl};
+  },
+);
+
+exports.getAdminPhaseOneData = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const firestore = admin.firestore();
+    const platformAdmin = await firestore
+      .collection("platformAdmins")
+      .doc(uid)
+      .get();
+    const hasActiveAdminRecord = platformAdmin.exists &&
+      platformAdmin.data()?.active !== false;
+    const hasAdminClaim = request.auth?.token?.platformAdmin === true &&
+      hasActiveAdminRecord;
+    const tokenEmail = normalizeEmail(request.auth?.token?.email);
+    const tokenEmailHash = tokenEmail ?
+      crypto.createHash("sha256").update(tokenEmail).digest("hex") : "";
+    const hasInvitedAdminEmail =
+      request.auth?.token?.email_verified !== false &&
+      PLATFORM_ADMIN_EMAIL_HASHES.has(tokenEmailHash) &&
+      (!platformAdmin.exists || hasActiveAdminRecord);
+    if (!hasAdminClaim && !hasActiveAdminRecord && !hasInvitedAdminEmail) {
+      throw new HttpsError(
+        "permission-denied",
+        "This account is not a Pritze platform administrator.",
+      );
+    }
+    if (hasInvitedAdminEmail && !platformAdmin.exists) {
+      await platformAdmin.ref.set({
+        active: true,
+        email: tokenEmail,
+        provisionedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    const [
+      bookingsSnapshot,
+      salonsSnapshot,
+      barbersSnapshot,
+      customersSnapshot,
+      salonFeedbackSnapshot,
+      customerRatingsSnapshot,
+      joinRequestsSnapshot,
+      settlementsSnapshot,
+      walletsSnapshot,
+      notesSnapshot,
+      auditSnapshot,
+      automationRulesSnapshot,
+      operationalAlertsSnapshot,
+      arrivalSessionsSnapshot,
+    ] = await Promise.all([
+      firestore.collection("bookings")
+        .orderBy("start", "desc")
+        .limit(1000)
+        .get(),
+      firestore.collection("salons").limit(500).get(),
+      firestore.collection("barbers").limit(1000).get(),
+      firestore.collection("users")
+        .where("role", "==", "customer")
+        .limit(1000)
+        .get(),
+      firestore.collection("salonFeedback")
+        .orderBy("createdAt", "desc")
+        .limit(500)
+        .get(),
+      firestore.collection("customerRatings")
+        .orderBy("createdAt", "desc")
+        .limit(500)
+        .get(),
+      firestore.collection("joinRequests")
+        .orderBy("requestedAt", "desc")
+        .limit(500)
+        .get(),
+      firestore.collection("salonSettlements").limit(1000).get(),
+      firestore.collection("salonWallets").limit(500).get(),
+      firestore.collection("adminNotes")
+        .orderBy("createdAt", "desc")
+        .limit(500)
+        .get(),
+      firestore.collection("adminAuditLogs")
+        .orderBy("createdAt", "desc")
+        .limit(500)
+        .get(),
+      firestore.collection("adminAutomationRules").limit(50).get(),
+      firestore.collection("adminOperationalAlerts").limit(500).get(),
+      firestore.collection("bookingArrivalSessions").limit(500).get(),
+    ]);
+
+    return {
+      generatedAtMillis: Date.now(),
+      bookings: bookingsSnapshot.docs.map(adminBookingRecord),
+      salons: salonsSnapshot.docs.map(adminSalonRecord),
+      barbers: barbersSnapshot.docs.map(adminBarberRecord),
+      customers: customersSnapshot.docs.map(adminCustomerRecord),
+      reviews: [
+        ...salonFeedbackSnapshot.docs.map((document) =>
+          adminReviewRecord(document, "salon")),
+        ...customerRatingsSnapshot.docs.map((document) =>
+          adminReviewRecord(document, "customer")),
+      ],
+      joinRequests: joinRequestsSnapshot.docs.map(adminJoinRequestRecord),
+      settlements: settlementsSnapshot.docs.map(adminSettlementRecord),
+      wallets: walletsSnapshot.docs.map(adminWalletRecord),
+      notes: notesSnapshot.docs.map(adminNoteRecord),
+      auditLogs: auditSnapshot.docs.map(adminAuditLogRecord),
+      automationRules: adminAutomationRuleRecords(automationRulesSnapshot),
+      operationalAlerts: operationalAlertsSnapshot.docs
+        .map(adminOperationalAlertRecord)
+        .sort((left, right) => right.detectedAtMillis - left.detectedAtMillis),
+      arrivalSessions: arrivalSessionsSnapshot.docs
+        .map(adminArrivalSessionRecord)
+        .filter((session) => session.bookingId && session.sharingActive)
+        .sort((left, right) =>
+          right.lastLocationAtMillis - left.lastLocationAtMillis),
+    };
+  },
+);
+
+exports.markSalonSettlementPaid = onCall(
+  {invoker: "public", enforceAppCheck: false},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const bookingId = requiredId(request.data?.bookingId, "booking id");
+    const paymentReference = String(request.data?.paymentReference ?? "")
+      .trim().slice(0, 120);
+    const reason = requiredAdminReason(request.data?.reason);
+    if (paymentReference.length < 4) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Enter the external payment reference.",
+      );
+    }
+    const paidAtMillis = Number(request.data?.paidAtMillis) || Date.now();
+    if (paidAtMillis <= 0 || paidAtMillis > Date.now() + 5 * 60 * 1000) {
+      throw new HttpsError("invalid-argument", "Enter a valid payment date.");
+    }
+    const firestore = admin.firestore();
+    const settlementRef = firestore.collection("salonSettlements").doc(bookingId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    const paymentReferenceRef = firestore
+      .collection("settlementPaymentReferences")
+      .doc(crypto.createHash("sha256")
+        .update(paymentReference.toUpperCase()).digest("hex"));
+    let result = null;
+    await firestore.runTransaction(async (transaction) => {
+      const [settlementSnapshot, paymentReferenceSnapshot] = await Promise.all([
+        transaction.get(settlementRef),
+        transaction.get(paymentReferenceRef),
+      ]);
+      const settlement = settlementSnapshot.data();
+      if (!settlement) {
+        throw new HttpsError("not-found", "Settlement not found.");
+      }
+      if (settlement.status === "paid") {
+        if (settlement.paymentReference !== paymentReference) {
+          throw new HttpsError(
+            "already-exists",
+            "This settlement was already paid with another reference.",
+          );
+        }
+        if (paymentReferenceSnapshot.exists &&
+            paymentReferenceSnapshot.data()?.bookingId !== bookingId) {
+          throw new HttpsError(
+            "already-exists",
+            "This payment reference is already used by another settlement.",
+          );
+        }
+        if (!paymentReferenceSnapshot.exists) {
+          transaction.set(paymentReferenceRef, {
+            bookingId,
+            paymentReference,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+        result = {bookingId, status: "paid", alreadyPaid: true};
+        return;
+      }
+      if (settlement.status !== "payable") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Only payable settlements can be marked paid.",
+        );
+      }
+      const payoutAmount = money(settlement.pritzePayoutAmount);
+      const salonId = requiredId(settlement.salonId, "salon id");
+      const walletRef = firestore.collection("salonWallets").doc(salonId);
+      const walletSnapshot = await transaction.get(walletRef);
+      const payableBalance = money(walletSnapshot.data()?.payableBalance);
+      if (payoutAmount <= 0 || payableBalance < payoutAmount) {
+        throw new HttpsError(
+          "failed-precondition",
+          "The salon payable wallet does not match this settlement.",
+        );
+      }
+      if (paymentReferenceSnapshot.exists &&
+          paymentReferenceSnapshot.data()?.bookingId !== bookingId) {
+        throw new HttpsError(
+          "already-exists",
+          "This payment reference is already used by another settlement.",
+        );
+      }
+      transaction.update(settlementRef, {
+        status: "paid",
+        paymentReference,
+        paidAt: admin.firestore.Timestamp.fromMillis(paidAtMillis),
+        paidByAdminUid: adminUid,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.set(walletRef, {
+        payableBalance: admin.firestore.FieldValue.increment(-payoutAmount),
+        paidAmount: admin.firestore.FieldValue.increment(payoutAmount),
+        lastPaidBookingId: bookingId,
+        lastPaymentReference: paymentReference,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.set(paymentReferenceRef, {
+        bookingId,
+        salonId,
+        paymentReference,
+        paidAt: admin.firestore.Timestamp.fromMillis(paidAtMillis),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "settlement.marked_paid",
+        targetType: "booking",
+        targetId: bookingId,
+        reason,
+        before: {status: settlement.status, paymentReference: ""},
+        after: {status: "paid", paymentReference},
+      }));
+      result = {bookingId, status: "paid", alreadyPaid: false};
+    });
+    return result;
+  },
+);
+
+exports.updateSalonControlAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const salonId = requiredId(request.data?.salonId, "salon id");
+    const control = String(request.data?.control ?? "").trim();
+    const value = request.data?.value;
+    const reason = requiredAdminReason(request.data?.reason);
+    if (!["isOpen", "instantBookingsEnabled", "adminSuspended",
+      "proinReferralApproved"]
+      .includes(control) || typeof value !== "boolean") {
+      throw new HttpsError("invalid-argument", "Invalid salon control.");
+    }
+    const firestore = admin.firestore();
+    const salonRef = firestore.collection("salons").doc(salonId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    let after = {};
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(salonRef);
+      const salon = snapshot.data();
+      if (!salon) throw new HttpsError("not-found", "Salon not found.");
+      const before = {
+        isOpen: salon.isOpen === true,
+        instantBookingsEnabled: salon.instantBookingsEnabled !== false,
+        adminSuspended: salon.adminSuspended === true,
+        proinReferralApproved: salon.proinReferralApproved === true,
+      };
+      after = control === "adminSuspended" && value === true ? {
+        ...before,
+        adminSuspended: true,
+        isOpen: false,
+        instantBookingsEnabled: false,
+      } : {...before, [control]: value};
+      transaction.update(salonRef, {
+        ...after,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: `salon.${control}`,
+        targetType: "salon",
+        targetId: salonId,
+        reason,
+        before,
+        after,
+      }));
+    });
+    return {salonId, ...after};
+  },
+);
+
+exports.updateCustomerProfileAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const customerUid = requiredId(request.data?.customerUid, "customer uid");
+    const reason = requiredAdminReason(request.data?.reason);
+    const name = normalizeDisplayName(request.data?.name);
+    const phone = normalizeVerifiedPhone(request.data?.phone);
+    const emailValue = adminString(request.data?.email);
+    const email = emailValue ? normalizeEmail(emailValue) : "";
+    const gender = normalizeProfileGender(request.data?.gender);
+    const birthDate = normalizeBirthDate(request.data?.birthDate);
+    const preferredStyles = sanitizeShortList(request.data?.preferredStyles);
+    const photoUrl = sanitizePhotoUrls([request.data?.photoUrl], 1)[0] || "";
+    const stylePhotoUrls = sanitizePhotoUrls(request.data?.stylePhotoUrls);
+    if (!name) {
+      throw new HttpsError("invalid-argument", "Enter the customer name.");
+    }
+    if (!/^\+91\d{10}$/.test(phone)) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Enter a valid +91 10-digit customer phone number.",
+      );
+    }
+    if (emailValue && !email) {
+      throw new HttpsError("invalid-argument", "Enter a valid email address.");
+    }
+    if (gender === null || birthDate === null) {
+      throw new HttpsError("invalid-argument", "Check the customer details.");
+    }
+
+    const firestore = admin.firestore();
+    const userRef = firestore.collection("users").doc(customerUid);
+    const initialSnapshot = await userRef.get();
+    const initial = initialSnapshot.data();
+    if (!initial) throw new HttpsError("not-found", "Customer not found.");
+    requireStoredRole(initial, "customer");
+    const previousPhone = normalizeVerifiedPhone(initial.phone || initial.contact);
+    const phoneRef = firestore.collection("loginIdentifiers").doc(phoneKey(phone));
+
+    let phoneAuthUser = null;
+    try {
+      phoneAuthUser = await admin.auth().getUserByPhoneNumber(phone);
+    } catch (error) {
+      if (error.code !== "auth/user-not-found") throw error;
+    }
+    if (phoneAuthUser && phoneAuthUser.uid !== customerUid) {
+      throw new HttpsError(
+        "already-exists",
+        "This phone number already belongs to another account.",
+      );
+    }
+
+    const before = adminCustomerProfileView(customerUid, initial);
+    const after = {
+      ...before,
+      name,
+      phone,
+      email,
+      gender,
+      birthDate,
+      preferredStyles,
+      photoUrl,
+      stylePhotoUrls,
+    };
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const latestSnapshot = await transaction.get(userRef);
+      const latest = latestSnapshot.data();
+      if (!latest) throw new HttpsError("not-found", "Customer not found.");
+      requireStoredRole(latest, "customer");
+      const claimedPhoneSnapshot = await transaction.get(phoneRef);
+      const claimedPhone = claimedPhoneSnapshot.data();
+      if (claimedPhoneSnapshot.exists && claimedPhone?.uid !== customerUid) {
+        const role = normalizeRole(claimedPhone?.role);
+        throw new HttpsError(
+          "already-exists",
+          role === "owner" ?
+            "This phone number is already registered as a salon owner." :
+            "This phone number already belongs to another customer.",
+        );
+      }
+      let previousPhoneRef = null;
+      let previousPhoneSnapshot = null;
+      if (previousPhone && previousPhone !== phone) {
+        previousPhoneRef = firestore.collection("loginIdentifiers")
+          .doc(phoneKey(previousPhone));
+        previousPhoneSnapshot = await transaction.get(previousPhoneRef);
+      }
+      transaction.set(userRef, {
+        name,
+        contact: phone,
+        phone,
+        email: email || null,
+        gender,
+        birthDate,
+        preferredStyles,
+        photoUrl,
+        stylePhotoUrls,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.set(phoneRef, {
+        phone,
+        role: "customer",
+        uid: customerUid,
+        source: "admin_customer_profile",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      if (previousPhoneRef && previousPhoneSnapshot?.data()?.uid === customerUid) {
+        transaction.delete(previousPhoneRef);
+      }
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "customer.profile_updated",
+        targetType: "customer",
+        targetId: customerUid,
+        reason,
+        before,
+        after,
+      }));
+    });
+    await admin.auth().updateUser(customerUid, {
+      displayName: name,
+      phoneNumber: phone,
+    });
+    return after;
+  },
+);
+
+exports.updateCustomerControlAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const customerUid = requiredId(request.data?.customerUid, "customer uid");
+    const adminSuspended = request.data?.adminSuspended;
+    const reason = requiredAdminReason(request.data?.reason);
+    if (typeof adminSuspended !== "boolean") {
+      throw new HttpsError("invalid-argument", "Invalid customer access state.");
+    }
+    const firestore = admin.firestore();
+    const userRef = firestore.collection("users").doc(customerUid);
+    const snapshot = await userRef.get();
+    const user = snapshot.data();
+    if (!user) throw new HttpsError("not-found", "Customer not found.");
+    requireStoredRole(user, "customer");
+    await admin.auth().updateUser(customerUid, {disabled: adminSuspended});
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const latestSnapshot = await transaction.get(userRef);
+      const latest = latestSnapshot.data();
+      if (!latest) throw new HttpsError("not-found", "Customer not found.");
+      requireStoredRole(latest, "customer");
+      transaction.set(userRef, {
+        adminSuspended,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: adminSuspended ?
+          "customer.account_suspended" : "customer.account_restored",
+        targetType: "customer",
+        targetId: customerUid,
+        reason,
+        before: {adminSuspended: latest.adminSuspended === true},
+        after: {adminSuspended},
+      }));
+    });
+    return {customerUid, adminSuspended};
+  },
+);
+
+exports.updateSalonProfileAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const salonId = requiredId(request.data?.salonId, "salon id");
+    const reason = requiredAdminReason(request.data?.reason);
+    const name = normalizeDisplayName(request.data?.name);
+    const ownerName = normalizeDisplayName(request.data?.ownerName);
+    const address = adminString(request.data?.address).slice(0, 500);
+    const directionsUrl = adminHttpsUrl(request.data?.directionsUrl);
+    const phone = normalizeVerifiedPhone(request.data?.phone);
+    const emailValue = adminString(request.data?.email);
+    const email = emailValue ? normalizeEmail(emailValue) : "";
+    const logoUrl = adminHttpsUrl(request.data?.logoUrl);
+    const photoUrls = sanitizePhotoUrls(request.data?.photoUrls);
+    const distanceLabel = adminString(request.data?.distanceLabel).slice(0, 80);
+    const openTime = adminSalonTime(request.data?.openTime);
+    const closeTime = adminSalonTime(request.data?.closeTime);
+    if (!name || !ownerName || !address) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Salon name, owner name and address are required.",
+      );
+    }
+    if (!/^\+91\d{10}$/.test(phone)) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Enter a valid +91 10-digit salon phone number.",
+      );
+    }
+    if (emailValue && !email) {
+      throw new HttpsError("invalid-argument", "Enter a valid email address.");
+    }
+    if (directionsUrl === null || logoUrl === null) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Salon links and images must use secure https links.",
+      );
+    }
+    if (!openTime || !closeTime || adminSalonMinutes(closeTime) <=
+        adminSalonMinutes(openTime)) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Enter valid opening and closing times, with closing after opening.",
+      );
+    }
+
+    const firestore = admin.firestore();
+    const salonRef = firestore.collection("salons").doc(salonId);
+    const initialSnapshot = await salonRef.get();
+    const initial = initialSnapshot.data();
+    if (!initial) throw new HttpsError("not-found", "Salon not found.");
+    const ownerUid = requiredId(initial.ownerUid, "salon owner uid");
+    const ownerRef = firestore.collection("users").doc(ownerUid);
+    const ownerSnapshot = await ownerRef.get();
+    const owner = ownerSnapshot.data();
+    if (!owner) throw new HttpsError("not-found", "Salon owner not found.");
+    requireStoredRole(owner, "owner");
+    const previousPhone = normalizeVerifiedPhone(
+      owner.profilePhone || initial.phone,
+    );
+    const phoneRef = firestore.collection("loginIdentifiers").doc(phoneKey(phone));
+    let phoneAuthUser = null;
+    try {
+      phoneAuthUser = await admin.auth().getUserByPhoneNumber(phone);
+    } catch (error) {
+      if (error.code !== "auth/user-not-found") throw error;
+    }
+    if (phoneAuthUser && phoneAuthUser.uid !== ownerUid) {
+      throw new HttpsError(
+        "already-exists",
+        "This phone number already belongs to another account.",
+      );
+    }
+    const before = adminSalonProfileView(salonId, initial);
+    const after = {
+      ...before,
+      name,
+      ownerName,
+      address,
+      directionsUrl: directionsUrl || "",
+      phone,
+      email,
+      logoUrl: logoUrl || "",
+      photoUrls,
+      distanceLabel: distanceLabel || "Nearby",
+      openTime,
+      closeTime,
+    };
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const [latestSalonSnapshot, latestOwnerSnapshot, phoneSnapshot] =
+        await Promise.all([
+          transaction.get(salonRef),
+          transaction.get(ownerRef),
+          transaction.get(phoneRef),
+        ]);
+      const latestSalon = latestSalonSnapshot.data();
+      const latestOwner = latestOwnerSnapshot.data();
+      if (!latestSalon || !latestOwner) {
+        throw new HttpsError("not-found", "Salon or owner not found.");
+      }
+      requireStoredRole(latestOwner, "owner");
+      if (phoneSnapshot.exists && phoneSnapshot.data()?.uid !== ownerUid) {
+        const role = normalizeRole(phoneSnapshot.data()?.role);
+        throw new HttpsError(
+          "already-exists",
+          role === "customer" ?
+            "This phone number is already registered as a customer." :
+            "This phone number belongs to another salon owner.",
+        );
+      }
+      let previousPhoneRef = null;
+      let previousPhoneSnapshot = null;
+      if (previousPhone && previousPhone !== phone) {
+        previousPhoneRef = firestore.collection("loginIdentifiers")
+          .doc(phoneKey(previousPhone));
+        previousPhoneSnapshot = await transaction.get(previousPhoneRef);
+      }
+      transaction.set(salonRef, {
+        name,
+        ownerName,
+        address,
+        directionsUrl: directionsUrl || "",
+        phone,
+        email: email || null,
+        logoUrl: logoUrl || "",
+        photoUrls,
+        distanceLabel: distanceLabel || "Nearby",
+        openTime,
+        closeTime,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.set(ownerRef, {
+        profilePhone: phone,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.set(phoneRef, {
+        phone,
+        role: "owner",
+        uid: ownerUid,
+        source: "admin_salon_profile",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      if (previousPhoneRef && previousPhoneSnapshot?.data()?.uid === ownerUid) {
+        transaction.delete(previousPhoneRef);
+      }
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "salon.profile_updated",
+        targetType: "salon",
+        targetId: salonId,
+        reason,
+        before,
+        after,
+      }));
+    });
+    const ownerAuth = await admin.auth().getUser(ownerUid);
+    if (ownerAuth.phoneNumber && ownerAuth.phoneNumber !== phone) {
+      await admin.auth().updateUser(ownerUid, {phoneNumber: phone});
+    }
+    return after;
+  },
+);
+
+exports.updateSalonServiceAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const salonId = requiredId(request.data?.salonId, "salon id");
+    const serviceId = requiredId(request.data?.serviceId, "service id");
+    const reason = requiredAdminReason(request.data?.reason);
+    const hasName = Object.prototype.hasOwnProperty.call(request.data || {}, "name");
+    const hasCategory = Object.prototype.hasOwnProperty.call(
+      request.data || {}, "category",
+    );
+    const hasPrice = Object.prototype.hasOwnProperty.call(request.data || {}, "price");
+    const hasDuration = Object.prototype.hasOwnProperty.call(
+      request.data || {}, "durationMinutes",
+    );
+    const hasAvailability = Object.prototype.hasOwnProperty.call(
+      request.data || {}, "isAvailable",
+    );
+    const hasInstant = Object.prototype.hasOwnProperty.call(
+      request.data || {}, "instantBookingEnabled",
+    );
+    const name = normalizeDisplayName(request.data?.name);
+    const category = adminString(request.data?.category).slice(0, 80);
+    const price = Number(request.data?.price);
+    const durationMinutes = Number(request.data?.durationMinutes);
+    const isAvailable = request.data?.isAvailable;
+    const instantBookingEnabled = request.data?.instantBookingEnabled;
+    if (hasName && !name) {
+      throw new HttpsError("invalid-argument", "Enter the service name.");
+    }
+    if (hasCategory && !category) {
+      throw new HttpsError("invalid-argument", "Enter the service category.");
+    }
+    if (hasPrice && (!Number.isFinite(price) || price < 0 || price > 100000)) {
+      throw new HttpsError("invalid-argument", "Enter a valid service price.");
+    }
+    if (hasDuration && (!Number.isInteger(durationMinutes) ||
+        durationMinutes < 5 || durationMinutes > 480)) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Service duration must be between 5 and 480 minutes.",
+      );
+    }
+    if (hasAvailability && typeof isAvailable !== "boolean") {
+      throw new HttpsError("invalid-argument", "Invalid service availability.");
+    }
+    if (hasInstant && typeof instantBookingEnabled !== "boolean") {
+      throw new HttpsError(
+        "invalid-argument", "Invalid instant-booking availability.",
+      );
+    }
+    if (!hasName && !hasCategory && !hasPrice && !hasDuration &&
+        !hasAvailability && !hasInstant) {
+      throw new HttpsError("invalid-argument", "No service changes supplied.");
+    }
+    const firestore = admin.firestore();
+    const salonRef = firestore.collection("salons").doc(salonId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(salonRef);
+      const salon = snapshot.data();
+      if (!salon) throw new HttpsError("not-found", "Salon not found.");
+      const services = Array.isArray(salon.services) ? salon.services : [];
+      const serviceIndex = services.findIndex((item) =>
+        String(item?.id ?? "").trim() === serviceId);
+      if (serviceIndex < 0) {
+        throw new HttpsError("not-found", "Salon service not found.");
+      }
+      const previous = services[serviceIndex] || {};
+      const nextService = {
+        ...previous,
+        ...(hasName ? {name} : {}),
+        ...(hasCategory ? {category} : {}),
+        ...(hasPrice ? {price: money(price)} : {}),
+        ...(hasDuration ? {durationMinutes} : {}),
+        ...(hasAvailability ? {isAvailable} : {}),
+        ...(hasInstant ? {instantBookingEnabled} : {}),
+      };
+      const nextServices = services.map((item, index) => index === serviceIndex ?
+        nextService : item);
+      transaction.update(salonRef, {
+        services: nextServices,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "salon.service_updated",
+        targetType: "salon",
+        targetId: salonId,
+        reason,
+        before: {serviceId, ...previous},
+        after: {serviceId, ...nextService},
+      }));
+    });
+    return {salonId, serviceId};
+  },
+);
+
+exports.updateBarberStatusAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const barberId = requiredId(request.data?.barberId, "barber id");
+    const isActive = request.data?.isActive;
+    const reason = requiredAdminReason(request.data?.reason);
+    if (typeof isActive !== "boolean") {
+      throw new HttpsError("invalid-argument", "Invalid barber status.");
+    }
+    const firestore = admin.firestore();
+    const barberRef = firestore.collection("barbers").doc(barberId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(barberRef);
+      const barber = snapshot.data();
+      if (!barber) throw new HttpsError("not-found", "Barber not found.");
+      transaction.update(barberRef, {
+        isActive,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "barber.active_status",
+        targetType: "barber",
+        targetId: barberId,
+        reason,
+        before: {isActive: barber.isActive !== false},
+        after: {isActive},
+      }));
+    });
+    return {barberId, isActive};
+  },
+);
+
+exports.updateBarberProfileAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const barberId = requiredId(request.data?.barberId, "barber id");
+    const reason = requiredAdminReason(request.data?.reason);
+    const name = normalizeDisplayName(request.data?.name);
+    const phone = adminString(request.data?.phone).slice(0, 30);
+    const emailValue = adminString(request.data?.email);
+    const email = emailValue ? normalizeEmail(emailValue) : "";
+    const speciality = adminString(request.data?.speciality).slice(0, 120);
+    const experienceYears = Number(request.data?.experienceYears);
+    const resumeSummary = adminString(request.data?.resumeSummary).slice(0, 1000);
+    const serviceIds = adminStringList(request.data?.serviceIds, 100);
+    const isActive = request.data?.isActive;
+    if (!name) throw new HttpsError("invalid-argument", "Enter the barber name.");
+    if (emailValue && !email) {
+      throw new HttpsError("invalid-argument", "Enter a valid barber email.");
+    }
+    if (!Number.isInteger(experienceYears) || experienceYears < 0 ||
+        experienceYears > 80 || typeof isActive !== "boolean") {
+      throw new HttpsError("invalid-argument", "Check the barber details.");
+    }
+    const firestore = admin.firestore();
+    const barberRef = firestore.collection("barbers").doc(barberId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(barberRef);
+      const barber = snapshot.data();
+      if (!barber) throw new HttpsError("not-found", "Barber not found.");
+      const before = adminBarberRecord(snapshot);
+      const after = {
+        ...before,
+        name,
+        phone,
+        email,
+        speciality,
+        experienceYears,
+        resumeSummary,
+        serviceIds,
+        serviceCount: serviceIds.length,
+        isActive,
+      };
+      transaction.set(barberRef, {
+        name,
+        phone,
+        email: email || null,
+        speciality,
+        experienceYears,
+        resumeSummary,
+        serviceIds,
+        isActive,
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: adminUid,
+        lastAdminActionReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "barber.profile_updated",
+        targetType: "barber",
+        targetId: barberId,
+        reason,
+        before,
+        after,
+      }));
+    });
+    return {barberId};
+  },
+);
+
+exports.resolveJoinRequestAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const requestId = requiredId(request.data?.requestId, "request id");
+    const status = String(request.data?.status ?? "").trim();
+    const reason = requiredAdminReason(request.data?.reason);
+    if (!["approved", "rejected"].includes(status)) {
+      throw new HttpsError("invalid-argument", "Invalid join request decision.");
+    }
+    const firestore = admin.firestore();
+    const requestRef = firestore.collection("joinRequests").doc(requestId);
+    const barberRef = status === "approved" ?
+      firestore.collection("barbers").doc() : null;
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    let requesterUid = "";
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(requestRef);
+      const joinRequest = snapshot.data();
+      if (!joinRequest) {
+        throw new HttpsError("not-found", "Join request not found.");
+      }
+      if (joinRequest.status !== "pending") {
+        throw new HttpsError(
+          "failed-precondition",
+          "Only pending join requests can be reviewed.",
+        );
+      }
+      requesterUid = adminString(joinRequest.requesterUid);
+      transaction.update(requestRef, {
+        status,
+        reviewedAt: admin.firestore.FieldValue.serverTimestamp(),
+        reviewedByAdminUid: adminUid,
+        reviewReason: reason,
+        ...(barberRef ? {barberId: barberRef.id} : {}),
+      });
+      if (barberRef) {
+        transaction.create(barberRef, {
+          uid: requesterUid || null,
+          salonId: adminString(joinRequest.salonId),
+          name: adminString(joinRequest.barberName) || "Barber",
+          phone: adminString(joinRequest.barberPhone),
+          email: adminString(joinRequest.barberEmail),
+          speciality: adminString(joinRequest.speciality),
+          experienceYears: Math.max(0, Number(joinRequest.experienceYears) || 0),
+          resumeSummary: adminString(joinRequest.resumeSummary),
+          serviceIds: adminStringList(joinRequest.serviceIds),
+          isActive: true,
+          createdByAdminUid: adminUid,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: `join_request.${status}`,
+        targetType: "joinRequest",
+        targetId: requestId,
+        reason,
+        before: {status: joinRequest.status},
+        after: {status, barberId: barberRef?.id || ""},
+      }));
+    });
+    if (requesterUid) {
+      await sendToUsers([requesterUid], {
+        title: status === "approved" ? "Join request approved" :
+          "Join request update",
+        body: status === "approved" ?
+          "Your salon join request was approved." :
+          "Your salon join request was not approved.",
+        data: {type: "join_request", requestId, event: status},
+      });
+    }
+    return {requestId, status, barberId: barberRef?.id || ""};
+  },
+);
+
+exports.addAdminNote = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const targetType = String(request.data?.targetType ?? "").trim();
+    const targetId = requiredId(request.data?.targetId, "target id");
+    const note = String(request.data?.note ?? "").trim().slice(0, 1000);
+    if (!["booking", "customer", "salon", "barber"].includes(targetType)) {
+      throw new HttpsError("invalid-argument", "Invalid note target.");
+    }
+    if (note.length < 3) {
+      throw new HttpsError("invalid-argument", "Enter an internal note.");
+    }
+    const targetCollections = {
+      booking: "bookings",
+      customer: "users",
+      salon: "salons",
+      barber: "barbers",
+    };
+    const firestore = admin.firestore();
+    const targetRef = firestore.collection(targetCollections[targetType])
+      .doc(targetId);
+    const noteRef = firestore.collection("adminNotes").doc();
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const targetSnapshot = await transaction.get(targetRef);
+      if (!targetSnapshot.exists) {
+        throw new HttpsError("not-found", "Note target not found.");
+      }
+      transaction.create(noteRef, {
+        targetType,
+        targetId,
+        note,
+        adminUid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "note.created",
+        targetType,
+        targetId,
+        reason: "Internal operational note",
+        before: {},
+        after: {noteId: noteRef.id},
+      }));
+    });
+    return {noteId: noteRef.id};
+  },
+);
+
+exports.updateAdminAutomationRule = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const ruleId = String(request.data?.ruleId ?? "").trim();
+    const enabled = request.data?.enabled;
+    const threshold = Number(request.data?.threshold);
+    const reason = requiredAdminReason(request.data?.reason);
+    const thresholdBounds = {
+      instant_response: [1, 15],
+      overdue_arrival: [5, 60],
+      unassigned_booking: [1, 60],
+      cancellation_spike: [5, 100],
+      low_rating: [1, 5],
+    };
+    const bounds = thresholdBounds[ruleId];
+    if (!bounds || typeof enabled !== "boolean" ||
+        !Number.isFinite(threshold) || threshold < bounds[0] ||
+        threshold > bounds[1]) {
+      throw new HttpsError("invalid-argument", "Invalid automation rule.");
+    }
+    const firestore = admin.firestore();
+    const ruleRef = firestore.collection("adminAutomationRules").doc(ruleId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ruleRef);
+      const before = snapshot.exists ? snapshot.data() :
+        DEFAULT_ADMIN_AUTOMATION_RULES[ruleId];
+      const after = {enabled, threshold};
+      transaction.set(ruleRef, {
+        ...after,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedByAdminUid: adminUid,
+      }, {merge: true});
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "automation.rule_updated",
+        targetType: "automationRule",
+        targetId: ruleId,
+        reason,
+        before: {enabled: before?.enabled, threshold: before?.threshold},
+        after,
+      }));
+    });
+    return {ruleId, enabled, threshold};
+  },
+);
+
+exports.acknowledgeAdminOperationalAlert = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const alertId = requiredId(request.data?.alertId, "alert id");
+    const reason = requiredAdminReason(request.data?.reason);
+    const firestore = admin.firestore();
+    const alertRef = firestore.collection("adminOperationalAlerts").doc(alertId);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(alertRef);
+      const alert = snapshot.data();
+      if (!alert) throw new HttpsError("not-found", "Alert not found.");
+      if (alert.status !== "active") {
+        throw new HttpsError("failed-precondition", "This alert is no longer active.");
+      }
+      transaction.update(alertRef, {
+        status: "acknowledged",
+        acknowledgedAt: admin.firestore.FieldValue.serverTimestamp(),
+        acknowledgedByAdminUid: adminUid,
+        acknowledgementReason: reason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: "intelligence.alert_acknowledged",
+        targetType: alert.targetType || "alert",
+        targetId: alert.targetId || alertId,
+        reason,
+        before: {alertId, status: alert.status},
+        after: {alertId, status: "acknowledged"},
+      }));
+    });
+    return {alertId, status: "acknowledged"};
+  },
+);
+
+exports.runAdminIntelligenceScan = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    const result = await generateAdminOperationalAlerts();
+    await admin.firestore().collection("adminAuditLogs").add(adminAuditRecord({
+      adminUid,
+      action: "intelligence.scan_requested",
+      targetType: "platform",
+      targetId: "pritze",
+      reason,
+      before: {},
+      after: result,
+    }));
+    return result;
+  },
+);
+
+exports.getDiscountAdministrationDataAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    await requirePlatformAdministrator(request);
+    const firestore = admin.firestore();
+    const [
+      campaigns,
+      campaignUsage,
+      salonUsage,
+      customerUsage,
+      customerTotals,
+      salonTotals,
+      platformTotals,
+      vault,
+    ] = await Promise.all([
+      firestore.collection("discountCampaigns").limit(500).get(),
+      firestore.collection("discountCampaignUsage").limit(500).get(),
+      firestore.collection("discountSalonUsage").limit(5000).get(),
+      firestore.collection("discountCustomerUsage").limit(5000).get(),
+      firestore.collection("discountCustomerTotals").limit(2000).get(),
+      firestore.collection("discountSalonTotals").limit(1000).get(),
+      firestore.collection("discountPlatformTotals").doc("current").get(),
+      firestore.collection("platformFinance").doc("discountVault").get(),
+    ]);
+    return {
+      generatedAtMillis: Date.now(),
+      campaigns: campaigns.docs.map((document) =>
+        discountCampaignAdminView(document.id, document.data())),
+      campaignUsage: campaignUsage.docs.map((document) => ({
+        campaignId: document.id,
+        ...discountUsageAdminView(document.data()),
+      })),
+      salonUsage: salonUsage.docs.map((document) => ({
+        usageId: document.id,
+        campaignId: adminString(document.data()?.campaignId),
+        salonId: adminString(document.data()?.salonId),
+        ...discountUsageAdminView(document.data()),
+      })),
+      customerUsage: customerUsage.docs.map((document) => ({
+        usageId: document.id,
+        campaignId: adminString(document.data()?.campaignId),
+        customerUid: adminString(document.data()?.customerUid),
+        ...discountUsageAdminView(document.data()),
+      })),
+      customerTotals: customerTotals.docs.map((document) => ({
+        customerUid: document.id,
+        ...discountTotalsAdminView(document.data()),
+      })),
+      salonTotals: salonTotals.docs.map((document) => ({
+        salonId: document.id,
+        ...discountTotalsAdminView(document.data()),
+      })),
+      platformTotals: discountTotalsAdminView(platformTotals.data()),
+      vault: discountVaultAdminView(vault.data()),
+    };
+  },
+);
+
+exports.upsertDiscountCampaignAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    return runDiscountAdminCallable(async () => {
+      const normalized = normalizeDiscountCampaignInput(request.data || {});
+      const firestore = admin.firestore();
+      const campaignRef = firestore.collection("discountCampaigns")
+        .doc(normalized.campaignId);
+      const usageRef = firestore.collection("discountCampaignUsage")
+        .doc(normalized.campaignId);
+      const auditRef = firestore.collection("adminAuditLogs").doc();
+      let result = null;
+      await firestore.runTransaction(async (transaction) => {
+        const [campaignSnapshot, usageSnapshot] = await Promise.all([
+          transaction.get(campaignRef),
+          transaction.get(usageRef),
+        ]);
+        const before = campaignSnapshot.data() || null;
+        const usage = discountUsageAdminView(usageSnapshot.data());
+        const committed = usage.reservedPayoutAmount +
+          usage.realizedPayoutAmount;
+        if (normalized.totalPayoutBudget < committed) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Campaign budget cannot be below its reserved and spent payout.",
+          );
+        }
+        const existingVoucherHash = adminString(before?.voucherCodeHash);
+        if (normalized.expectedVoucherCodeHash &&
+            normalized.expectedVoucherCodeHash !== existingVoucherHash) {
+          throw new HttpsError(
+            "failed-precondition",
+            "This voucher changed after the page was loaded. Refresh and try again.",
+          );
+        }
+        const voucherCodeHash = normalized.voucherOnly ?
+          (normalized.voucherCodeHash || existingVoucherHash) : "";
+        const voucherMaskedCode = normalized.voucherOnly ?
+          (normalized.voucherMaskedCode ||
+            adminString(before?.voucherMaskedCode)) : "";
+        if (normalized.voucherOnly && !voucherCodeHash) {
+          throw new HttpsError(
+            "invalid-argument",
+            "Enter the original voucher code.",
+          );
+        }
+        const recordedUses = usage.reservedUses + usage.realizedUses +
+          usage.releasedUses;
+        if (existingVoucherHash !== voucherCodeHash && recordedUses > 0) {
+          throw new HttpsError(
+            "failed-precondition",
+            "A campaign with booking usage cannot change or remove its voucher code.",
+          );
+        }
+        const registryRef = voucherCodeHash ? firestore
+          .collection("voucherCodeRegistry").doc(voucherCodeHash) : null;
+        const oldRegistryRef = existingVoucherHash &&
+          existingVoucherHash !== voucherCodeHash ? firestore
+          .collection("voucherCodeRegistry").doc(existingVoucherHash) : null;
+        const duplicateDiscountQuery = voucherCodeHash ? firestore
+          .collection("discountCampaigns")
+          .where("voucherCodeHash", "==", voucherCodeHash)
+          .limit(2) : null;
+        const registrySnapshot = registryRef ?
+          await transaction.get(registryRef) : null;
+        const oldRegistrySnapshot = oldRegistryRef ?
+          await transaction.get(oldRegistryRef) : null;
+        const proinCouponSnapshot = voucherCodeHash ? await transaction.get(
+          firestore.collection("proinCoupons").doc(voucherCodeHash),
+        ) : null;
+        const duplicateDiscounts = duplicateDiscountQuery ?
+          await transaction.get(duplicateDiscountQuery) : null;
+        const registry = registrySnapshot?.data();
+        if (registry && (registry.kind !== "discount" ||
+            registry.targetId !== normalized.campaignId)) {
+          throw new HttpsError(
+            "already-exists",
+            "This voucher code is already assigned to another campaign.",
+          );
+        }
+        if (proinCouponSnapshot?.exists) {
+          throw new HttpsError(
+            "already-exists",
+            "This code is already assigned to a Proin coupon.",
+          );
+        }
+        if (duplicateDiscounts?.docs.some((document) =>
+          document.id !== normalized.campaignId)) {
+          throw new HttpsError(
+            "already-exists",
+            "This voucher code is already assigned to another discount campaign.",
+          );
+        }
+        const version = Math.max(0, Number(before?.version) || 0) + 1;
+        const versionRef = firestore.collection("discountCampaignVersions")
+          .doc(`${normalized.campaignId}__v${version}`);
+        const versionSnapshot = await transaction.get(versionRef);
+        if (versionSnapshot.exists) {
+          throw new HttpsError(
+            "already-exists",
+            "This discount campaign version already exists.",
+          );
+        }
+        const campaignId = normalized.campaignId;
+        const startsAtMillis = normalized.startsAtMillis;
+        const endsAtMillis = normalized.endsAtMillis;
+        const fields = {...normalized};
+        delete fields.campaignId;
+        delete fields.startsAtMillis;
+        delete fields.endsAtMillis;
+        delete fields.voucherCode;
+        delete fields.expectedVoucherCodeHash;
+        delete fields.voucherCodeHash;
+        delete fields.voucherMaskedCode;
+        const timestamp = admin.firestore.FieldValue.serverTimestamp();
+        const record = {
+          ...fields,
+          voucherCodeHash,
+          voucherMaskedCode,
+          storesPlaintextVoucherCode: false,
+          version,
+          startsAt: startsAtMillis > 0 ?
+            admin.firestore.Timestamp.fromMillis(startsAtMillis) : null,
+          endsAt: endsAtMillis > 0 ?
+            admin.firestore.Timestamp.fromMillis(endsAtMillis) : null,
+          createdAt: before?.createdAt || timestamp,
+          createdByAdminUid: before?.createdByAdminUid || adminUid,
+          updatedAt: timestamp,
+          updatedByAdminUid: adminUid,
+        };
+        transaction.set(campaignRef, record);
+        if (registryRef) {
+          transaction.set(registryRef, {
+            codeHash: voucherCodeHash,
+            maskedCode: voucherMaskedCode,
+            kind: "discount",
+            targetId: campaignId,
+            updatedAt: timestamp,
+          }, {merge: true});
+        }
+        if (oldRegistryRef && oldRegistrySnapshot?.data()?.kind === "discount" &&
+            oldRegistrySnapshot.data()?.targetId === campaignId) {
+          transaction.delete(oldRegistryRef);
+        }
+        transaction.create(versionRef, {
+          ...record,
+          campaignId,
+          versionCreatedAt: timestamp,
+        });
+        result = discountCampaignAdminView(campaignId, record);
+        transaction.create(auditRef, adminAuditRecord({
+          adminUid,
+          action: before ?
+            "discount.campaign_updated" : "discount.campaign_created",
+          targetType: "discountCampaign",
+          targetId: campaignId,
+          reason,
+          before: before ? discountCampaignAdminView(campaignId, before) : {},
+          after: result,
+        }));
+      });
+      return result;
+    });
+  },
+);
+
+exports.setDiscountVaultBudgetAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    return runDiscountAdminCallable(async () => {
+      const approvedAmount = normalizeDiscountVaultBudget(
+        request.data?.approvedAmount,
+      );
+      const requestedSalonCreditLimit = request.data &&
+        Object.prototype.hasOwnProperty.call(
+          request.data,
+          "salonCreditLimitAmount",
+        ) ?
+        normalizeSalonPromotionCreditLimit(request.data.salonCreditLimitAmount) :
+        null;
+      const firestore = admin.firestore();
+      const vaultRef = firestore.collection("platformFinance")
+        .doc("discountVault");
+      const auditRef = firestore.collection("adminAuditLogs").doc();
+      let result = null;
+      await firestore.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(vaultRef);
+        const before = discountVaultAdminView(snapshot.data());
+        const committed = before.reservedAmount + before.spentAmount;
+        if (approvedAmount < committed) {
+          throw new HttpsError(
+            "failed-precondition",
+            "Approved discount budget cannot be below reserved and spent payout.",
+          );
+        }
+        const salonCreditLimitAmount = requestedSalonCreditLimit ??
+          before.salonCreditLimitAmount;
+        const after = {
+          approvedAmount,
+          availableAmount: approvedAmount - committed,
+          reservedAmount: before.reservedAmount,
+          spentAmount: before.spentAmount,
+          salonCreditLimitAmount,
+          budgetVersion: before.budgetVersion + 1,
+        };
+        const timestamp = admin.firestore.FieldValue.serverTimestamp();
+        transaction.set(vaultRef, {
+          ...after,
+          createdAt: snapshot.data()?.createdAt || timestamp,
+          updatedAt: timestamp,
+          updatedByAdminUid: adminUid,
+        }, {merge: true});
+        transaction.create(auditRef, adminAuditRecord({
+          adminUid,
+          action: "discount.vault_budget_changed",
+          targetType: "discountVault",
+          targetId: "discountVault",
+          reason,
+          before,
+          after,
+        }));
+        result = after;
+      });
+      return result;
+    });
+  },
+);
+
+exports.getProinPhaseOneDataAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    await requirePlatformAdministrator(request);
+    return runProinCallable(() => proinBackend.phaseOneSnapshot());
+  },
+);
+
+exports.upsertProinProgramAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    return runProinCallable(() => proinBackend.upsertProgram({
+      adminUid,
+      data: request.data || {},
+      reason,
+    }));
+  },
+);
+
+exports.setProinFinanceBudgetAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    return runProinCallable(() => proinBackend.setFinanceBudget({
+      adminUid,
+      data: request.data || {},
+      reason,
+    }));
+  },
+);
+
+exports.grantProinAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    return runProinCallable(() => proinBackend.grantAsAdmin({
+      adminUid,
+      data: request.data || {},
+      reason,
+    }));
+  },
+);
+
+exports.upsertProinCouponAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    return runProinCallable(() => proinBackend.upsertCoupon({
+      adminUid,
+      data: request.data || {},
+      reason,
+    }));
+  },
+);
+
+exports.claimProinCoupon = onCall(
+  {invoker: "public", enforceAppCheck: true, cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    await enforceHourlyAttemptLimit({
+      firestore: admin.firestore(),
+      collection: "proinCouponAttempts",
+      uid,
+      limit: PROIN_COUPON_ATTEMPT_LIMIT,
+      message: "Too many coupon attempts. Try again later.",
+    });
+    const result = await runProinCallable(() => proinBackend.claimCoupon({
+      uid,
+      rawCode: request.data?.couponCode,
+    }));
+    if (!result.alreadyClaimed && result.amountProin > 0) {
+      await sendProinRewardNotification({
+        recipientUid: uid,
+        amountProin: result.amountProin,
+        expiresAtMillis: result.expiresAtMillis,
+        sourceType: "coupon",
+      });
+    }
+    return result;
+  },
+);
+
+exports.claimSalonProinCoupon = onCall(
+  {invoker: "public", enforceAppCheck: true, cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const salonId = requiredId(request.data?.salonId, "salon id");
+    await enforceHourlyAttemptLimit({
+      firestore: admin.firestore(),
+      collection: "salonProinCouponAttempts",
+      uid,
+      limit: PROIN_COUPON_ATTEMPT_LIMIT,
+      message: "Too many coupon attempts. Try again later.",
+    });
+    const result = await runProinCallable(() => proinBackend.claimCoupon({
+      uid,
+      salonId,
+      rawCode: request.data?.couponCode,
+    }));
+    if (!result.alreadyClaimed && result.amountProin > 0) {
+      await sendProinRewardNotification({
+        recipientUid: uid,
+        amountProin: result.amountProin,
+        expiresAtMillis: result.expiresAtMillis,
+        sourceType: "coupon",
+      });
+    }
+    return {
+      message: result.alreadyClaimed ?
+        "This coupon was already added to this salon." :
+        `${result.amountProin} credits added to this salon.`,
+      ...result,
+    };
+  },
+);
+
+exports.getCustomerProinWallet = onCall(
+  {invoker: "public", enforceAppCheck: true, cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    return runProinCallable(() => proinBackend.customerWalletData({uid}));
+  },
+);
+
+exports.getSalonProinWallet = onCall(
+  {invoker: "public", enforceAppCheck: true, cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const salonId = requiredId(request.data?.salonId, "salon id");
+    const salonSnapshot = await admin.firestore()
+      .collection("salons").doc(salonId).get();
+    if (!salonSnapshot.exists) {
+      throw new HttpsError("not-found", "Salon not found.");
+    }
+    if (String(salonSnapshot.data()?.ownerUid || "").trim() !== uid) {
+      throw new HttpsError(
+        "permission-denied",
+        "Only this salon's owner can view its promotional credits.",
+      );
+    }
+    return runProinCallable(() => proinBackend.salonWalletData({salonId}));
+  },
+);
+
+exports.getCustomerProinActivity = onCall(
+  {invoker: "public", enforceAppCheck: true, cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    return runProinCallable(() => proinBackend.customerStatementData({
+      uid,
+      limit: request.data?.limit,
+      beforeMillis: request.data?.beforeMillis,
+    }));
+  },
+);
+
+exports.revokeProinAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    const result = await runProinCallable(() =>
+      proinBackend.revokeAvailableLotAsAdmin({
+        adminUid,
+        data: request.data || {},
+        reason,
+      }));
+    if (!result.duplicate && result.walletType === "customer_rewards" &&
+        result.accountId) {
+      try {
+        await sendToUsers([result.accountId], {
+          title: "Proin balance adjusted",
+          body: `${result.amountProin} unused Proin was removed from your balance.`,
+          data: {
+            type: "proin",
+            event: "rewardRevoked",
+            amountProin: result.amountProin,
+            destination: "profile",
+          },
+          collapseKey: `proin-revoked-${result.lotId}`,
+        });
+      } catch (error) {
+        console.error("Could not send Proin revocation notification", error);
+      }
+    }
+    return result;
+  },
+);
+
+exports.markProinReimbursementSettledAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    const result = await runProinCallable(() =>
+      proinBackend.settleSalonReimbursementAsAdmin({
+        adminUid,
+        data: request.data || {},
+        reason,
+      }));
+    if (!result.alreadySettled && result.salonId) {
+      try {
+        const salonSnapshot = await admin.firestore().collection("salons")
+          .doc(result.salonId).get();
+        const ownerUid = String(salonSnapshot.data()?.ownerUid || "").trim();
+        await sendToUsers([ownerUid].filter(Boolean), {
+          title: "Proin reimbursement recorded",
+          body: `₹${result.amountInr} has been marked as paid by Pritze.`,
+          data: {
+            type: "proin",
+            event: "reimbursementSettled",
+            bookingId: result.bookingId,
+            amountInr: result.amountInr,
+            destination: "salonOverview",
+          },
+          collapseKey: `proin-reimbursement-${result.bookingId}`,
+        });
+      } catch (error) {
+        console.error("Could not send Proin settlement notification", error);
+      }
+    }
+    return result;
+  },
+);
+
+exports.getProinBookingQuote = onCall(
+  {invoker: "public", enforceAppCheck: true, cpu: 1},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const firestore = admin.firestore();
+    await enforceHourlyAttemptLimit({
+      firestore,
+      collection: "proinQuoteAttempts",
+      uid,
+      limit: PROIN_QUOTE_ATTEMPT_LIMIT,
+      message: "Too many Proin price refreshes. Try again later.",
+    });
+    const salonId = requiredId(request.data?.salonId, "salon id");
+    const serviceIds = [...new Set(
+      (Array.isArray(request.data?.serviceIds) ? request.data.serviceIds : [])
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean),
+    )];
+    if (serviceIds.length === 0 || serviceIds.length > 6) {
+      throw new HttpsError("invalid-argument", "Choose between 1 and 6 services.");
+    }
+    const [userSnapshot, salonSnapshot] = await Promise.all([
+      firestore.collection("users").doc(uid).get(),
+      firestore.collection("salons").doc(salonId).get(),
+    ]);
+    requireStoredRole(userSnapshot.data(), "customer");
+    const salon = salonSnapshot.data();
+    if (!salon) throw new HttpsError("not-found", "Salon not found.");
+    const services = serviceIds.map((id) => findSalonService(salon, id));
+    if (services.some((service) => !service || service.isAvailable === false)) {
+      throw new HttpsError("failed-precondition", "A service is unavailable.");
+    }
+    const originalAmount = services.reduce(
+      (total, service) => total + money(service.price),
+      0,
+    );
+    const quoteId = String(request.data?.quoteId || "").trim();
+    let discountAmount = 0;
+    if (quoteId) {
+      const quoteSnapshot = await firestore.collection("discountQuotes")
+        .doc(quoteId).get();
+      const error = lockedDiscountQuoteError({
+        quote: quoteSnapshot.data(),
+        customerUid: uid,
+        salonId,
+        serviceIds,
+        originalAmount,
+        nowMillis: Date.now(),
+      });
+      if (error) throw new HttpsError("failed-precondition", error);
+      discountAmount = money(quoteSnapshot.data()?.discountAmount);
+    }
+    return runProinCallable(() => proinBackend.quoteBookingRedemption({
+      uid,
+      salonId,
+      serviceIds,
+      originalAmount,
+      discountAmount,
+    }));
+  },
+);
+
+exports.runProinReconciliationAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    const result = await runProinCallable(() => proinBackend.reconcile());
+    await admin.firestore().collection("adminAuditLogs").add(adminAuditRecord({
+      adminUid,
+      action: "proin.reconciliation_requested",
+      targetType: "platform",
+      targetId: "proin",
+      reason,
+      before: {},
+      after: result,
+    }));
+    return result;
+  },
+);
+
+exports.runProinReferralAwardBackfillAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    const result = await scanQualifiedReferralRewards({
+      includePreviouslyProcessed: true,
+      limit: 500,
+    });
+    await admin.firestore().collection("adminAuditLogs").add(adminAuditRecord({
+      adminUid,
+      action: "proin.referral_backfill_requested",
+      targetType: "platform",
+      targetId: "proin",
+      reason,
+      before: {},
+      after: result,
+    }));
+    return result;
+  },
+);
+
+exports.expireProinLots = onSchedule(
+  {schedule: "every 15 minutes", timeZone: "Asia/Kolkata", cpu: "gcf_gen1"},
+  async () => proinBackend.expireLots(),
+);
+
+exports.reconcileProinFinancialState = onSchedule(
+  {schedule: "every day 03:15", timeZone: "Asia/Kolkata", cpu: "gcf_gen1"},
+  async () => proinBackend.reconcile(),
+);
+
+exports.retryPendingProinReferralAwards = onSchedule(
+  {schedule: "every 30 minutes", timeZone: "Asia/Kolkata", cpu: "gcf_gen1"},
+  async () => scanQualifiedReferralRewards({limit: 100}),
+);
+
+exports.sendProinExpiryReminders = onSchedule(
+  {
+    schedule: "every day 10:00",
+    timeZone: "Asia/Kolkata",
+    cpu: "gcf_gen1",
+  },
+  async () => sendProinExpiryReminders(),
+);
+
+exports.generateAdminOperationalAlerts = onSchedule(
+  {schedule: "every 5 minutes", timeZone: "Asia/Kolkata", cpu: "gcf_gen1"},
+  async () => generateAdminOperationalAlerts(),
+);
+
+async function generateAdminOperationalAlerts() {
+  const firestore = admin.firestore();
+  const [bookingsSnapshot, salonsSnapshot, rulesSnapshot, alertsSnapshot] =
+    await Promise.all([
+      firestore.collection("bookings").limit(2000).get(),
+      firestore.collection("salons").limit(500).get(),
+      firestore.collection("adminAutomationRules").limit(50).get(),
+      firestore.collection("adminOperationalAlerts").limit(500).get(),
+    ]);
+  const storedRules = Object.fromEntries(rulesSnapshot.docs.map((document) =>
+    [document.id, document.data()]));
+  const nowMillis = Date.now();
+  const alerts = evaluateOperationalAlerts({
+    bookings: bookingsSnapshot.docs.map((document) => ({
+      id: document.id,
+      ...document.data(),
+    })),
+    salons: salonsSnapshot.docs.map((document) => ({
+      id: document.id,
+      ...document.data(),
+    })),
+    storedRules,
+    nowMillis,
+  });
+  const activeIds = new Set();
+  const existingAlerts = new Map(alertsSnapshot.docs.map((document) =>
+    [document.id, document.data()]));
+  const writer = firestore.bulkWriter();
+  for (const alert of alerts) {
+    const alertId = crypto.createHash("sha256").update(alert.key).digest("hex");
+    activeIds.add(alertId);
+    const persistedStatus = existingAlerts.get(alertId)?.status ===
+      "acknowledged" ? "acknowledged" : "active";
+    writer.set(firestore.collection("adminOperationalAlerts").doc(alertId), {
+      ...alert,
+      status: persistedStatus,
+      detectedAt: admin.firestore.Timestamp.fromMillis(alert.detectedAtMillis),
+      lastDetectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      occurrenceCount: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+  }
+  let resolvedCount = 0;
+  for (const document of alertsSnapshot.docs) {
+    if (!activeIds.has(document.id) &&
+        ["active", "acknowledged"].includes(document.data()?.status)) {
+      resolvedCount += 1;
+      writer.update(document.ref, {
+        status: "resolved",
+        resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  }
+  await writer.close();
+  return {activeCount: alerts.length, resolvedCount, scannedAtMillis: nowMillis};
+}
+
+async function scanQualifiedReferralRewards({
+  includePreviouslyProcessed = false,
+  limit = 100,
+} = {}) {
+  const firestore = admin.firestore();
+  let query = firestore.collection("referrals")
+    .where("status", "==", "qualified");
+  if (!includePreviouslyProcessed) {
+    query = query.where("proinAwardPending", "==", true);
+  }
+  const snapshot = await query.limit(Math.max(1, Math.min(500, limit))).get();
+  let processedCount = 0;
+  let awardedCount = 0;
+  const failures = [];
+  for (const document of snapshot.docs) {
+    try {
+      const result = await processQualifiedReferralRewards(
+        document.id,
+        document.data(),
+      );
+      processedCount += 1;
+      awardedCount += result.newAwardCount;
+    } catch (error) {
+      failures.push({
+        referralId: document.id,
+        message: String(error.message || error).slice(0, 300),
+      });
+    }
+  }
+  return {
+    scannedCount: snapshot.size,
+    processedCount,
+    awardedCount,
+    failureCount: failures.length,
+    failures: failures.slice(0, 20),
+  };
+}
+
+async function processQualifiedReferralRewards(referralId, suppliedReferral) {
+  const firestore = admin.firestore();
+  const referralSnapshot = await firestore.collection("referrals")
+    .doc(referralId).get();
+  const referral = referralSnapshot.data() || suppliedReferral;
+  if (!referral || referral.status !== "qualified") {
+    return {newAwardCount: 0, pending: false};
+  }
+  const qualification = await proinReferralQualification(referral);
+  if (!qualification.ready) {
+    await referralSnapshot.ref.set({
+      proinAwardPending: true,
+      proinAwardStatus: qualification.status,
+      proinAwardLastScannedAt:
+        admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+    return {newAwardCount: 0, pending: true};
+  }
+  const programsSnapshot = await firestore.collection("proinPrograms")
+    .where("sourceType", "==", qualification.sourceType)
+    .where("active", "==", true)
+    .limit(50)
+    .get();
+  const programs = programsSnapshot.docs
+    .map((document) => ({id: document.id, ...document.data()}))
+    .filter((program) =>
+      program.referralTargetRole === referral.referredRole &&
+      program.referralInviterRole === referral.inviterRole &&
+      program.qualificationEvent === qualification.qualificationEvent &&
+      adminMillis(program.startsAt) <= qualification.eligibilityAtMillis &&
+      adminMillis(program.endsAt) > qualification.eligibilityAtMillis);
+
+  const existingAwards = Array.isArray(referral.proinAwards) ?
+    referral.proinAwards : [];
+  const awardsByProgram = new Map(existingAwards.map((award) =>
+    [String(award?.programId || ""), award]));
+  const failures = [];
+  let newAwardCount = 0;
+  for (const program of programs) {
+    try {
+      const recipient = await proinReferralRecipient({
+        program,
+        referral,
+        qualification,
+      });
+      if (!recipient.ready) {
+        failures.push({programId: program.id, message: recipient.status});
+        continue;
+      }
+      const result = await runProinCallable(() =>
+        proinBackend.grantQualifiedEvent({
+          data: {
+            programId: program.id,
+            walletType: recipient.walletType,
+            accountId: recipient.accountId,
+            sourceId: referralId,
+            idempotencyKey:
+              `referral:${referralId}:${program.id}:${program.rewardRecipient}`,
+            expectedSourceType: qualification.sourceType,
+            expectedQualificationEvent: qualification.qualificationEvent,
+            eligibilityAtMillis: qualification.eligibilityAtMillis,
+          },
+        }));
+      awardsByProgram.set(program.id, {
+        programId: program.id,
+        recipient: String(program.rewardRecipient || ""),
+        walletType: recipient.walletType,
+        lotId: result.lotId,
+        amountProin: result.amountProin,
+        expiresAtMillis: result.expiresAtMillis,
+      });
+      if (!result.duplicate) {
+        newAwardCount += 1;
+        await sendProinRewardNotification({
+          recipientUid: recipient.recipientUserUid,
+          amountProin: result.amountProin,
+          expiresAtMillis: result.expiresAtMillis,
+          sourceType: qualification.sourceType,
+        });
+      }
+    } catch (error) {
+      failures.push({
+        programId: program.id,
+        message: String(error.message || error).slice(0, 300),
+      });
+    }
+  }
+  const hasConfiguredPrograms = programs.length > 0;
+  const pending = !hasConfiguredPrograms || failures.length > 0;
+  await referralSnapshot.ref.set({
+    proinAwardPending: pending,
+    proinAwardStatus: pending ?
+      (hasConfiguredPrograms ? "partial_or_retry" : "waiting_for_program") :
+      "awarded",
+    proinAwards: [...awardsByProgram.values()].slice(0, 20),
+    proinAwardFailureCount: failures.length,
+    proinAwardFailures: failures.slice(0, 10),
+    proinAwardLastScannedAt: admin.firestore.FieldValue.serverTimestamp(),
+    ...(pending ? {} : {
+      proinAwardProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  return {newAwardCount, pending, failureCount: failures.length};
+}
+
+async function proinReferralQualification(referral) {
+  const firestore = admin.firestore();
+  if (referral.referredRole === "customer") {
+    const bookingId = String(referral.qualificationBookingId || "").trim();
+    if (!bookingId) {
+      return {ready: false, status: "waiting_for_completed_booking"};
+    }
+    const bookingSnapshot = await firestore.collection("bookings")
+      .doc(bookingId).get();
+    const booking = bookingSnapshot.data();
+    if (!booking || booking.status !== "completed" ||
+        booking.customerUid !== referral.referredUid) {
+      return {ready: false, status: "qualification_booking_not_valid"};
+    }
+    return {
+      ready: true,
+      sourceType: "referral_customer",
+      qualificationEvent: "first_completed_booking",
+      eligibilityAtMillis: adminMillis(booking.completedAt) ||
+        adminMillis(referral.qualifiedAt) || Date.now(),
+      qualificationSalon: null,
+    };
+  }
+  if (referral.referredRole !== "owner") {
+    return {ready: false, status: "unsupported_referral_role"};
+  }
+  let salonId = String(referral.qualificationSalonId || "").trim();
+  if (!salonId) {
+    const salonSnapshot = await firestore.collection("salons")
+      .where("ownerUid", "==", referral.referredUid).limit(1).get();
+    salonId = salonSnapshot.docs[0]?.id || "";
+  }
+  if (!salonId) {
+    return {ready: false, status: "waiting_for_referred_salon"};
+  }
+  const salonSnapshot = await firestore.collection("salons").doc(salonId).get();
+  const salon = salonSnapshot.data();
+  if (!salon || salon.ownerUid !== referral.referredUid ||
+      salon.proinReferralApproved !== true || salon.adminSuspended === true) {
+    return {ready: false, status: "waiting_for_admin_approval"};
+  }
+  const completedSnapshot = await firestore.collection("bookings")
+    .where("salonId", "==", salonId)
+    .where("status", "==", "completed")
+    .orderBy("completedAt", "asc")
+    .limit(1)
+    .get();
+  const completedBooking = completedSnapshot.docs[0]?.data();
+  if (!completedBooking) {
+    return {ready: false, status: "waiting_for_first_completed_booking"};
+  }
+  return {
+    ready: true,
+    sourceType: "referral_salon",
+    qualificationEvent: "salon_approved_and_first_completed_booking",
+    eligibilityAtMillis: adminMillis(completedBooking.completedAt) ||
+      adminMillis(completedBooking.updatedAt) || Date.now(),
+    qualificationSalon: {id: salonId, ...salon},
+  };
+}
+
+async function proinReferralRecipient({program, referral, qualification}) {
+  const rewardRecipient = String(program.rewardRecipient || "");
+  const role = rewardRecipient === "inviter" ?
+    referral.inviterRole : referral.referredRole;
+  const userUid = rewardRecipient === "inviter" ?
+    referral.inviterUid : referral.referredUid;
+  if (!userUid || !["customer", "owner"].includes(role)) {
+    return {ready: false, status: "reward_recipient_not_valid"};
+  }
+  if (role === "customer") {
+    if (program.walletType !== "customer_rewards") {
+      return {ready: false, status: "customer_wallet_type_mismatch"};
+    }
+    const userSnapshot = await admin.firestore().collection("users")
+      .doc(userUid).get();
+    if (userSnapshot.data()?.role !== "customer") {
+      return {ready: false, status: "customer_account_not_found"};
+    }
+    return {
+      ready: true,
+      walletType: "customer_rewards",
+      accountId: userUid,
+      recipientUserUid: userUid,
+    };
+  }
+  if (program.walletType !== "salon_promotion_credits") {
+    return {ready: false, status: "salon_wallet_type_mismatch"};
+  }
+  let salon = rewardRecipient === "referred" ?
+    qualification.qualificationSalon : null;
+  if (!salon) {
+    const salonSnapshot = await admin.firestore().collection("salons")
+      .where("ownerUid", "==", userUid).limit(10).get();
+    const document = salonSnapshot.docs.find((candidate) =>
+      candidate.data()?.proinReferralApproved === true &&
+      candidate.data()?.adminSuspended !== true);
+    salon = document ? {id: document.id, ...document.data()} : null;
+  }
+  if (!salon?.id) {
+    return {ready: false, status: "approved_salon_account_not_found"};
+  }
+  return {
+    ready: true,
+    walletType: "salon_promotion_credits",
+    accountId: salon.id,
+    recipientUserUid: userUid,
+  };
+}
+
+async function sendProinRewardNotification({
+  recipientUid,
+  amountProin,
+  expiresAtMillis,
+  sourceType,
+}) {
+  if (!recipientUid || amountProin <= 0) return;
+  const expiry = new Intl.DateTimeFormat("en-IN", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "Asia/Kolkata",
+  }).format(new Date(expiresAtMillis));
+  await sendToUsers([recipientUid], {
+    title: `You earned ${amountProin} Proin`,
+    body: `Your reward is available until ${expiry}.`,
+    data: {
+      type: "proin",
+      event: "rewardGranted",
+      sourceType,
+      amountProin,
+      expiresAtMillis,
+      destination: "profile",
+    },
+    collapseKey: `proin-reward-${sourceType}-${recipientUid}`,
+  });
+}
+
+async function sendProinExpiryReminders() {
+  const firestore = admin.firestore();
+  const nowMillis = Date.now();
+  const horizonMillis = nowMillis + 30 * 24 * 60 * 60 * 1000;
+  const snapshot = await firestore.collection("proinLots")
+    .where("status", "==", "active")
+    .where("expiresAt", ">", admin.firestore.Timestamp.fromMillis(nowMillis))
+    .where(
+      "expiresAt",
+      "<=",
+      admin.firestore.Timestamp.fromMillis(horizonMillis),
+    )
+    .orderBy("expiresAt", "asc")
+    .limit(2000)
+    .get();
+  let sentCount = 0;
+  const failures = [];
+  for (const document of snapshot.docs) {
+    try {
+      if (await sendClaimedProinExpiryReminder(document.ref, nowMillis)) {
+        sentCount += 1;
+      }
+    } catch (error) {
+      failures.push({lotId: document.id, message: String(error.message)});
+    }
+  }
+  return {
+    scannedCount: snapshot.size,
+    sentCount,
+    failureCount: failures.length,
+    failures: failures.slice(0, 20),
+  };
+}
+
+async function sendClaimedProinExpiryReminder(lotRef, nowMillis) {
+  const firestore = admin.firestore();
+  let claimedLot = null;
+  let reminderTier = 0;
+  let sentField = "";
+  let claimField = "";
+  const claimed = await firestore.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(lotRef);
+    const lot = snapshot.data();
+    const remainingMillis = adminMillis(lot?.expiresAt) - nowMillis;
+    if (!lot || lot.status !== "active" || lot.availableProin <= 0 ||
+        remainingMillis <= 0) {
+      return false;
+    }
+    reminderTier = remainingMillis <= 24 * 60 * 60 * 1000 ? 1 :
+      remainingMillis <= 7 * 24 * 60 * 60 * 1000 ? 7 : 30;
+    sentField = `expiryReminder${reminderTier}dSentAt`;
+    claimField = `expiryReminder${reminderTier}dClaimedAt`;
+    if (lot[sentField]) return false;
+    const previousClaimMillis = adminMillis(lot[claimField]);
+    if (previousClaimMillis > nowMillis - 6 * 60 * 60 * 1000) return false;
+    claimedLot = {id: snapshot.id, ...lot};
+    transaction.update(lotRef, {
+      [claimField]: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return true;
+  });
+  if (!claimed || !claimedLot) return false;
+  try {
+    let recipientUid = claimedLot.accountId;
+    if (claimedLot.walletType === "salon_promotion_credits") {
+      const salonSnapshot = await firestore.collection("salons")
+        .doc(claimedLot.accountId).get();
+      recipientUid = String(salonSnapshot.data()?.ownerUid || "").trim();
+    }
+    if (!recipientUid) throw new Error("Proin reminder recipient not found.");
+    const remainingDays = Math.max(1, Math.ceil(
+      (adminMillis(claimedLot.expiresAt) - nowMillis) /
+        (24 * 60 * 60 * 1000),
+    ));
+    await sendToUsers([recipientUid], {
+      title: `${claimedLot.availableProin} Proin expiring soon`,
+      body: `Use your Proin within ${remainingDays} day${
+        remainingDays === 1 ? "" : "s"}.`,
+      data: {
+        type: "proin",
+        event: "expiryReminder",
+        lotId: claimedLot.id,
+        amountProin: claimedLot.availableProin,
+        reminderTier,
+        expiresAtMillis: adminMillis(claimedLot.expiresAt),
+        destination: "profile",
+      },
+      collapseKey: `proin-expiry-${claimedLot.id}-${reminderTier}`,
+    });
+    await lotRef.update({
+      [sentField]: admin.firestore.FieldValue.serverTimestamp(),
+      [claimField]: admin.firestore.FieldValue.delete(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return true;
+  } catch (error) {
+    await lotRef.update({
+      [claimField]: admin.firestore.FieldValue.delete(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    throw error;
+  }
+}
+
+exports.sendAdminEmailOtp = onCall(
+  {
+    invoker: "public",
+    enforceAppCheck: false,
+    cpu: "gcf_gen1",
+    secrets: [smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom, otpSecret],
+  },
+  async (request) => {
+    const email = normalizeEmail(request.data?.email);
+    if (!isPlatformAdminEmail(email)) {
+      throw new HttpsError(
+        "permission-denied",
+        "This email is not authorized for the Pritze Control Center.",
+      );
+    }
+
+    const docRef = admin.firestore()
+      .collection("adminEmailOtps")
+      .doc(emailKey(email));
+    const now = Date.now();
+    const code = crypto.randomInt(100000, 1000000).toString();
+    await admin.firestore().runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(docRef);
+      const previous = snapshot.data();
+      if (
+        previous?.sentAt?.toMillis &&
+        now - previous.sentAt.toMillis() < EMAIL_RESEND_DELAY_MS
+      ) {
+        throw new HttpsError(
+          "resource-exhausted",
+          "Please wait before requesting another code.",
+        );
+      }
+      transaction.set(docRef, {
+        email,
+        codeHash: hashCode(email, code),
+        attempts: 0,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: admin.firestore.Timestamp.fromMillis(now + OTP_TTL_MS),
+      });
+    });
+
+    try {
+      await sendOtpMail(email, code);
+    } catch (error) {
+      await docRef.delete();
+      console.error("sendAdminEmailOtp delivery failed", {
+        emailDomain: email.split("@").pop(),
+        error: error.message,
+      });
+      throw new HttpsError(
+        "unavailable",
+        "The sign-in code could not be sent. Please try again.",
+      );
+    }
+    return {ok: true};
+  },
+);
+
+exports.verifyAdminEmailOtp = onCall(
+  {
+    invoker: "public",
+    enforceAppCheck: false,
+    cpu: "gcf_gen1",
+    secrets: [otpSecret],
+  },
+  async (request) => {
+    const email = normalizeEmail(request.data?.email);
+    const code = String(request.data?.code ?? "").trim();
+    if (!isPlatformAdminEmail(email)) {
+      throw new HttpsError(
+        "permission-denied",
+        "This email is not authorized for the Pritze Control Center.",
+      );
+    }
+    if (!/^\d{6}$/.test(code)) {
+      throw new HttpsError("invalid-argument", "Enter the 6-digit code.");
+    }
+
+    const docRef = admin.firestore()
+      .collection("adminEmailOtps")
+      .doc(emailKey(email));
+    const verification = await admin.firestore().runTransaction(async (
+      transaction,
+    ) => {
+      const snapshot = await transaction.get(docRef);
+      const data = snapshot.data();
+      if (!data) {
+        return {code: "not-found", message: "Request a new sign-in code."};
+      }
+      if (!data.expiresAt?.toMillis || data.expiresAt.toMillis() < Date.now()) {
+        transaction.delete(docRef);
+        return {code: "deadline-exceeded", message: "This code expired."};
+      }
+      if ((data.attempts ?? 0) >= MAX_ATTEMPTS) {
+        transaction.delete(docRef);
+        return {
+          code: "resource-exhausted",
+          message: "Too many attempts. Request a new code.",
+        };
+      }
+      if (data.codeHash !== hashCode(email, code)) {
+        transaction.update(docRef, {
+          attempts: admin.firestore.FieldValue.increment(1),
+        });
+        return {code: "permission-denied", message: "Incorrect code."};
+      }
+      transaction.delete(docRef);
+      return {code: "ok", message: ""};
+    });
+    if (verification.code !== "ok") {
+      throw new HttpsError(verification.code, verification.message);
+    }
+
+    const user = await getOrCreateEmailUser(email);
+    await admin.firestore().collection("platformAdmins").doc(user.uid).set({
+      active: true,
+      email,
+      provisionedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+    const customToken = await admin.auth().createCustomToken(user.uid, {
+      platformAdmin: true,
+      provider: "admin_email_otp",
+    });
+    return {customToken};
+  },
+);
+
+exports.signInAdminWithPassword = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const normalizedUserId = normalizeAdminUserId(request.data?.userId);
+    const password = normalizeAdminPassword(request.data?.password);
+    if (!normalizedUserId || !password) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Enter a valid User ID and password.",
+      );
+    }
+
+    const firestore = admin.firestore();
+    const credentialId = adminCredentialId(normalizedUserId);
+    await enforceAdminPasswordAttemptLimit({
+      firestore,
+      request,
+      credentialId,
+    });
+    const credentialRef = firestore
+      .collection("platformAdminCredentials")
+      .doc(credentialId);
+    const credentialSnapshot = await credentialRef.get();
+    const credential = credentialSnapshot.data() || {};
+    const lockedUntilMillis = credential.lockedUntil?.toMillis?.() || 0;
+    const suppliedPasswordMatches = verifyAdminPassword(
+      password,
+      credentialSnapshot.exists ?
+        credential.passwordHash : DUMMY_ADMIN_PASSWORD_HASH,
+    );
+
+    if (credentialSnapshot.exists && lockedUntilMillis > Date.now()) {
+      await recordAdminAuthenticationEvent({
+        firestore,
+        request,
+        credentialId,
+        outcome: "locked",
+      });
+      throw new HttpsError(
+        "resource-exhausted",
+        "Too many attempts. Try again in 15 minutes.",
+      );
+    }
+    if (
+      !credentialSnapshot.exists ||
+      credential.active !== true ||
+      !suppliedPasswordMatches
+    ) {
+      let accountLocked = false;
+      if (credentialSnapshot.exists && credential.active === true) {
+        await firestore.runTransaction(async (transaction) => {
+          const latestSnapshot = await transaction.get(credentialRef);
+          const latest = latestSnapshot.data() || {};
+          if (!latestSnapshot.exists || latest.active !== true) return;
+          const failure = nextAdminPasswordFailure(latest);
+          accountLocked = failure.shouldLock;
+          transaction.update(credentialRef, {
+            failedAttempts: failure.failedAttempts,
+            failureWindowStartedAt: admin.firestore.Timestamp.fromMillis(
+              failure.failureWindowStartedAtMillis,
+            ),
+            lockedUntil: failure.lockedUntilMillis ?
+              admin.firestore.Timestamp.fromMillis(
+                failure.lockedUntilMillis,
+              ) : admin.firestore.FieldValue.delete(),
+            lastFailedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+      }
+      await recordAdminAuthenticationEvent({
+        firestore,
+        request,
+        credentialId,
+        outcome: accountLocked ? "locked" : "denied",
+      });
+      throw new HttpsError(
+        accountLocked ? "resource-exhausted" : "permission-denied",
+        accountLocked ?
+          "Too many attempts. Try again in 15 minutes." :
+          "The User ID or password is incorrect.",
+      );
+    }
+
+    const authUid = adminString(credential.authUid);
+    const displayName = adminString(credential.displayName) || "Pritze Admin";
+    if (!authUid) {
+      console.error("Administrator credential is missing an Auth UID", {
+        credentialId,
+      });
+      throw new HttpsError(
+        "failed-precondition",
+        "This administrator account is not ready. Contact the account owner.",
+      );
+    }
+    const platformAdminRef = firestore.collection("platformAdmins").doc(authUid);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    await firestore.runTransaction(async (transaction) => {
+      const latestCredential = await transaction.get(credentialRef);
+      const platformAdmin = await transaction.get(platformAdminRef);
+      if (
+        latestCredential.data()?.active !== true ||
+        latestCredential.data()?.authUid !== authUid ||
+        !platformAdmin.exists ||
+        platformAdmin.data()?.active === false
+      ) {
+        throw new HttpsError(
+          "permission-denied",
+          "This administrator account is no longer active.",
+        );
+      }
+      transaction.update(credentialRef, {
+        failedAttempts: 0,
+        failureWindowStartedAt: admin.firestore.FieldValue.delete(),
+        lockedUntil: admin.firestore.FieldValue.delete(),
+        lastAuthenticatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid: authUid,
+        action: "administrator.signed_in",
+        targetType: "platformAdmin",
+        targetId: authUid,
+        reason: "Pritze team credential authentication",
+        before: {},
+        after: {provider: "admin_password"},
+      }));
+    });
+
+    try {
+      await admin.auth().getUser(authUid);
+    } catch (error) {
+      console.error("Administrator Auth user is unavailable", {
+        authUid,
+        error: error.message,
+      });
+      throw new HttpsError(
+        "failed-precondition",
+        "This administrator account is not ready. Contact the account owner.",
+      );
+    }
+    const customToken = await admin.auth().createCustomToken(authUid, {
+      platformAdmin: true,
+      provider: "admin_password",
+    });
+    await recordAdminAuthenticationEvent({
+      firestore,
+      request,
+      credentialId,
+      outcome: "success",
+      authUid,
+    });
+    return {customToken, displayName};
+  },
+);
+
+exports.getDiscountQuote = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: 1,
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const firestore = admin.firestore();
+  if (request.data?.previewOnly !== true) {
+    await enforceHourlyAttemptLimit({
+      firestore,
+      collection: "discountQuoteAttempts",
+      uid,
+      limit: DISCOUNT_QUOTE_LIMIT,
+      message: "Too many price refreshes. Try again later.",
+    });
+  }
+  const checkout = await loadCheckoutDiscountContext(
+    firestore,
+    uid,
+    request.data || {},
+  );
+  if (request.data?.previewOnly === true) {
+    return findBestActiveDiscountQuote(firestore, checkout.context);
+  }
+  return emptyDiscountQuote(checkout.originalAmount);
 });
 
-exports.createBooking = onCall({invoker: "public"}, async (request) => {
+exports.listCheckoutDiscountOffers = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: 1,
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const firestore = admin.firestore();
+  if (request.data?.prefetchOnly !== true) {
+    await enforceHourlyAttemptLimit({
+      firestore,
+      collection: "discountOfferAttempts",
+      uid,
+      limit: DISCOUNT_QUOTE_LIMIT,
+      message: "Too many offer refreshes. Try again later.",
+    });
+  }
+  const checkout = await loadCheckoutDiscountContext(
+    firestore,
+    uid,
+    request.data || {},
+  );
+  return {
+    offers: await findVisibleCheckoutDiscountOffers(
+      firestore,
+      checkout.context,
+    ),
+  };
+});
+
+exports.applyVisibleCheckoutDiscount = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: 1,
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const firestore = admin.firestore();
+  const campaignId = requiredId(
+    request.data?.campaignId,
+    "discount campaign id",
+  );
+  await enforceHourlyAttemptLimit({
+    firestore,
+    collection: "checkoutCouponAttempts",
+    uid,
+    limit: PROIN_COUPON_ATTEMPT_LIMIT,
+    message: "Too many offer attempts. Try again later.",
+  });
+  const checkout = await loadCheckoutDiscountContext(
+    firestore,
+    uid,
+    request.data || {},
+  );
+  const quote = await findVisibleCheckoutDiscountQuote(
+    firestore,
+    checkout.context,
+    campaignId,
+  );
+  if (!quote.campaignId) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This offer is no longer available for this booking.",
+    );
+  }
+  const lockedQuote = await persistDiscountQuote(firestore, {
+    uid,
+    salonId: checkout.salonId,
+    serviceIds: checkout.serviceIds,
+    originalAmount: checkout.originalAmount,
+    quote,
+  });
+  return {
+    benefitType: "discount",
+    message: `${quote.campaignName} applied. You save ₹${quote.discountAmount}.`,
+    quote: lockedQuote,
+  };
+});
+
+exports.applyCheckoutCoupon = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: 1,
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const firestore = admin.firestore();
+  const rawCode = String(request.data?.couponCode ?? "").trim();
+  const code = normalizeProinCouponCode(rawCode);
+  if (!code) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Enter a 4-20 character coupon code with at least one letter.",
+    );
+  }
+  await enforceHourlyAttemptLimit({
+    firestore,
+    collection: "checkoutCouponAttempts",
+    uid,
+    limit: PROIN_COUPON_ATTEMPT_LIMIT,
+    message: "Too many coupon attempts. Try again later.",
+  });
+  const codeHash = proinCouponHash(code);
+  const proinCouponSnapshot = await firestore.collection("proinCoupons")
+    .doc(codeHash).get();
+  if (proinCouponSnapshot.exists) {
+    const result = await runProinCallable(() => proinBackend.claimCoupon({
+      uid,
+      rawCode: code,
+    }));
+    if (!result.alreadyClaimed && result.amountProin > 0) {
+      await sendProinRewardNotification({
+        recipientUid: uid,
+        amountProin: result.amountProin,
+        expiresAtMillis: result.expiresAtMillis,
+        sourceType: "coupon",
+      });
+    }
+    return {
+      benefitType: "proin",
+      message: result.alreadyClaimed ?
+        "This Proin coupon was already added to your account." :
+        `${result.amountProin} Proin added to your account.`,
+      ...result,
+    };
+  }
+
+  const salonId = requiredId(request.data?.salonId, "salon id");
+  const serviceIds = [...new Set(
+    (Array.isArray(request.data?.serviceIds) ? request.data.serviceIds : [])
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean),
+  )];
+  if (serviceIds.length === 0 || serviceIds.length > 6) {
+    throw new HttpsError("invalid-argument", "Choose between 1 and 6 services.");
+  }
+  const [userSnapshot, salonSnapshot] = await Promise.all([
+    firestore.collection("users").doc(uid).get(),
+    firestore.collection("salons").doc(salonId).get(),
+  ]);
+  requireStoredRole(userSnapshot.data(), "customer");
+  const salon = salonSnapshot.data();
+  if (!salon) throw new HttpsError("not-found", "Salon not found.");
+  const services = serviceIds.map((id) => findSalonService(salon, id));
+  if (services.some((service) => !service || service.isAvailable === false)) {
+    throw new HttpsError("failed-precondition", "A service is unavailable.");
+  }
+  const originalAmount = services.reduce(
+    (total, service) => total + Math.max(0, Number(service.price) || 0),
+    0,
+  );
+  const visitCounts = await loadDiscountVisitCounts(
+    firestore,
+    uid,
+    salonId,
+    userSnapshot.data(),
+  );
+  const context = buildDiscountContext({
+    customerUid: uid,
+    salonId,
+    serviceIds,
+    serviceAmounts: Object.fromEntries(
+      services.map((service, index) => [
+        serviceIds[index],
+        Math.max(0, Number(service.price) || 0),
+      ]),
+    ),
+    originalAmount,
+    ...visitCounts,
+    nowMillis: Date.now(),
+  });
+  const quote = await findVoucherDiscountQuote(firestore, context, codeHash);
+  if (!quote.campaignId) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This voucher is invalid, expired, fully used, or not eligible for this booking.",
+    );
+  }
+  const quoteRef = firestore.collection("discountQuotes").doc();
+  const expiresAtMillis = Date.now() + DISCOUNT_QUOTE_TTL_MS;
+  await quoteRef.set({
+    quoteId: quoteRef.id,
+    customerUid: uid,
+    salonId,
+    serviceIds: [...serviceIds].sort(),
+    originalAmount,
+    ...discountBookingFields(quote),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: admin.firestore.Timestamp.fromMillis(expiresAtMillis),
+    consumedAt: null,
+  });
+  return {
+    benefitType: "discount",
+    message: `${quote.campaignName} applied. You save ₹${quote.discountAmount}.`,
+    quote: {
+      ...quote,
+      quoteId: quoteRef.id,
+      expiresAtMillis,
+    },
+  };
+});
+
+exports.createBooking = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: 1,
+}, async (request) => {
   const uid = requireAuthenticatedUid(request);
   const firestore = admin.firestore();
   const salonId = requiredId(request.data?.salonId, "salon id");
@@ -148,6 +2979,8 @@ exports.createBooking = onCall({invoker: "public"}, async (request) => {
     );
   }
   const serviceId = serviceIds[0];
+  const quoteId = String(request.data?.quoteId ?? "").trim();
+  const requestedProin = Number(request.data?.requestedProin ?? 0);
   const arrivalMinutes = isInstant ? Number(request.data?.arrivalMinutes) : 0;
   const requestedStartMillis = Number(request.data?.startMillis);
   const requestedBarberId = String(request.data?.barberId ?? "").trim();
@@ -283,6 +3116,33 @@ exports.createBooking = onCall({invoker: "public"}, async (request) => {
       "A verified customer phone number is required to book.",
     );
   }
+  const servicePrice = services.reduce(
+    (total, service) => total + Math.max(0, Number(service.price) || 0),
+    0,
+  );
+  const visitCounts = quoteId ? await loadDiscountVisitCounts(
+    firestore,
+    uid,
+    salonId,
+    user,
+  ) : {completedBookingCount: 0, salonCompletedCount: 0};
+  const discountContext = buildDiscountContext({
+    customerUid: uid,
+    salonId,
+    serviceIds,
+    serviceAmounts: Object.fromEntries(
+      services.map((service, index) => [
+        serviceIds[index],
+        Math.max(0, Number(service.price) || 0),
+      ]),
+    ),
+    originalAmount: servicePrice,
+    ...visitCounts,
+    nowMillis,
+  });
+  let discountQuote = emptyDiscountQuote(servicePrice);
+  const quoteRef = quoteId ?
+    firestore.collection("discountQuotes").doc(quoteId) : null;
   const booking = {
     salonId,
     serviceId,
@@ -298,13 +3158,17 @@ exports.createBooking = onCall({invoker: "public"}, async (request) => {
     serviceName: services
       .map((service) => String(service.name ?? "Service").trim() || "Service")
       .join(", "),
-    servicePrice: services.reduce(
-      (total, service) => total + Math.max(0, Number(service.price) || 0),
-      0,
+    servicePrice,
+    servicePriceBreakdown: Object.fromEntries(
+      services.map((service, index) => [
+        serviceIds[index],
+        money(service.price),
+      ]),
     ),
     bookingFee: 0,
     paymentRequired: false,
     paymentStatus: "not_required",
+    ...discountBookingFields(discountQuote),
     status: isInstant ? "pending" : "confirmed",
     createdAt,
     isInstant,
@@ -336,7 +3200,131 @@ exports.createBooking = onCall({invoker: "public"}, async (request) => {
       );
     }
 
+    let lockedQuote = false;
+    if (quoteRef) {
+      const quoteSnapshot = await transaction.get(quoteRef);
+      const quoteData = quoteSnapshot.data();
+      const quoteError = lockedDiscountQuoteError({
+        quote: quoteData,
+        customerUid: uid,
+        salonId,
+        serviceIds,
+        originalAmount: servicePrice,
+        nowMillis,
+      });
+      if (quoteError) {
+        throw new HttpsError("failed-precondition", quoteError);
+      }
+      discountQuote = discountQuoteFromStored(quoteData);
+      lockedQuote = true;
+    }
+
+    let discountReservation = null;
+    let discountFundingState = null;
+    if (discountQuote.campaignId) {
+      discountReservation = discountReferences(
+        firestore,
+        discountQuote.campaignId,
+        salonId,
+        uid,
+      );
+      const campaignSnapshot = await transaction.get(
+        discountReservation.campaignRef,
+      );
+      const campaignUsageSnapshot = await transaction.get(
+        discountReservation.campaignUsageRef,
+      );
+      const salonUsageSnapshot = await transaction.get(
+        discountReservation.salonUsageRef,
+      );
+      const customerUsageSnapshot = await transaction.get(
+        discountReservation.customerUsageRef,
+      );
+      const vaultSnapshot = await transaction.get(discountReservation.vaultRef);
+      const salonPromotionWalletSnapshot = await transaction.get(
+        discountReservation.salonPromotionWalletRef,
+      );
+      const salonPromotionLotsSnapshot = await transaction.get(
+        discountReservation.salonPromotionLotsQuery,
+      );
+      const campaign = campaignSnapshot.data();
+      const recalculated = campaign && discountCampaignEligible(
+        campaign,
+        discountContext,
+      ) ? calculateDiscountQuote(
+        campaignSnapshot.id,
+        campaign,
+        servicePrice,
+        discountBaseAmount(campaign, discountContext),
+      ) : emptyDiscountQuote(servicePrice);
+      const usage = {
+        campaign: campaignUsageSnapshot.data(),
+        salon: salonUsageSnapshot.data(),
+        customer: customerUsageSnapshot.data(),
+        vault: vaultSnapshot.data(),
+        salonCreditWallet: salonPromotionWalletSnapshot.data(),
+      };
+      const quoteToReserve = lockedQuote ? discountQuote : recalculated;
+      if (!campaign || campaign.active !== true ||
+          !discountBudgetAllows(campaign, quoteToReserve, usage)) {
+        if (lockedQuote) {
+          throw new HttpsError(
+            "failed-precondition",
+            "This discount is no longer available. Refresh the price before booking.",
+          );
+        }
+        discountQuote = emptyDiscountQuote(servicePrice);
+        discountReservation = null;
+      } else {
+        discountQuote = quoteToReserve;
+        discountFundingState = {
+          vault: vaultSnapshot.data(),
+          salonCreditWallet: salonPromotionWalletSnapshot.data(),
+          salonCreditLots: salonPromotionLotsSnapshot.docs.map((document) => ({
+            id: document.id,
+            ref: document.ref,
+            ...document.data(),
+          })),
+        };
+      }
+      Object.assign(booking, discountBookingFields(discountQuote));
+    }
+
+    booking.discountGlobalTotalsTracked = Boolean(discountReservation);
+
+    const proinFields = await runProinCallable(() =>
+      proinBackend.reserveBookingRedemptionInTransaction({
+        transaction,
+        bookingId: bookingRef.id,
+        uid,
+        salonId,
+        serviceIds,
+        originalAmount: servicePrice,
+        discountAmount: discountQuote.discountAmount,
+        requestedProin,
+      }));
+    Object.assign(booking, proinFields);
+
     transaction.create(bookingRef, booking);
+    if (quoteRef) {
+      transaction.update(quoteRef, {
+        consumedAt: admin.firestore.FieldValue.serverTimestamp(),
+        consumedByBookingId: bookingRef.id,
+      });
+    }
+    if (discountReservation) {
+      reserveDiscountInTransaction(
+        transaction,
+        discountReservation,
+        discountQuote,
+        {
+          bookingId: bookingRef.id,
+          salonId,
+          customerUid: uid,
+          fundingState: discountFundingState,
+        },
+      );
+    }
     transaction.set(activeCustomerRef, activeBookingMarker({
       bookingId: bookingRef.id,
       salonId,
@@ -372,10 +3360,251 @@ exports.createBooking = onCall({invoker: "public"}, async (request) => {
   return {bookingId: bookingRef.id};
 });
 
-exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
+exports.updateBookingStatus = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: "gcf_gen1",
+}, (request) => updateBookingStatusHandler(request));
+
+exports.updateBookingStatusAsAdmin = onCall({
+  invoker: "public",
+  enforceAppCheck: false,
+  cpu: "gcf_gen1",
+}, (request) => updateBookingStatusHandler(request, {platformAdmin: true}));
+
+exports.updateCustomerArrivalStatus = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: "gcf_gen1",
+}, async (request) => {
   const uid = requireAuthenticatedUid(request);
   const bookingId = requiredId(request.data?.bookingId, "booking id");
+  const arrivalStatus = String(request.data?.arrivalStatus ?? "").trim();
+  if (!validArrivalStatus(arrivalStatus)) {
+    throw new HttpsError("invalid-argument", "Invalid arrival status.");
+  }
+  const firestore = admin.firestore();
+  const bookingRef = firestore.collection("bookings").doc(bookingId);
+  const sessionRef = firestore.collection("bookingArrivalSessions").doc(bookingId);
+  let bookingForNotification = null;
+  await firestore.runTransaction(async (transaction) => {
+    const bookingSnapshot = await transaction.get(bookingRef);
+    const booking = bookingSnapshot.data();
+    requireCustomerArrivalBooking(booking, uid);
+    const stopSharing = arrivalStatus === "arrived" ||
+      arrivalStatus === "notStarted";
+    transaction.update(bookingRef, {
+      arrivalStatus,
+      arrivalStatusUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(stopSharing ? {
+        arrivalSharingActive: false,
+        arrivalSharingExpiresAt: admin.firestore.FieldValue.delete(),
+      } : {}),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    if (stopSharing) {
+      transaction.set(sessionRef, {
+        bookingId,
+        customerUid: uid,
+        sharingActive: false,
+        stoppedReason: arrivalStatus,
+        stoppedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...customerArrivalLocationDeletes(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+    bookingForNotification = {...booking, arrivalStatus};
+  });
+  const hydrated = await hydrateBookingRecipients(bookingForNotification);
+  await sendToUsers(
+    [hydrated?.ownerUid, hydrated?.barberUid].filter(Boolean),
+    {
+      title: "Customer arrival update",
+      body: `${hydrated?.customerName || "Customer"}: ` +
+        customerArrivalStatusLabel(arrivalStatus),
+      data: {
+        type: "customerArrival",
+        bookingId,
+        salonId: hydrated?.salonId || "",
+        arrivalStatus,
+        destination: "bookings",
+      },
+      collapseKey: `arrival-${bookingId}`,
+    },
+  );
+  return {bookingId, arrivalStatus};
+});
+
+exports.startCustomerArrivalSharing = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: "gcf_gen1",
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const bookingId = requiredId(request.data?.bookingId, "booking id");
+  const location = customerLocationPayload(request.data);
+  const nowMillis = Date.now();
+  if (!validLocationUpdate({...location, nowMillis})) {
+    throw new HttpsError("invalid-argument", "Location is invalid or too old.");
+  }
+  const firestore = admin.firestore();
+  const bookingRef = firestore.collection("bookings").doc(bookingId);
+  const sessionRef = firestore.collection("bookingArrivalSessions").doc(bookingId);
+  let result = null;
+  await firestore.runTransaction(async (transaction) => {
+    const bookingSnapshot = await transaction.get(bookingRef);
+    const booking = bookingSnapshot.data();
+    requireCustomerArrivalBooking(booking, uid);
+    const startMillis = booking.start?.toMillis?.() || 0;
+    if (startMillis <= 0 || nowMillis < startMillis - 2 * 60 * 60 * 1000) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Live arrival sharing opens two hours before the booking.",
+      );
+    }
+    const expiresAtMillis = sharingExpiresAtMillis({
+      nowMillis,
+      bookingStartMillis: startMillis,
+      durationMinutes: booking.durationMinutes,
+    });
+    if (expiresAtMillis <= nowMillis) {
+      throw new HttpsError("failed-precondition", "This booking has ended.");
+    }
+    const salonSnapshot = await transaction.get(
+      firestore.collection("salons").doc(String(booking.salonId || "")),
+    );
+    const salon = salonSnapshot.data() || {};
+    const metrics = customerArrivalMetrics(location, salon);
+    const expiresAt = admin.firestore.Timestamp.fromMillis(expiresAtMillis);
+    transaction.set(sessionRef, {
+      bookingId,
+      customerUid: uid,
+      salonId: String(booking.salonId || ""),
+      sharingActive: true,
+      startedAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt,
+      latestLatitude: location.latitude,
+      latestLongitude: location.longitude,
+      accuracyMeters: location.accuracyMeters,
+      speedMetersPerSecond: location.speedMetersPerSecond,
+      lastLocationAt: admin.firestore.Timestamp.fromMillis(
+        location.capturedAtMillis,
+      ),
+      ...metrics,
+      stoppedReason: "",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+    transaction.update(bookingRef, {
+      arrivalStatus: booking.arrivalStatus === "runningLate" ?
+        "runningLate" : "onTheWay",
+      arrivalStatusUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      arrivalSharingActive: true,
+      arrivalSharingExpiresAt: expiresAt,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    result = {bookingId, expiresAtMillis, ...metrics};
+  });
+  return result;
+});
+
+exports.updateCustomerArrivalLocation = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: "gcf_gen1",
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const bookingId = requiredId(request.data?.bookingId, "booking id");
+  const location = customerLocationPayload(request.data);
+  const nowMillis = Date.now();
+  if (!validLocationUpdate({...location, nowMillis})) {
+    throw new HttpsError("invalid-argument", "Location is invalid or too old.");
+  }
+  const firestore = admin.firestore();
+  const bookingRef = firestore.collection("bookings").doc(bookingId);
+  const sessionRef = firestore.collection("bookingArrivalSessions").doc(bookingId);
+  let result = null;
+  await firestore.runTransaction(async (transaction) => {
+    const [bookingSnapshot, sessionSnapshot] = await Promise.all([
+      transaction.get(bookingRef),
+      transaction.get(sessionRef),
+    ]);
+    const booking = bookingSnapshot.data();
+    const session = sessionSnapshot.data();
+    requireCustomerArrivalBooking(booking, uid);
+    if (!session || session.customerUid !== uid ||
+        session.sharingActive !== true ||
+        (session.expiresAt?.toMillis?.() || 0) <= nowMillis) {
+      throw new HttpsError("failed-precondition", "Location sharing is not active.");
+    }
+    const salonSnapshot = await transaction.get(
+      firestore.collection("salons").doc(String(booking.salonId || "")),
+    );
+    const metrics = customerArrivalMetrics(
+      location,
+      salonSnapshot.data() || {},
+    );
+    transaction.update(sessionRef, {
+      latestLatitude: location.latitude,
+      latestLongitude: location.longitude,
+      accuracyMeters: location.accuracyMeters,
+      speedMetersPerSecond: location.speedMetersPerSecond,
+      lastLocationAt: admin.firestore.Timestamp.fromMillis(
+        location.capturedAtMillis,
+      ),
+      ...metrics,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    result = {bookingId, ...metrics};
+  });
+  return result;
+});
+
+exports.stopCustomerArrivalSharing = onCall({
+  invoker: "public",
+  enforceAppCheck: true,
+  cpu: "gcf_gen1",
+}, async (request) => {
+  const uid = requireAuthenticatedUid(request);
+  const bookingId = requiredId(request.data?.bookingId, "booking id");
+  const firestore = admin.firestore();
+  const bookingRef = firestore.collection("bookings").doc(bookingId);
+  const sessionRef = firestore.collection("bookingArrivalSessions").doc(bookingId);
+  await firestore.runTransaction(async (transaction) => {
+    const bookingSnapshot = await transaction.get(bookingRef);
+    const booking = bookingSnapshot.data();
+    if (!booking) throw new HttpsError("not-found", "Booking not found.");
+    if (booking.customerUid !== uid) {
+      throw new HttpsError("permission-denied", "Not allowed.");
+    }
+    transaction.update(bookingRef, {
+      arrivalSharingActive: false,
+      arrivalSharingExpiresAt: admin.firestore.FieldValue.delete(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    transaction.set(sessionRef, {
+      bookingId,
+      customerUid: uid,
+      sharingActive: false,
+      stoppedReason: "customer",
+      stoppedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...customerArrivalLocationDeletes(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+  });
+  return {bookingId, sharingActive: false};
+});
+
+async function updateBookingStatusHandler(
+  request,
+  {platformAdmin = false, systemActor = false} = {},
+) {
+  const uid = systemActor ? "system" : platformAdmin ?
+    await requirePlatformAdministrator(request) :
+    requireAuthenticatedUid(request);
+  const bookingId = requiredId(request.data?.bookingId, "booking id");
   const nextStatus = String(request.data?.status ?? "").trim();
+  const adminReason = platformAdmin ?
+    requiredAdminReason(request.data?.reason) : "";
   const allowedStatuses = new Set([
     "confirmed",
     "inProgress",
@@ -388,6 +3617,8 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
   }
   const firestore = admin.firestore();
   const bookingRef = firestore.collection("bookings").doc(bookingId);
+  const auditRef = platformAdmin ?
+    firestore.collection("adminAuditLogs").doc() : null;
   const initialBookingSnapshot = await bookingRef.get();
   const initialBooking = initialBookingSnapshot.data();
   if (!initialBooking) {
@@ -419,20 +3650,28 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
     .trim();
   let actorRole = "";
   let updatedBooking = null;
+  let statusChanged = false;
+  let proinWalletToRefresh = "";
   await firestore.runTransaction(async (transaction) => {
     const bookingSnapshot = await transaction.get(bookingRef);
-    const actorSnapshot = await transaction.get(
+    const actorSnapshot = platformAdmin || systemActor ? null :
+      await transaction.get(
       firestore.collection("users").doc(uid),
-    );
+      );
     const booking = bookingSnapshot.data();
     if (!booking) {
       throw new HttpsError("not-found", "Booking not found.");
     }
-    actorRole = normalizeRole(actorSnapshot.data()?.role) || "";
+    if (booking.status === nextStatus) {
+      updatedBooking = booking;
+      return;
+    }
+    actorRole = systemActor ? "admin" : platformAdmin ?
+      "admin" : normalizeRole(actorSnapshot.data()?.role) || "";
     if (
       (actorRole === "customer" && booking.customerUid !== uid) ||
       (actorRole === "owner" && booking.ownerUid !== uid) ||
-      (actorRole !== "customer" && actorRole !== "owner")
+      !["customer", "owner", "admin"].includes(actorRole)
     ) {
       throw new HttpsError("permission-denied", "Not allowed.");
     }
@@ -445,6 +3684,7 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
     if (transitionError) {
       throw new HttpsError("failed-precondition", transitionError);
     }
+    statusChanged = true;
 
     let assignedBarber = null;
     const lockReads = new Map();
@@ -502,14 +3742,74 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
       .doc(booking.customerUid);
     const isTerminal = ["cancelled", "rejected", "completed"]
       .includes(nextStatus);
+    const shouldStopArrivalSharing = isTerminal || nextStatus === "inProgress";
     const activeCustomerSnapshot = isTerminal ?
       await transaction.get(activeCustomerRef) : null;
     const activeInstantSnapshot = isTerminal && booking.isInstant === true ?
       await transaction.get(activeInstantRef) : null;
+    let discountResolution = null;
+    if (isTerminal &&
+        booking.discountStatus === "reserved" &&
+        String(booking.discountCampaignId ?? "").trim()) {
+      const refs = discountReferences(
+        firestore,
+        booking.discountCampaignId,
+        booking.salonId,
+        booking.customerUid,
+      );
+      await transaction.get(refs.campaignUsageRef);
+      await transaction.get(refs.salonUsageRef);
+      await transaction.get(refs.customerUsageRef);
+      const fundingState = await readDiscountResolutionFundingState({
+        transaction,
+        firestore,
+        refs,
+        booking,
+        bookingId,
+      });
+      discountResolution = {
+        refs,
+        outcome: nextStatus === "completed" ? "redeemed" : "released",
+        fundingState,
+      };
+    }
+    let qualifyingCustomerReferral = null;
+    if (nextStatus === "completed") {
+      const referralRef = firestore.collection("referrals")
+        .doc(booking.customerUid);
+      const referralSnapshot = await transaction.get(referralRef);
+      const referral = referralSnapshot.data();
+      if (referral?.status === "pending" &&
+          referral.referredRole === "customer") {
+        qualifyingCustomerReferral = {ref: referralRef, data: referral};
+      }
+    }
+
+    let proinResolutionFields = null;
+    if (isTerminal && booking.proinStatus === "reserved") {
+      const resolution = await runProinCallable(() =>
+        proinBackend.resolveBookingRedemptionInTransaction({
+          transaction,
+          bookingId,
+          booking,
+          outcome: nextStatus === "completed" ? "redeemed" : "released",
+          nowMillis,
+        }));
+      if (resolution) {
+        const {walletId, ...bookingFields} = resolution;
+        proinWalletToRefresh = walletId;
+        proinResolutionFields = bookingFields;
+      }
+    }
 
     const update = {
       status: nextStatus,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(proinResolutionFields || {}),
+      ...(shouldStopArrivalSharing ? {
+        arrivalSharingActive: false,
+        arrivalSharingExpiresAt: admin.firestore.FieldValue.delete(),
+      } : {}),
     };
     if (nextStatus === "confirmed" && booking.status === "pending") {
       update.acceptedAt = admin.firestore.FieldValue.serverTimestamp();
@@ -521,22 +3821,101 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
     }
     if (nextStatus === "inProgress") {
       update.startedAt = admin.firestore.FieldValue.serverTimestamp();
+      update.autoCompleteAt = admin.firestore.Timestamp.fromMillis(
+        serviceAutoCompleteAtMillis({...booking, startedAt: nowMillis}),
+      );
     }
     if (nextStatus === "completed") {
       update.completedAt = admin.firestore.FieldValue.serverTimestamp();
+      update.completionSource = systemActor ?
+        "automatic_timeout" : platformAdmin ? "admin" : "salon";
+      update.autoCompleted = systemActor;
     }
     if (nextStatus === "cancelled") {
       update.cancelledBy = actorRole;
       update.cancellationReason = cancellationReason ||
-        (actorRole === "owner" ? "Cancelled by salon" : "Cancelled by customer");
+        (actorRole === "admin" ? adminReason :
+          actorRole === "owner" ? "Cancelled by salon" :
+            "Cancelled by customer");
       update.cancelledAt = admin.firestore.FieldValue.serverTimestamp();
     }
     if (nextStatus === "rejected") {
-      update.cancelledBy = "owner";
-      update.cancellationReason = cancellationReason || "Rejected by salon";
+      update.cancelledBy = actorRole === "admin" ? "admin" : "owner";
+      update.cancellationReason = cancellationReason ||
+        (actorRole === "admin" ? adminReason : "Rejected by salon");
       update.rejectedAt = admin.firestore.FieldValue.serverTimestamp();
     }
+    if (platformAdmin) {
+      update.lastAdminActionAt = admin.firestore.FieldValue.serverTimestamp();
+      update.lastAdminActionBy = uid;
+      update.lastAdminActionReason = adminReason;
+    }
+    if (discountResolution) {
+      update.discountStatus = discountResolution.outcome;
+    }
     transaction.update(bookingRef, update);
+    if (shouldStopArrivalSharing) {
+      transaction.set(
+        firestore.collection("bookingArrivalSessions").doc(bookingId),
+        {
+          bookingId,
+          customerUid: booking.customerUid,
+          sharingActive: false,
+          stoppedReason: nextStatus,
+          stoppedAt: admin.firestore.FieldValue.serverTimestamp(),
+          ...customerArrivalLocationDeletes(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true},
+      );
+    }
+    if (nextStatus === "completed") {
+      transaction.set(firestore.collection("users").doc(booking.customerUid), {
+        completedBookingCount: admin.firestore.FieldValue.increment(1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      transaction.set(
+        firestore.collection("customerSalonStats")
+          .doc(`${booking.customerUid}__${booking.salonId}`),
+        {
+          customerUid: booking.customerUid,
+          salonId: booking.salonId,
+          completedBookingCount: admin.firestore.FieldValue.increment(1),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true},
+      );
+    }
+    if (qualifyingCustomerReferral) {
+      transaction.update(qualifyingCustomerReferral.ref, {
+        status: "qualified",
+        qualifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        qualificationBookingId: bookingId,
+        proinAwardPending: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.set(
+        firestore.collection("referralStats")
+          .doc(qualifyingCustomerReferral.data.inviterUid),
+        {
+          pendingCustomerCount: admin.firestore.FieldValue.increment(-1),
+          qualifiedCustomerCount: admin.firestore.FieldValue.increment(1),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true},
+      );
+    }
+    if (discountResolution) {
+      resolveReservedDiscountInTransaction({
+        transaction,
+        firestore,
+        refs: discountResolution.refs,
+        booking,
+        bookingId,
+        outcome: discountResolution.outcome,
+        fundingState: discountResolution.fundingState,
+      });
+    }
 
     if (assignedBarber) {
       const createdAt = booking.createdAt ||
@@ -580,12 +3959,31 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, {merge: true});
     }
+    if (auditRef) {
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid: uid,
+        action: "booking.status_changed",
+        targetType: "booking",
+        targetId: bookingId,
+        reason: adminReason,
+        before: {status: booking.status},
+        after: {status: nextStatus},
+      }));
+    }
     updatedBooking = {...booking, ...update};
     if (assignedBarber) {
       updatedBooking.barberId = assignedBarber.id;
       updatedBooking.barberUid = normalizedOptionalString(assignedBarber.data().uid);
     }
   });
+
+  if (!statusChanged) {
+    return {bookingId, status: nextStatus, unchanged: true};
+  }
+
+  if (proinWalletToRefresh) {
+    await proinBackend.refreshWalletExpiry(proinWalletToRefresh);
+  }
 
   const hydrated = await hydrateBookingRecipients(updatedBooking);
   const message = bookingStatusMessage(hydrated);
@@ -597,13 +3995,30 @@ exports.updateBookingStatus = onCall({invoker: "public"}, async (request) => {
     requiredActiveRolesByUser: bookingRecipientRoles(hydrated),
   });
   return {bookingId, status: nextStatus};
-});
+}
 
-exports.rescheduleBooking = onCall({invoker: "public"}, async (request) => {
-  const uid = requireAuthenticatedUid(request);
+exports.rescheduleBooking = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  (request) => rescheduleBookingHandler(request),
+);
+
+exports.rescheduleBookingAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  (request) => rescheduleBookingHandler(request, {platformAdmin: true}),
+);
+
+async function rescheduleBookingHandler(
+  request,
+  {platformAdmin = false} = {},
+) {
+  const uid = platformAdmin ?
+    await requirePlatformAdministrator(request) :
+    requireAuthenticatedUid(request);
   const bookingId = requiredId(request.data?.bookingId, "booking id");
   const barberId = requiredId(request.data?.barberId, "barber id");
   const startMillis = Number(request.data?.startMillis);
+  const adminReason = platformAdmin ?
+    requiredAdminReason(request.data?.reason) : "";
   if (!Number.isFinite(startMillis)) {
     throw new HttpsError("invalid-argument", "Choose a new appointment time.");
   }
@@ -615,11 +4030,13 @@ exports.rescheduleBooking = onCall({invoker: "public"}, async (request) => {
   }
   const salonRef = firestore.collection("salons").doc(initial.salonId);
   const barberRef = firestore.collection("barbers").doc(barberId);
+  const auditRef = platformAdmin ?
+    firestore.collection("adminAuditLogs").doc() : null;
   const nowMillis = Date.now();
   let updatedBooking = null;
   await firestore.runTransaction(async (transaction) => {
     const bookingSnapshot = await transaction.get(bookingRef);
-    const actorSnapshot = await transaction.get(
+    const actorSnapshot = platformAdmin ? null : await transaction.get(
       firestore.collection("users").doc(uid),
     );
     const salonSnapshot = await transaction.get(salonRef);
@@ -627,8 +4044,8 @@ exports.rescheduleBooking = onCall({invoker: "public"}, async (request) => {
     const booking = bookingSnapshot.data();
     const salon = salonSnapshot.data();
     const barber = barberSnapshot.data();
-    requireStoredRole(actorSnapshot.data(), "customer");
-    if (!booking || booking.customerUid !== uid) {
+    if (!platformAdmin) requireStoredRole(actorSnapshot.data(), "customer");
+    if (!booking || (!platformAdmin && booking.customerUid !== uid)) {
       throw new HttpsError("permission-denied", "Not allowed.");
     }
     if (!canRescheduleBooking(booking, nowMillis)) {
@@ -699,6 +4116,11 @@ exports.rescheduleBooking = onCall({invoker: "public"}, async (request) => {
       rescheduledAt: admin.firestore.FieldValue.serverTimestamp(),
       rescheduledFrom: booking.start,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      ...(platformAdmin ? {
+        lastAdminActionAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastAdminActionBy: uid,
+        lastAdminActionReason: adminReason,
+      } : {}),
     });
     for (let index = 0; index < oldRefs.length; index += 1) {
       if (oldSnapshots[index].data()?.bookingId === bookingId) {
@@ -721,6 +4143,20 @@ exports.rescheduleBooking = onCall({invoker: "public"}, async (request) => {
         createdAt,
       }));
     }
+    if (auditRef) {
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid: uid,
+        action: "booking.rescheduled",
+        targetType: "booking",
+        targetId: bookingId,
+        reason: adminReason,
+        before: {
+          barberId: adminString(booking.barberId),
+          startMillis: adminMillis(booking.start),
+        },
+        after: {barberId, startMillis},
+      }));
+    }
     updatedBooking = {
       ...booking,
       barberId,
@@ -737,9 +4173,11 @@ exports.rescheduleBooking = onCall({invoker: "public"}, async (request) => {
     requiredActiveRolesByUser: bookingRecipientRoles(hydrated),
   });
   return {bookingId};
-});
+}
 
-exports.sendBookingPush = onCall({invoker: "public"}, async (request) => {
+exports.sendBookingPush = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  async (request) => {
   const uid = request.auth?.uid;
   if (!uid) {
     throw new HttpsError("unauthenticated", "Sign in first.");
@@ -774,12 +4212,115 @@ exports.sendBookingPush = onCall({invoker: "public"}, async (request) => {
     event,
     handledBy: "authoritativeBookingWorkflow",
   };
-});
+  },
+);
+
+exports.qualifySalonReferralOnSalonCreated = onDocumentCreated(
+  "salons/{salonId}",
+  async (event) => {
+    const salon = event.data?.data();
+    const ownerUid = String(salon?.ownerUid ?? "").trim();
+    if (!ownerUid) return;
+    const firestore = admin.firestore();
+    const referralRef = firestore.collection("referrals").doc(ownerUid);
+    await firestore.runTransaction(async (transaction) => {
+      const referralSnapshot = await transaction.get(referralRef);
+      const referral = referralSnapshot.data();
+      if (referral?.status !== "pending" ||
+          referral.referredRole !== "owner") {
+        return;
+      }
+      transaction.update(referralRef, {
+        status: "qualified",
+        qualifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        qualificationSalonId: event.params.salonId,
+        proinAwardPending: true,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.set(
+        firestore.collection("referralStats").doc(referral.inviterUid),
+        {
+          pendingSalonCount: admin.firestore.FieldValue.increment(-1),
+          qualifiedSalonCount: admin.firestore.FieldValue.increment(1),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true},
+      );
+    });
+  },
+);
+
+exports.awardProinOnReferralQualified = onDocumentUpdated(
+  "referrals/{referredUserId}",
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (before?.status === "qualified" || after?.status !== "qualified") {
+      return;
+    }
+    await processQualifiedReferralRewards(
+      event.params.referredUserId,
+      after,
+    );
+  },
+);
+
+exports.awardSalonReferralAfterFirstCompletedBooking = onDocumentUpdated(
+  "bookings/{bookingId}",
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (before?.status === "completed" || after?.status !== "completed") {
+      return;
+    }
+    const salonId = String(after.salonId || "").trim();
+    if (!salonId) return;
+    const salonSnapshot = await admin.firestore()
+      .collection("salons").doc(salonId).get();
+    const ownerUid = String(salonSnapshot.data()?.ownerUid || "").trim();
+    if (!ownerUid) return;
+    const referralSnapshot = await admin.firestore()
+      .collection("referrals").doc(ownerUid).get();
+    if (referralSnapshot.data()?.status !== "qualified" ||
+        referralSnapshot.data()?.referredRole !== "owner") {
+      return;
+    }
+    await processQualifiedReferralRewards(ownerUid, {
+      ...referralSnapshot.data(),
+      qualificationSalonId:
+        referralSnapshot.data()?.qualificationSalonId || salonId,
+    });
+  },
+);
+
+exports.awardSalonReferralAfterAdminApproval = onDocumentUpdated(
+  "salons/{salonId}",
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (before?.proinReferralApproved === true ||
+        after?.proinReferralApproved !== true) {
+      return;
+    }
+    const ownerUid = String(after.ownerUid || "").trim();
+    if (!ownerUid) return;
+    const referralSnapshot = await admin.firestore()
+      .collection("referrals").doc(ownerUid).get();
+    if (referralSnapshot.data()?.status !== "qualified" ||
+        referralSnapshot.data()?.referredRole !== "owner") {
+      return;
+    }
+    await processQualifiedReferralRewards(ownerUid, {
+      ...referralSnapshot.data(),
+      qualificationSalonId: event.params.salonId,
+    });
+  },
+);
 
 exports.alertOwnerOnBookingCreated = onDocumentCreated(
   {
     document: "bookings/{bookingId}",
-    timeoutSeconds: 120,
+    timeoutSeconds: 240,
     memory: "256MiB",
   },
   async (event) => {
@@ -838,9 +4379,21 @@ exports.alertOwnerOnBookingCreated = onDocumentCreated(
       return;
     }
 
+    const createdAtMillis = createdBooking.createdAt?.toMillis?.() ||
+      Date.now();
+    const expiresAtMillis = createdAtMillis + INSTANT_RESPONSE_TIMEOUT_MS;
     for (let attempt = 0; attempt < OWNER_ALERT_ATTEMPTS; attempt += 1) {
       if (attempt > 0) {
-        await delay(OWNER_ALERT_REPEAT_DELAY_MS);
+        const waitMillis = Math.min(
+          OWNER_ALERT_REPEAT_DELAY_MS,
+          Math.max(0, expiresAtMillis - Date.now()),
+        );
+        if (waitMillis > 0) {
+          await delay(waitMillis);
+        }
+      }
+      if (Date.now() >= expiresAtMillis) {
+        break;
       }
       const snapshot = await bookingRef.get();
       const current = snapshot.data();
@@ -879,6 +4432,27 @@ exports.alertOwnerOnBookingCreated = onDocumentCreated(
         attempt: attempt + 1,
         delivery: ownerDelivery,
       });
+    }
+    const remainingMillis = expiresAtMillis - Date.now();
+    if (remainingMillis > 0) {
+      await delay(remainingMillis);
+    }
+    const expiredBooking = await expirePendingInstantBooking(
+      bookingRef,
+      bookingId,
+    );
+    if (expiredBooking) {
+      const booking = await hydrateBookingRecipients(expiredBooking);
+      await sendToUsers([booking.customerUid].filter(Boolean), {
+        title: "Oops, looks like the salon is busy",
+        body: "Please try again or see other nearby salons.",
+        data: {
+          ...bookingNotificationData(bookingId, booking),
+          event: "response_timeout",
+        },
+        requiredActiveRolesByUser: bookingRecipientRoles(booking),
+      });
+      console.log("instant booking auto-cancelled", {bookingId});
     }
     await customerDeliveryPromise;
   },
@@ -958,12 +4532,49 @@ exports.stopOwnerAlertOnBookingResolved = onDocumentUpdated(
   },
 );
 
+exports.completeOverdueServices = onSchedule(
+  {
+    schedule: "every 1 minutes",
+    timeZone: "Asia/Kolkata",
+    timeoutSeconds: 120,
+    memory: "256MiB",
+    cpu: "gcf_gen1",
+  },
+  async () => {
+    const firestore = admin.firestore();
+    const nowMillis = Date.now();
+    const snapshot = await firestore.collection("bookings")
+      .where("status", "==", "inProgress")
+      .limit(500)
+      .get();
+    const overdue = snapshot.docs.filter((document) =>
+      shouldAutoCompleteService(document.data(), nowMillis));
+    const results = await Promise.allSettled(overdue.map((document) =>
+      updateBookingStatusHandler(
+        {data: {bookingId: document.id, status: "completed"}},
+        {systemActor: true},
+      )));
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.error("automatic service completion failed", result.reason);
+      }
+    }
+    console.log("overdue services checked", {
+      activeServiceCount: snapshot.size,
+      completedServiceCount: results.filter(
+        (result) => result.status === "fulfilled",
+      ).length,
+    });
+  },
+);
+
 exports.sendBookingArrivalReminders = onSchedule(
   {
     schedule: "every 1 minutes",
     timeZone: "Asia/Kolkata",
     timeoutSeconds: 120,
     memory: "256MiB",
+    cpu: "gcf_gen1",
   },
   async () => {
     const firestore = admin.firestore();
@@ -1007,7 +4618,51 @@ exports.sendBookingArrivalReminders = onSchedule(
   },
 );
 
-exports.sendJoinRequestPush = onCall({invoker: "public"}, async (request) => {
+exports.expireCustomerArrivalSharing = onSchedule(
+  {
+    schedule: "every 10 minutes",
+    timeZone: "Asia/Kolkata",
+    timeoutSeconds: 120,
+    memory: "256MiB",
+    cpu: "gcf_gen1",
+  },
+  async () => {
+    const firestore = admin.firestore();
+    const now = admin.firestore.Timestamp.now();
+    const snapshot = await firestore.collection("bookingArrivalSessions")
+      .where("sharingActive", "==", true)
+      .limit(500)
+      .get();
+    const writer = firestore.bulkWriter();
+    let expiredCount = 0;
+    for (const document of snapshot.docs) {
+      if ((document.data().expiresAt?.toMillis?.() || 0) > now.toMillis()) {
+        continue;
+      }
+      expiredCount += 1;
+      writer.update(document.ref, {
+        sharingActive: false,
+        stoppedReason: "expired",
+        stoppedAt: now,
+        ...customerArrivalLocationDeletes(),
+        updatedAt: now,
+      });
+      writer.set(firestore.collection("bookings").doc(document.id), {
+        arrivalSharingActive: false,
+        arrivalSharingExpiresAt: admin.firestore.FieldValue.delete(),
+        updatedAt: now,
+      }, {merge: true});
+    }
+    await writer.close();
+    console.log("customer arrival sharing expiry checked", {
+      expiredCount,
+    });
+  },
+);
+
+exports.sendJoinRequestPush = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  async (request) => {
   const uid = request.auth?.uid;
   if (!uid) {
     throw new HttpsError("unauthenticated", "Sign in first.");
@@ -1074,12 +4729,14 @@ exports.sendJoinRequestPush = onCall({invoker: "public"}, async (request) => {
     delivery,
   });
   return {ok: true, delivery};
-});
+  },
+);
 
 exports.sendEmailOtp = onCall(
   {
     enforceAppCheck: true,
     invoker: "public",
+    cpu: "gcf_gen1",
     secrets: [smtpHost, smtpPort, smtpUser, smtpPass, smtpFrom, otpSecret],
   },
   async (request) => {
@@ -1135,7 +4792,12 @@ exports.sendEmailOtp = onCall(
 );
 
 exports.verifyEmailOtp = onCall(
-  {enforceAppCheck: true, invoker: "public", secrets: [otpSecret]},
+  {
+    enforceAppCheck: true,
+    invoker: "public",
+    cpu: "gcf_gen1",
+    secrets: [otpSecret],
+  },
   async (request) => {
     const email = normalizeEmail(request.data?.email);
     const code = String(request.data?.code ?? "").trim();
@@ -1205,7 +4867,7 @@ exports.verifyEmailOtp = onCall(
 );
 
 exports.claimLoginRole = onCall(
-  {enforceAppCheck: false, invoker: "public"},
+  {enforceAppCheck: false, invoker: "public", cpu: "gcf_gen1"},
   async (request) => {
     const uid = request.auth?.uid;
     if (!uid) {
@@ -1266,6 +4928,9 @@ exports.claimLoginRole = onCall(
         userSnapshot.data(),
         !ownerSalons.empty,
       );
+      const isNewRegistration = !storedRole;
+      const referralOnboardingPending =
+        userSnapshot.data()?.referralOnboardingCompleted === false;
       const claimedPhoneRole = normalizeRole(phoneSnapshot?.data()?.role);
 
       if (storedRole && storedRole !== requestedRole) {
@@ -1294,6 +4959,7 @@ exports.claimLoginRole = onCall(
           role: requestedRole,
           name: "",
           requiresName: true,
+          requiresReferralOnboarding: false,
         };
       }
 
@@ -1307,6 +4973,10 @@ exports.claimLoginRole = onCall(
         email: email || null,
         phone: phone || null,
         provider,
+        ...(isNewRegistration ? {
+          referralOnboardingCompleted: false,
+          registeredAt: admin.firestore.FieldValue.serverTimestamp(),
+        } : {}),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, {merge: true});
 
@@ -1322,6 +4992,8 @@ exports.claimLoginRole = onCall(
         role: requestedRole,
         name: resolvedName,
         requiresName: false,
+        requiresReferralOnboarding:
+          isNewRegistration || referralOnboardingPending,
       };
     });
 
@@ -1329,8 +5001,435 @@ exports.claimLoginRole = onCall(
   },
 );
 
+exports.getReferralCodes = onCall(
+  {enforceAppCheck: true, invoker: "public", cpu: 1},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const firestore = admin.firestore();
+    const userRef = firestore.collection("users").doc(uid);
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const proposedCustomerCode = generateReferralCode();
+      let proposedSalonCode = generateReferralCode();
+      while (proposedSalonCode === proposedCustomerCode) {
+        proposedSalonCode = generateReferralCode();
+      }
+      try {
+        return await firestore.runTransaction(async (transaction) => {
+          const userSnapshot = await transaction.get(userRef);
+          const user = userSnapshot.data() ?? {};
+          const role = inferStoredRole(user, false);
+          if (role !== "customer" && role !== "owner") {
+            throw new HttpsError(
+              "permission-denied",
+              "Only customers and salon owners can create referral codes.",
+            );
+          }
+
+          const customerField = role === "customer" ?
+            "customerReferralCode" : "ownerCustomerReferralCode";
+          const existingCustomerCode = normalizeReferralCode(
+            user[customerField],
+          );
+          const existingSalonCode = role === "owner" ?
+            normalizeReferralCode(user.ownerSalonReferralCode) : "";
+          const customerCode = existingCustomerCode || proposedCustomerCode;
+          const salonCode = role === "owner" ?
+            (existingSalonCode || proposedSalonCode) : "";
+          const reservations = [
+            {
+              code: customerCode,
+              targetRole: "customer",
+              wasStored: Boolean(existingCustomerCode),
+            },
+            ...(role === "owner" ? [{
+              code: salonCode,
+              targetRole: "owner",
+              wasStored: Boolean(existingSalonCode),
+            }] : []),
+          ];
+          const reservationSnapshots = [];
+          for (const reservation of reservations) {
+            reservationSnapshots.push(await transaction.get(
+              firestore.collection("referralCodes").doc(reservation.code),
+            ));
+          }
+          for (let index = 0; index < reservations.length; index += 1) {
+            const reservation = reservations[index];
+            const reserved = reservationSnapshots[index].data();
+            if (!reserved) continue;
+            const matchesOwner = reserved.ownerUid === uid &&
+              reserved.targetRole === reservation.targetRole;
+            if (matchesOwner) continue;
+            if (reservation.wasStored) {
+              throw new HttpsError(
+                "data-loss",
+                "A stored referral code has an ownership conflict. Contact support.",
+              );
+            }
+            const collision = new Error("referral-code-collision");
+            collision.isReferralCodeCollision = true;
+            throw collision;
+          }
+
+          reservations.forEach((reservation, index) => {
+            if (reservationSnapshots[index].exists) return;
+            transaction.set(reservationSnapshots[index].ref, {
+              code: reservation.code,
+              ownerUid: uid,
+              inviterRole: role,
+              targetRole: reservation.targetRole,
+              active: true,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          });
+          transaction.set(userRef, {
+            [customerField]: customerCode,
+            ...(role === "owner" ? {ownerSalonReferralCode: salonCode} : {}),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, {merge: true});
+          return {customerInviteCode: customerCode, salonInviteCode: salonCode};
+        });
+      } catch (error) {
+        if (error?.isReferralCodeCollision === true) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new HttpsError(
+      "resource-exhausted",
+      "Could not reserve a referral code. Please try again.",
+    );
+  },
+);
+
+exports.updateReferralCodeAsAdmin = onCall(
+  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  async (request) => {
+    const adminUid = await requirePlatformAdministrator(request);
+    const reason = requiredAdminReason(request.data?.reason);
+    const currentCode = normalizeReferralCode(request.data?.currentCode);
+    const newCode = normalizeReferralCode(request.data?.newCode);
+    if (!currentCode || !newCode) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Referral codes must be 6 characters with letters and numbers.",
+      );
+    }
+    const firestore = admin.firestore();
+    const currentRef = firestore.collection("referralCodes").doc(currentCode);
+    const newRef = firestore.collection("referralCodes").doc(newCode);
+    const auditRef = firestore.collection("adminAuditLogs").doc();
+    let response = null;
+
+    await firestore.runTransaction(async (transaction) => {
+      const [currentSnapshot, newSnapshot] = await Promise.all([
+        transaction.get(currentRef),
+        currentCode === newCode ? transaction.get(currentRef) :
+          transaction.get(newRef),
+      ]);
+      const before = currentSnapshot.data();
+      if (!before) {
+        throw new HttpsError("not-found", "This referral code was not found.");
+      }
+      if (currentCode !== newCode && newSnapshot.exists) {
+        throw new HttpsError(
+          "already-exists",
+          "This referral code is already assigned to another account.",
+        );
+      }
+      const ownerUid = adminString(before.ownerUid);
+      const inviterRole = adminString(before.inviterRole);
+      const targetRole = adminString(before.targetRole);
+      const userCodeField = referralCodeUserField(inviterRole, targetRole);
+      if (!ownerUid || !userCodeField) {
+        throw new HttpsError(
+          "data-loss",
+          "This referral code record is missing its owner or role.",
+        );
+      }
+      const userRef = firestore.collection("users").doc(ownerUid);
+      const userSnapshot = await transaction.get(userRef);
+      if (!userSnapshot.exists) {
+        throw new HttpsError(
+          "failed-precondition",
+          "The referral code owner account no longer exists.",
+        );
+      }
+      const active = request.data?.active === true;
+      const nowField = admin.firestore.FieldValue.serverTimestamp();
+      const after = {
+        code: newCode,
+        ownerUid,
+        inviterRole,
+        targetRole,
+        active,
+        createdAt: before.createdAt || nowField,
+        replacedFromCode: currentCode === newCode ?
+          adminString(before.replacedFromCode) : currentCode,
+        updatedAt: nowField,
+        updatedByAdminUid: adminUid,
+      };
+
+      if (currentCode === newCode) {
+        transaction.set(currentRef, after, {merge: true});
+      } else {
+        transaction.set(currentRef, {
+          active: false,
+          replacedByCode: newCode,
+          updatedAt: nowField,
+          updatedByAdminUid: adminUid,
+        }, {merge: true});
+        transaction.create(newRef, after);
+        transaction.set(userRef, {
+          [userCodeField]: newCode,
+          updatedAt: nowField,
+        }, {merge: true});
+      }
+
+      const beforeView = referralCodeAdminView(currentCode, before);
+      const afterView = referralCodeAdminView(newCode, after);
+      transaction.create(auditRef, adminAuditRecord({
+        adminUid,
+        action: currentCode === newCode ?
+          "referral.code_updated" : "referral.code_replaced",
+        targetType: "referralCode",
+        targetId: currentCode,
+        reason,
+        before: beforeView,
+        after: afterView,
+      }));
+      response = afterView;
+    });
+    return response;
+  },
+);
+
+exports.completeReferralOnboarding = onCall(
+  {enforceAppCheck: true, invoker: "public", cpu: "gcf_gen1"},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const rawCode = String(request.data?.referralCode ?? "").trim();
+    const code = rawCode ? normalizeReferralCode(rawCode) : "";
+    if (rawCode && !code) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Enter a valid 6-character referral code.",
+      );
+    }
+    const firestore = admin.firestore();
+    if (code) {
+      await enforceReferralAttemptLimit(firestore, uid);
+    }
+    const userRef = firestore.collection("users").doc(uid);
+    const codeRef = code ? firestore.collection("referralCodes").doc(code) : null;
+    const referralRef = firestore.collection("referrals").doc(uid);
+
+    return firestore.runTransaction(async (transaction) => {
+      const userSnapshot = await transaction.get(userRef);
+      const codeSnapshot = codeRef ? await transaction.get(codeRef) : null;
+      const referralSnapshot = await transaction.get(referralRef);
+      const user = userSnapshot.data() ?? {};
+      const role = inferStoredRole(user, false);
+      if (role !== "customer" && role !== "owner") {
+        throw new HttpsError("permission-denied", "Complete registration first.");
+      }
+      if (user.referralOnboardingCompleted === true) {
+        return {completed: true, alreadyCompleted: true};
+      }
+      if (user.referralOnboardingCompleted !== false) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Referral codes can only be entered during first registration.",
+        );
+      }
+      if (code) {
+        const referralCode = codeSnapshot?.data();
+        if (!referralCode || referralCode.active !== true) {
+          throw new HttpsError("not-found", "This referral code is not valid.");
+        }
+        if (!referralTargetAllowed(referralCode.targetRole, role)) {
+          throw new HttpsError(
+            "failed-precondition",
+            role === "customer" ?
+              "This code cannot be used for a customer account." :
+              "This code cannot be used for a salon account.",
+          );
+        }
+        if (referralCode.ownerUid === uid) {
+          throw new HttpsError(
+            "failed-precondition",
+            "You cannot use your own referral code.",
+          );
+        }
+        if (referralSnapshot.exists) {
+          throw new HttpsError(
+            "already-exists",
+            "A referral has already been recorded for this account.",
+          );
+        }
+        const inviteLimit = await referralInviteLimit({
+          transaction,
+          firestore,
+          inviterUid: referralCode.ownerUid,
+          inviterRole: referralCode.inviterRole,
+          targetRole: role,
+        });
+        if (inviteLimit.hasLimit) {
+          const statsRef = firestore.collection("referralStats")
+            .doc(referralCode.ownerUid);
+          const statsSnapshot = await transaction.get(statsRef);
+          const stats = statsSnapshot.data() || {};
+          const pendingField = role === "owner" ?
+            "pendingSalonCount" : "pendingCustomerCount";
+          const qualifiedField = role === "owner" ?
+            "qualifiedSalonCount" : "qualifiedCustomerCount";
+          const currentInviteCount = money(stats[pendingField]) +
+            money(stats[qualifiedField]);
+          if (currentInviteCount >= inviteLimit.maximumInvitesPerAccount) {
+            throw new HttpsError(
+              "resource-exhausted",
+              role === "owner" ?
+                "This salon referral code has reached its invite limit." :
+                "This customer referral code has reached its invite limit.",
+            );
+          }
+        }
+        transaction.set(referralRef, {
+          referredUid: uid,
+          referredRole: role,
+          referralCode: code,
+          inviterUid: referralCode.ownerUid,
+          inviterRole: referralCode.inviterRole,
+          status: "pending",
+          qualificationType: role === "owner" ?
+            "salon_registered" : "first_completed_booking",
+          qualifiedAt: null,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        transaction.set(
+          firestore.collection("referralStats").doc(referralCode.ownerUid),
+          {
+            inviterUid: referralCode.ownerUid,
+            [role === "owner" ? "pendingSalonCount" :
+              "pendingCustomerCount"]:
+                admin.firestore.FieldValue.increment(1),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          {merge: true},
+        );
+      }
+      transaction.set(userRef, {
+        referralOnboardingCompleted: true,
+        referralCodeEntered: code || null,
+        referralCompletedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      return {completed: true, alreadyCompleted: false};
+    });
+  },
+);
+
+async function referralInviteLimit({
+  transaction,
+  firestore,
+  inviterUid,
+  inviterRole,
+  targetRole,
+}) {
+  const normalizedInviterRole = String(inviterRole || "").trim();
+  const normalizedTargetRole = String(targetRole || "").trim();
+  if (!inviterUid || !["customer", "owner"].includes(normalizedInviterRole) ||
+      !["customer", "owner"].includes(normalizedTargetRole)) {
+    return {hasLimit: false, maximumInvitesPerAccount: 0};
+  }
+  const sourceType = normalizedTargetRole === "owner" ?
+    "referral_salon" : "referral_customer";
+  const qualificationEvent = normalizedTargetRole === "owner" ?
+    "salon_approved_and_first_completed_booking" :
+    "first_completed_booking";
+  const nowMillis = Date.now();
+  const snapshot = await transaction.get(
+    firestore.collection("proinPrograms")
+      .where("sourceType", "==", sourceType)
+      .where("active", "==", true)
+      .limit(50),
+  );
+  const limits = snapshot.docs
+    .map((document) => document.data())
+    .filter((program) =>
+      String(program.rewardRecipient || "") === "inviter" &&
+      String(program.referralInviterRole || "") === normalizedInviterRole &&
+      String(program.referralTargetRole || "") === normalizedTargetRole &&
+      String(program.qualificationEvent || "") === qualificationEvent &&
+      adminMillis(program.startsAt) <= nowMillis &&
+      adminMillis(program.endsAt) > nowMillis)
+    .map((program) => money(program.maximumGrantsPerAccount))
+    .filter((value) => value > 0);
+  if (!limits.length) {
+    return {hasLimit: false, maximumInvitesPerAccount: 0};
+  }
+  return {
+    hasLimit: true,
+    maximumInvitesPerAccount: Math.min(...limits),
+  };
+}
+
+exports.getReferralSummary = onCall(
+  {enforceAppCheck: true, invoker: "public", cpu: 1},
+  async (request) => {
+    const uid = requireAuthenticatedUid(request);
+    const firestore = admin.firestore();
+    const userSnapshot = await firestore.collection("users").doc(uid).get();
+    const role = inferStoredRole(userSnapshot.data(), false);
+    if (role !== "customer" && role !== "owner") {
+      throw new HttpsError("permission-denied", "Referral summary unavailable.");
+    }
+    const [statsSnapshot, programsSnapshot, outgoingSnapshot,
+      incomingSnapshot] = await Promise.all([
+      firestore.collection("referralStats").doc(uid).get(),
+      firestore.collection("proinPrograms")
+        .where("active", "==", true).limit(100).get(),
+      firestore.collection("referrals")
+        .where("inviterUid", "==", uid).limit(100).get(),
+      firestore.collection("referrals").doc(uid).get(),
+    ]);
+    const data = statsSnapshot.data() ?? {};
+    const referrals = outgoingSnapshot.docs.map((document) => ({
+      referralId: document.id,
+      ...document.data(),
+    }));
+    if (incomingSnapshot.exists) {
+      referrals.push({
+        referralId: incomingSnapshot.id,
+        ...incomingSnapshot.data(),
+      });
+    }
+    const rewards = referralRewardSummary({
+      inviterUid: uid,
+      inviterRole: role,
+      nowMillis: Date.now(),
+      programs: programsSnapshot.docs.map((document) => ({
+        ...document.data(),
+        startsAtMillis: adminMillis(document.data()?.startsAt),
+        endsAtMillis: adminMillis(document.data()?.endsAt),
+      })),
+      referrals,
+    });
+    return {
+      pendingCustomerCount: money(data.pendingCustomerCount),
+      qualifiedCustomerCount: money(data.qualifiedCustomerCount),
+      pendingSalonCount: role === "owner" ? money(data.pendingSalonCount) : 0,
+      qualifiedSalonCount: role === "owner" ?
+        money(data.qualifiedSalonCount) : 0,
+      ...rewards,
+    };
+  },
+);
+
 exports.claimOwnerProfilePhone = onCall(
-  {enforceAppCheck: false, invoker: "public"},
+  {enforceAppCheck: false, invoker: "public", cpu: "gcf_gen1"},
   async (request) => {
     const uid = request.auth?.uid;
     if (!uid) {
@@ -1470,7 +5569,7 @@ exports.claimOwnerProfilePhone = onCall(
 );
 
 exports.updateCustomerProfile = onCall(
-  {enforceAppCheck: false, invoker: "public"},
+  {enforceAppCheck: false, invoker: "public", cpu: "gcf_gen1"},
   async (request) => {
     const uid = requireAuthenticatedUid(request);
     const name = normalizeDisplayName(request.data?.name);
@@ -1568,7 +5667,9 @@ exports.updateCustomerProfile = onCall(
   },
 );
 
-exports.submitSalonFeedback = onCall({invoker: "public"}, async (request) => {
+exports.submitSalonFeedback = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  async (request) => {
   const uid = requireAuthenticatedUid(request);
   const bookingId = requiredId(request.data?.bookingId, "booking id");
   const rating = normalizeVisitRating(request.data?.rating);
@@ -1619,9 +5720,12 @@ exports.submitSalonFeedback = onCall({invoker: "public"}, async (request) => {
     }, {merge: true});
   });
   return {bookingId, rating};
-});
+  },
+);
 
-exports.submitCustomerRating = onCall({invoker: "public"}, async (request) => {
+exports.submitCustomerRating = onCall(
+  {invoker: "public", cpu: "gcf_gen1"},
+  async (request) => {
   const uid = requireAuthenticatedUid(request);
   const bookingId = requiredId(request.data?.bookingId, "booking id");
   const rating = normalizeVisitRating(request.data?.rating);
@@ -1679,7 +5783,1041 @@ exports.submitCustomerRating = onCall({invoker: "public"}, async (request) => {
     }, {merge: true});
   });
   return {bookingId, rating};
-});
+  },
+);
+
+function buildDiscountContext({
+  customerUid,
+  salonId,
+  serviceIds,
+  serviceAmounts = {},
+  originalAmount,
+  bookings = [],
+  completedBookingCount,
+  salonCompletedCount,
+  nowMillis,
+}) {
+  const completed = bookings.filter((booking) => booking.status === "completed");
+  return {
+    customerUid,
+    salonId,
+    serviceIds,
+    serviceAmounts,
+    originalAmount: money(originalAmount),
+    completedBookingCount: Number.isInteger(completedBookingCount) ?
+      completedBookingCount : completed.length,
+    salonCompletedCount: Number.isInteger(salonCompletedCount) ?
+      salonCompletedCount : completed.filter(
+        (booking) => booking.salonId === salonId,
+      ).length,
+    nowMillis,
+  };
+}
+
+async function loadDiscountVisitCounts(
+  firestore,
+  uid,
+  salonId,
+  user = {},
+  preloadedStatSnapshot = null,
+) {
+  const statRef = firestore.collection("customerSalonStats")
+    .doc(`${uid}__${salonId}`);
+  const statSnapshot = preloadedStatSnapshot || await statRef.get();
+  const storedTotal = Number(user.completedBookingCount);
+  const storedSalonTotal = Number(statSnapshot.data()?.completedBookingCount);
+  if (Number.isInteger(storedTotal) && storedTotal >= 0 &&
+      Number.isInteger(storedSalonTotal) && storedSalonTotal >= 0) {
+    return {
+      completedBookingCount: storedTotal,
+      salonCompletedCount: storedSalonTotal,
+    };
+  }
+
+  const bookingsSnapshot = await firestore.collection("bookings")
+    .where("customerUid", "==", uid)
+    .get();
+  const completed = bookingsSnapshot.docs
+    .map((doc) => doc.data())
+    .filter((booking) => booking.status === "completed");
+  const completedBookingCount = completed.length;
+  const salonCompletedCount = completed.filter(
+    (booking) => booking.salonId === salonId,
+  ).length;
+  const userRef = firestore.collection("users").doc(uid);
+  let resolvedTotal = completedBookingCount;
+  let resolvedSalonTotal = salonCompletedCount;
+  await firestore.runTransaction(async (transaction) => {
+    const [currentUserSnapshot, currentStatSnapshot] = await Promise.all([
+      transaction.get(userRef),
+      transaction.get(statRef),
+    ]);
+    const currentTotal = Number(currentUserSnapshot.data()?.completedBookingCount);
+    const currentSalonTotal = Number(
+      currentStatSnapshot.data()?.completedBookingCount,
+    );
+    if (Number.isInteger(currentTotal) && currentTotal >= 0) {
+      resolvedTotal = currentTotal;
+    } else {
+      transaction.set(userRef, {
+        completedBookingCount,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+    if (Number.isInteger(currentSalonTotal) && currentSalonTotal >= 0) {
+      resolvedSalonTotal = currentSalonTotal;
+    } else {
+      transaction.set(statRef, {
+        customerUid: uid,
+        salonId,
+        completedBookingCount: salonCompletedCount,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+  });
+  return {
+    completedBookingCount: resolvedTotal,
+    salonCompletedCount: resolvedSalonTotal,
+  };
+}
+
+function discountQuoteFromStored(data = {}) {
+  return {
+    campaignId: String(data.discountCampaignId ?? "").trim(),
+    campaignName: String(data.discountCampaignName ?? "").trim(),
+    fundingSource: data.discountFundingSource ?
+      discountFundingSource(data.discountFundingSource) : "platform_vault",
+    discountType: data.discountType === "fixed" ? "fixed" : "percent",
+    discountPercent: Number(data.discountPercent) || 0,
+    fixedDiscountAmount: money(data.fixedDiscountAmount),
+    voucherOnly: data.discountSource === "voucher",
+    voucherMaskedCode: String(data.voucherMaskedCode ?? "").trim(),
+    originalAmount: money(data.originalAmount),
+    discountBaseAmount: money(data.discountBaseAmount),
+    discountAmount: money(data.discountAmount),
+    customerPayableAmount: money(data.customerPayableAmount),
+    pritzePayoutAmount: money(data.pritzePayoutAmount),
+    salonTotalEarning: money(data.salonTotalEarning),
+  };
+}
+
+function lockedDiscountQuoteError({
+  quote,
+  customerUid,
+  salonId,
+  serviceIds,
+  originalAmount,
+  nowMillis,
+}) {
+  if (!quote) return "This discount quote was not found. Refresh the price.";
+  if (quote.customerUid !== customerUid) return "This discount quote is not yours.";
+  if (quote.salonId !== salonId) return "This discount quote is for another salon.";
+  if (quote.consumedAt) return "This discount quote has already been used.";
+  if (!quote.expiresAt?.toMillis || quote.expiresAt.toMillis() <= nowMillis) {
+    return "This discount quote expired. Refresh the price before booking.";
+  }
+  const expectedServices = [...serviceIds].sort().join("|");
+  const quotedServices = (Array.isArray(quote.serviceIds) ? quote.serviceIds : [])
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean)
+    .sort()
+    .join("|");
+  if (expectedServices !== quotedServices ||
+      money(quote.originalAmount) !== money(originalAmount)) {
+    return "The selected services changed. Refresh the price before booking.";
+  }
+  return "";
+}
+
+function discountReferences(firestore, campaignId, salonId, customerUid) {
+  return {
+    campaignRef: firestore.collection("discountCampaigns").doc(campaignId),
+    campaignUsageRef: firestore.collection("discountCampaignUsage")
+      .doc(campaignId),
+    salonUsageRef: firestore.collection("discountSalonUsage")
+      .doc(`${campaignId}__${salonId}`),
+    customerUsageRef: firestore.collection("discountCustomerUsage")
+      .doc(`${campaignId}__${customerUid}`),
+    customerTotalRef: firestore.collection("discountCustomerTotals")
+      .doc(customerUid),
+    salonTotalRef: firestore.collection("discountSalonTotals").doc(salonId),
+    platformTotalRef: firestore.collection("discountPlatformTotals")
+      .doc("current"),
+    vaultRef: firestore.collection("platformFinance").doc("discountVault"),
+    salonPromotionWalletRef: firestore.collection("proinWallets")
+      .doc(discountSalonPromotionWalletId(salonId)),
+    salonPromotionUsageRef: firestore.collection("salonPromotionCreditUsage")
+      .doc(discountSalonPromotionWalletId(salonId)),
+    salonPromotionReservationRef: firestore
+      .collection("discountSalonPromotionCreditReservations"),
+    salonPromotionLotsQuery: firestore.collection("proinLots")
+      .where("walletId", "==", discountSalonPromotionWalletId(salonId))
+      .limit(500),
+  };
+}
+
+function discountSalonPromotionWalletId(salonId) {
+  return crypto.createHash("sha256")
+    .update(`salon_promotion_credits:${salonId}`)
+    .digest("hex");
+}
+
+async function loadCheckoutDiscountContext(firestore, uid, data = {}) {
+  const salonId = requiredId(data.salonId, "salon id");
+  const serviceIds = [...new Set(
+    (Array.isArray(data.serviceIds) ? data.serviceIds : [])
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean),
+  )];
+  if (serviceIds.length === 0 || serviceIds.length > 6) {
+    throw new HttpsError("invalid-argument", "Choose between 1 and 6 services.");
+  }
+  const statRef = firestore.collection("customerSalonStats")
+    .doc(`${uid}__${salonId}`);
+  const [userSnapshot, salonSnapshot, statSnapshot] = await Promise.all([
+    firestore.collection("users").doc(uid).get(),
+    firestore.collection("salons").doc(salonId).get(),
+    statRef.get(),
+  ]);
+  requireStoredRole(userSnapshot.data(), "customer");
+  const salon = salonSnapshot.data();
+  if (!salon) {
+    throw new HttpsError("not-found", "Salon not found.");
+  }
+  const services = serviceIds.map((id) => findSalonService(salon, id));
+  if (services.some((service) => !service || service.isAvailable === false)) {
+    throw new HttpsError("failed-precondition", "A service is unavailable.");
+  }
+  const originalAmount = services.reduce(
+    (total, service) => total + Math.max(0, Number(service.price) || 0),
+    0,
+  );
+  const visitCounts = await loadDiscountVisitCounts(
+    firestore,
+    uid,
+    salonId,
+    userSnapshot.data(),
+    statSnapshot,
+  );
+  const context = buildDiscountContext({
+    customerUid: uid,
+    salonId,
+    serviceIds,
+    serviceAmounts: Object.fromEntries(
+      services.map((service, index) => [
+        serviceIds[index],
+        Math.max(0, Number(service.price) || 0),
+      ]),
+    ),
+    originalAmount,
+    ...visitCounts,
+    nowMillis: Date.now(),
+  });
+  return {salonId, serviceIds, originalAmount, context};
+}
+
+async function persistDiscountQuote(firestore, {
+  uid,
+  salonId,
+  serviceIds,
+  originalAmount,
+  quote,
+}) {
+  const quoteRef = firestore.collection("discountQuotes").doc();
+  const expiresAtMillis = Date.now() + DISCOUNT_QUOTE_TTL_MS;
+  await quoteRef.set({
+    quoteId: quoteRef.id,
+    customerUid: uid,
+    salonId,
+    serviceIds: [...serviceIds].sort(),
+    originalAmount,
+    ...discountBookingFields(quote),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    expiresAt: admin.firestore.Timestamp.fromMillis(expiresAtMillis),
+    consumedAt: null,
+  });
+  return {
+    ...quote,
+    quoteId: quoteRef.id,
+    expiresAtMillis,
+  };
+}
+
+async function findBestActiveDiscountQuote(firestore, context) {
+  const campaignsSnapshot = await firestore.collection("discountCampaigns")
+    .where("active", "==", true)
+    .limit(50)
+    .get();
+  const candidates = campaignsSnapshot.docs
+    .filter((doc) => doc.data()?.voucherOnly !== true)
+    .filter((doc) => discountCampaignEligible(doc.data(), context))
+    .map((doc) => ({
+      doc,
+      campaign: doc.data(),
+      quote: calculateDiscountQuote(
+        doc.id,
+        doc.data(),
+        context.originalAmount,
+        discountBaseAmount(doc.data(), context),
+      ),
+    }))
+    .sort((left, right) =>
+      right.quote.discountAmount - left.quote.discountAmount ||
+      Number(right.campaign.priority ?? 0) -
+        Number(left.campaign.priority ?? 0) ||
+      left.doc.id.localeCompare(right.doc.id),
+    );
+  for (const candidate of candidates) {
+    const refs = discountReferences(
+      firestore,
+      candidate.doc.id,
+      context.salonId,
+      context.customerUid,
+    );
+    const [
+      campaignUsage,
+      salonUsage,
+      customerUsage,
+      vault,
+      salonCreditWallet,
+    ] = await Promise.all([
+      refs.campaignUsageRef.get(),
+      refs.salonUsageRef.get(),
+      refs.customerUsageRef.get(),
+      refs.vaultRef.get(),
+      refs.salonPromotionWalletRef.get(),
+    ]);
+    if (discountBudgetAllows(candidate.campaign, candidate.quote, {
+      campaign: campaignUsage.data(),
+      salon: salonUsage.data(),
+      customer: customerUsage.data(),
+      vault: vault.data(),
+      salonCreditWallet: salonCreditWallet.data(),
+    })) {
+      return {
+        ...candidate.quote,
+        campaignEndsAtMillis: adminMillis(candidate.campaign.endsAt),
+      };
+    }
+  }
+  return emptyDiscountQuote(context.originalAmount);
+}
+
+async function findVisibleCheckoutDiscountOffers(firestore, context) {
+  const campaignsSnapshot = await firestore.collection("discountCampaigns")
+    .where("active", "==", true)
+    .limit(50)
+    .get();
+  const candidates = campaignsSnapshot.docs
+    .filter((doc) =>
+      discountCampaignSelectableAtCheckout(doc.data(), context))
+    .map((doc) => {
+      const campaign = doc.data();
+      return {
+        doc,
+        campaign,
+        quote: calculateDiscountQuote(
+          doc.id,
+          campaign,
+          context.originalAmount,
+          discountBaseAmount(campaign, context),
+        ),
+      };
+    })
+    .sort((left, right) =>
+      right.quote.discountAmount - left.quote.discountAmount ||
+      Number(right.campaign.priority ?? 0) -
+        Number(left.campaign.priority ?? 0) ||
+      left.doc.id.localeCompare(right.doc.id),
+    );
+  const sharedRefs = discountReferences(
+    firestore,
+    "checkout-shared",
+    context.salonId,
+    context.customerUid,
+  );
+  const vaultPromise = sharedRefs.vaultRef.get();
+  const salonCreditWalletPromise = sharedRefs.salonPromotionWalletRef.get();
+  const evaluatedCandidates = await Promise.all(
+    candidates.map(async (candidate) => {
+      const refs = discountReferences(
+        firestore,
+        candidate.doc.id,
+        context.salonId,
+        context.customerUid,
+      );
+      const [
+        campaignUsage,
+        salonUsage,
+        customerUsage,
+        vault,
+        salonCreditWallet,
+      ] = await Promise.all([
+        refs.campaignUsageRef.get(),
+        refs.salonUsageRef.get(),
+        refs.customerUsageRef.get(),
+        vaultPromise,
+        salonCreditWalletPromise,
+      ]);
+      if (discountBudgetAllows(candidate.campaign, candidate.quote, {
+        campaign: campaignUsage.data(),
+        salon: salonUsage.data(),
+        customer: customerUsage.data(),
+        vault: vault.data(),
+        salonCreditWallet: salonCreditWallet.data(),
+      })) {
+        return {
+          ...candidate.quote,
+          campaignEndsAtMillis: adminMillis(candidate.campaign.endsAt),
+        };
+      }
+      return null;
+    }),
+  );
+  return evaluatedCandidates.filter(Boolean).slice(0, 10);
+}
+
+async function findVisibleCheckoutDiscountQuote(firestore, context, campaignId) {
+  const snapshot = await firestore.collection("discountCampaigns")
+    .doc(campaignId)
+    .get();
+  const campaign = snapshot.data();
+  if (!campaign ||
+      !discountCampaignSelectableAtCheckout(campaign, context)) {
+    return emptyDiscountQuote(context.originalAmount);
+  }
+  const quote = calculateDiscountQuote(
+    snapshot.id,
+    campaign,
+    context.originalAmount,
+    discountBaseAmount(campaign, context),
+  );
+  const refs = discountReferences(
+    firestore,
+    snapshot.id,
+    context.salonId,
+    context.customerUid,
+  );
+  const [
+    campaignUsage,
+    salonUsage,
+    customerUsage,
+    vault,
+    salonCreditWallet,
+  ] = await Promise.all([
+    refs.campaignUsageRef.get(),
+    refs.salonUsageRef.get(),
+    refs.customerUsageRef.get(),
+    refs.vaultRef.get(),
+    refs.salonPromotionWalletRef.get(),
+  ]);
+  if (!discountBudgetAllows(campaign, quote, {
+    campaign: campaignUsage.data(),
+    salon: salonUsage.data(),
+    customer: customerUsage.data(),
+    vault: vault.data(),
+    salonCreditWallet: salonCreditWallet.data(),
+  })) {
+    return emptyDiscountQuote(context.originalAmount);
+  }
+  return {
+    ...quote,
+    campaignEndsAtMillis: adminMillis(campaign.endsAt),
+  };
+}
+
+async function findVoucherDiscountQuote(firestore, context, codeHash) {
+  const campaignsSnapshot = await firestore.collection("discountCampaigns")
+    .where("voucherCodeHash", "==", codeHash)
+    .limit(2)
+    .get();
+  if (campaignsSnapshot.size !== 1) {
+    return emptyDiscountQuote(context.originalAmount);
+  }
+  const document = campaignsSnapshot.docs[0];
+  const campaign = document.data();
+  if (campaign.voucherOnly !== true ||
+      !discountCampaignEligible(campaign, context)) {
+    return emptyDiscountQuote(context.originalAmount);
+  }
+  const quote = calculateDiscountQuote(
+    document.id,
+    campaign,
+    context.originalAmount,
+    discountBaseAmount(campaign, context),
+  );
+  const refs = discountReferences(
+    firestore,
+    document.id,
+    context.salonId,
+    context.customerUid,
+  );
+  const [
+    campaignUsage,
+    salonUsage,
+    customerUsage,
+    vault,
+    salonCreditWallet,
+  ] = await Promise.all([
+    refs.campaignUsageRef.get(),
+    refs.salonUsageRef.get(),
+    refs.customerUsageRef.get(),
+    refs.vaultRef.get(),
+    refs.salonPromotionWalletRef.get(),
+  ]);
+  if (!discountBudgetAllows(campaign, quote, {
+    campaign: campaignUsage.data(),
+    salon: salonUsage.data(),
+    customer: customerUsage.data(),
+    vault: vault.data(),
+    salonCreditWallet: salonCreditWallet.data(),
+  })) {
+    return emptyDiscountQuote(context.originalAmount);
+  }
+  return {
+    ...quote,
+    campaignEndsAtMillis: adminMillis(campaign.endsAt),
+  };
+}
+
+function discountBookingFields(quote) {
+  return {
+    discountCampaignId: quote.campaignId,
+    discountCampaignName: quote.campaignName,
+    discountType: quote.discountType === "fixed" ? "fixed" : "percent",
+    discountPercent: quote.discountPercent,
+    fixedDiscountAmount: money(quote.fixedDiscountAmount),
+    discountFundingSource: quote.campaignId ?
+      discountFundingSource(quote) : "none",
+    discountSource: quote.voucherOnly === true ? "voucher" :
+      (quote.campaignId ? "automatic" : "none"),
+    voucherMaskedCode: String(quote.voucherMaskedCode ?? "").trim(),
+    discountBaseAmount: quote.discountBaseAmount,
+    discountAmount: quote.discountAmount,
+    customerPayableAmount: quote.customerPayableAmount,
+    pritzePayoutAmount: quote.pritzePayoutAmount,
+    salonTotalEarning: quote.salonTotalEarning,
+    discountStatus: quote.campaignId ? "reserved" : "none",
+  };
+}
+
+function usageReservationUpdate(quote, metadata) {
+  return {
+    ...metadata,
+    reservedDiscountAmount: admin.firestore.FieldValue.increment(
+      quote.discountAmount,
+    ),
+    reservedPayoutAmount: admin.firestore.FieldValue.increment(
+      quote.pritzePayoutAmount,
+    ),
+    reservedUses: admin.firestore.FieldValue.increment(1),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+function reserveDiscountInTransaction(
+  transaction,
+  refs,
+  quote,
+  {bookingId, salonId, customerUid, fundingState = null},
+) {
+  transaction.set(refs.campaignUsageRef, usageReservationUpdate(quote, {
+    campaignId: quote.campaignId,
+  }), {merge: true});
+  transaction.set(refs.salonUsageRef, usageReservationUpdate(quote, {
+    campaignId: quote.campaignId,
+    salonId,
+  }), {merge: true});
+  transaction.set(refs.customerUsageRef, usageReservationUpdate(quote, {
+    campaignId: quote.campaignId,
+    customerUid,
+  }), {merge: true});
+  transaction.set(refs.customerTotalRef, usageReservationUpdate(quote, {
+    customerUid,
+  }), {merge: true});
+  transaction.set(refs.salonTotalRef, usageReservationUpdate(quote, {
+    salonId,
+  }), {merge: true});
+  transaction.set(refs.platformTotalRef, usageReservationUpdate(quote, {
+    scope: "platform",
+  }), {merge: true});
+  transaction.set(refs.vaultRef, {
+    availableAmount: admin.firestore.FieldValue.increment(
+      -quote.pritzePayoutAmount,
+    ),
+    reservedAmount: admin.firestore.FieldValue.increment(
+      quote.pritzePayoutAmount,
+    ),
+    lastReservedBookingId: bookingId,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  if (discountFundingSource(quote) !== "salon_promotion_credits") return;
+  reserveSalonPromotionCreditInTransaction({
+    transaction,
+    refs,
+    quote,
+    bookingId,
+    salonId,
+    fundingState,
+  });
+}
+
+function resolveReservedDiscountInTransaction({
+  transaction,
+  firestore,
+  refs,
+  booking,
+  bookingId,
+  outcome,
+  fundingState = null,
+}) {
+  const discountAmount = money(booking.discountAmount);
+  const payoutAmount = money(booking.pritzePayoutAmount);
+  const isRedeemed = outcome === "redeemed";
+  const metricPrefix = isRedeemed ? "realized" : "released";
+  const resolution = {
+    reservedDiscountAmount: admin.firestore.FieldValue.increment(
+      -discountAmount,
+    ),
+    reservedPayoutAmount: admin.firestore.FieldValue.increment(-payoutAmount),
+    reservedUses: admin.firestore.FieldValue.increment(-1),
+    [`${metricPrefix}DiscountAmount`]: admin.firestore.FieldValue.increment(
+      discountAmount,
+    ),
+    [`${metricPrefix}PayoutAmount`]: admin.firestore.FieldValue.increment(
+      payoutAmount,
+    ),
+    [`${metricPrefix}Uses`]: admin.firestore.FieldValue.increment(1),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  transaction.set(refs.campaignUsageRef, resolution, {merge: true});
+  transaction.set(refs.salonUsageRef, resolution, {merge: true});
+  transaction.set(refs.customerUsageRef, resolution, {merge: true});
+  if (booking.discountGlobalTotalsTracked === true) {
+    transaction.set(refs.customerTotalRef, resolution, {merge: true});
+    transaction.set(refs.salonTotalRef, resolution, {merge: true});
+    transaction.set(refs.platformTotalRef, resolution, {merge: true});
+  }
+  transaction.set(refs.vaultRef, isRedeemed ? {
+    reservedAmount: admin.firestore.FieldValue.increment(-payoutAmount),
+    spentAmount: admin.firestore.FieldValue.increment(payoutAmount),
+    lastRedeemedBookingId: bookingId,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  } : {
+    reservedAmount: admin.firestore.FieldValue.increment(-payoutAmount),
+    availableAmount: admin.firestore.FieldValue.increment(payoutAmount),
+    lastReleasedBookingId: bookingId,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  if (isSalonPromotionCreditFundedDiscount(booking)) {
+    resolveSalonPromotionCreditInTransaction({
+      transaction,
+      firestore,
+      refs,
+      booking,
+      bookingId,
+      outcome,
+      fundingState,
+    });
+  }
+
+  if (!isRedeemed) return;
+  const salonId = String(booking.salonId ?? "").trim();
+  transaction.set(firestore.collection("salonWallets").doc(salonId), {
+    salonId,
+    payableBalance: admin.firestore.FieldValue.increment(payoutAmount),
+    lifetimePritzeEarnings: admin.firestore.FieldValue.increment(payoutAmount),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  transaction.set(firestore.collection("salonSettlements").doc(bookingId), {
+    bookingId,
+    salonId,
+    customerUid: booking.customerUid,
+    campaignId: booking.discountCampaignId,
+    originalAmount: money(booking.servicePrice),
+    discountAmount,
+    customerCounterAmount: money(booking.customerPayableAmount),
+    pritzePayoutAmount: payoutAmount,
+    salonTotalEarning: money(booking.salonTotalEarning),
+    status: "payable",
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: false});
+}
+
+function reserveSalonPromotionCreditInTransaction({
+  transaction,
+  refs,
+  quote,
+  bookingId,
+  salonId,
+  fundingState,
+}) {
+  const payoutAmount = money(quote.pritzePayoutAmount);
+  if (payoutAmount <= 0) return;
+  const wallet = fundingState?.salonCreditWallet || {};
+  const vault = fundingState?.vault || {};
+  const creditLimitProin = discountSalonPromotionCreditLimit(vault, wallet);
+  const availableBefore = signedMoney(wallet.availableProin);
+  const reservedBefore = money(wallet.reservedProin);
+  if (availableBefore + creditLimitProin < payoutAmount) {
+    throw new HttpsError(
+      "resource-exhausted",
+      "This salon has reached its promotional credit limit.",
+    );
+  }
+  const timestamp = admin.firestore.FieldValue.serverTimestamp();
+  const nowMillis = Date.now();
+  const targetLotBackedAmount = Math.min(
+    payoutAmount,
+    Math.max(0, availableBefore),
+  );
+  const lotAllocations = [];
+  let remainingLotBackedAmount = targetLotBackedAmount;
+  const lots = Array.isArray(fundingState?.salonCreditLots) ?
+    [...fundingState.salonCreditLots] : [];
+  for (const lot of lots.sort((left, right) =>
+    adminMillis(left.expiresAt) - adminMillis(right.expiresAt) ||
+    adminMillis(left.earnedAt) - adminMillis(right.earnedAt) ||
+    String(left.id || "").localeCompare(String(right.id || "")),
+  )) {
+    if (remainingLotBackedAmount <= 0) break;
+    const available = money(lot.availableProin);
+    if (!lot.ref || lot.status !== "active" || available <= 0 ||
+        adminMillis(lot.expiresAt) <= nowMillis) {
+      continue;
+    }
+    const amountProin = Math.min(remainingLotBackedAmount, available);
+    const availableAfter = available - amountProin;
+    const reservedAfter = money(lot.reservedProin) + amountProin;
+    lotAllocations.push({lotId: lot.id, amountProin});
+    remainingLotBackedAmount -= amountProin;
+    transaction.update(lot.ref, {
+      availableProin: availableAfter,
+      reservedProin: reservedAfter,
+      status: discountPromotionLotStatus({
+        availableProin: availableAfter,
+        reservedProin: reservedAfter,
+        redeemedProin: money(lot.redeemedProin),
+        expiredProin: money(lot.expiredProin),
+        revokedProin: money(lot.revokedProin),
+      }),
+      updatedAt: timestamp,
+    });
+  }
+  const lotBackedProin = lotAllocations.reduce(
+    (total, allocation) => total + allocation.amountProin,
+    0,
+  );
+  const creditLineProin = payoutAmount - lotBackedProin;
+  const availableAfter = availableBefore - payoutAmount;
+  const reservedAfter = reservedBefore + payoutAmount;
+  if (availableAfter < -creditLimitProin) {
+    throw new HttpsError(
+      "resource-exhausted",
+      "This salon has reached its promotional credit limit.",
+    );
+  }
+  transaction.set(refs.salonPromotionWalletRef, {
+    walletId: refs.salonPromotionWalletRef.id,
+    walletType: "salon_promotion_credits",
+    accountId: salonId,
+    availableProin: availableAfter,
+    reservedProin: reservedAfter,
+    lifetimeGrantedProin: money(wallet.lifetimeGrantedProin),
+    lifetimeRedeemedProin: money(wallet.lifetimeRedeemedProin),
+    lifetimeExpiredProin: money(wallet.lifetimeExpiredProin),
+    lifetimeRevokedProin: money(wallet.lifetimeRevokedProin),
+    creditLimitProin,
+    proinToInrRate: 1,
+    negativeBalanceAllowed: true,
+    createdAt: wallet.createdAt || timestamp,
+    updatedAt: timestamp,
+  }, {merge: true});
+  if (creditLineProin > 0) {
+    transaction.set(refs.salonPromotionUsageRef, {
+      walletId: refs.salonPromotionWalletRef.id,
+      walletType: "salon_promotion_credits",
+      salonId,
+      reservedProin: admin.firestore.FieldValue.increment(creditLineProin),
+      reservedUses: admin.firestore.FieldValue.increment(1),
+      creditLimitProin,
+      updatedAt: timestamp,
+    }, {merge: true});
+  }
+  transaction.create(refs.salonPromotionReservationRef.doc(bookingId), {
+    bookingId,
+    walletId: refs.salonPromotionWalletRef.id,
+    walletType: "salon_promotion_credits",
+    salonId,
+    campaignId: quote.campaignId,
+    status: "reserved",
+    amountProin: payoutAmount,
+    lotBackedProin,
+    creditLineProin,
+    lotAllocations,
+    availableProinBefore: availableBefore,
+    availableProinAfter: availableAfter,
+    reservedProinBefore: reservedBefore,
+    reservedProinAfter: reservedAfter,
+    creditLimitProin,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  transaction.create(
+    admin.firestore().collection("proinLedger")
+      .doc(`discount_salon_credit_reserve_${bookingId}`),
+    {
+      transactionId: `discount_salon_credit_reserve_${bookingId}`,
+      walletId: refs.salonPromotionWalletRef.id,
+      walletType: "salon_promotion_credits",
+      accountId: salonId,
+      type: "discount_reserve",
+      direction: "hold",
+      amountProin: payoutAmount,
+      creditLineProin,
+      lotBackedProin,
+      bookingId,
+      salonId,
+      campaignId: quote.campaignId,
+      lotAllocations,
+      createdByType: "system",
+      createdByUid: "",
+      balanceAfter: {
+        availableProin: availableAfter,
+        reservedProin: reservedAfter,
+        creditLimitProin,
+      },
+      createdAt: timestamp,
+    },
+  );
+}
+
+function resolveSalonPromotionCreditInTransaction({
+  transaction,
+  firestore,
+  refs,
+  booking,
+  bookingId,
+  outcome,
+  fundingState,
+}) {
+  const payoutAmount = money(booking.pritzePayoutAmount);
+  if (payoutAmount <= 0) return;
+  const isRedeemed = outcome === "redeemed";
+  const reservation = fundingState?.salonCreditReservation;
+  if (!reservation || reservation.status !== "reserved" ||
+      money(reservation.amountProin) !== payoutAmount) {
+    throw new HttpsError(
+      "data-loss",
+      "Salon promotional credit reservation is not balanced.",
+    );
+  }
+  const lotAllocations = Array.isArray(reservation.lotAllocations) ?
+    reservation.lotAllocations.map((allocation) => ({
+      lotId: String(allocation?.lotId || "").trim(),
+      amountProin: money(allocation?.amountProin),
+    })).filter((allocation) => allocation.lotId && allocation.amountProin > 0) :
+    [];
+  const lotBackedProin = lotAllocations.reduce(
+    (total, allocation) => total + allocation.amountProin,
+    0,
+  );
+  const creditLineProin = money(reservation.creditLineProin);
+  if (lotBackedProin + creditLineProin !== payoutAmount) {
+    throw new HttpsError(
+      "data-loss",
+      "Salon promotional credit allocation is not balanced.",
+    );
+  }
+  const lotsById = new Map((fundingState?.salonCreditLots || [])
+    .map((lot) => [String(lot.id || ""), lot]));
+  const timestamp = admin.firestore.FieldValue.serverTimestamp();
+  for (const allocation of lotAllocations) {
+    const lot = lotsById.get(allocation.lotId);
+    if (!lot?.ref || money(lot.reservedProin) < allocation.amountProin) {
+      throw new HttpsError(
+        "data-loss",
+        "A salon promotional credit lot is not balanced.",
+      );
+    }
+    const reservedAfter = money(lot.reservedProin) - allocation.amountProin;
+    const availableAfter = isRedeemed ?
+      money(lot.availableProin) :
+      money(lot.availableProin) + allocation.amountProin;
+    const redeemedAfter = money(lot.redeemedProin) +
+      (isRedeemed ? allocation.amountProin : 0);
+    transaction.update(lot.ref, {
+      availableProin: availableAfter,
+      reservedProin: reservedAfter,
+      redeemedProin: redeemedAfter,
+      status: discountPromotionLotStatus({
+        availableProin: availableAfter,
+        reservedProin: reservedAfter,
+        redeemedProin: redeemedAfter,
+        expiredProin: money(lot.expiredProin),
+        revokedProin: money(lot.revokedProin),
+      }),
+      updatedAt: timestamp,
+    });
+  }
+  const wallet = fundingState?.salonCreditWallet || {};
+  const creditLimitProin = discountSalonPromotionCreditLimit(
+    fundingState?.vault,
+    wallet,
+  );
+  const availableBefore = signedMoney(wallet.availableProin);
+  const reservedBefore = money(wallet.reservedProin);
+  if (reservedBefore < payoutAmount) {
+    throw new HttpsError(
+      "data-loss",
+      "Salon promotional credit reservation exceeds the wallet hold.",
+    );
+  }
+  const availableAfter = isRedeemed ?
+    availableBefore : availableBefore + payoutAmount;
+  const reservedAfter = reservedBefore - payoutAmount;
+  if (availableAfter < -creditLimitProin || reservedAfter < 0) {
+    throw new HttpsError(
+      "data-loss",
+      "Salon promotional credit resolution would exceed its limit.",
+    );
+  }
+  transaction.set(refs.salonPromotionWalletRef, {
+    walletId: refs.salonPromotionWalletRef.id,
+    walletType: "salon_promotion_credits",
+    accountId: String(booking.salonId || ""),
+    availableProin: availableAfter,
+    reservedProin: reservedAfter,
+    lifetimeGrantedProin: money(wallet.lifetimeGrantedProin),
+    lifetimeRedeemedProin:
+      money(wallet.lifetimeRedeemedProin) + (isRedeemed ? payoutAmount : 0),
+    lifetimeExpiredProin: money(wallet.lifetimeExpiredProin),
+    lifetimeRevokedProin: money(wallet.lifetimeRevokedProin),
+    creditLimitProin,
+    negativeBalanceAllowed: true,
+    updatedAt: timestamp,
+  }, {merge: true});
+  if (creditLineProin > 0) {
+    transaction.set(refs.salonPromotionUsageRef, {
+      walletId: refs.salonPromotionWalletRef.id,
+      walletType: "salon_promotion_credits",
+      salonId: String(booking.salonId || ""),
+      reservedProin: admin.firestore.FieldValue.increment(-creditLineProin),
+      reservedUses: admin.firestore.FieldValue.increment(-1),
+      [isRedeemed ? "redeemedProin" : "releasedProin"]:
+        admin.firestore.FieldValue.increment(creditLineProin),
+      [isRedeemed ? "redeemedUses" : "releasedUses"]:
+        admin.firestore.FieldValue.increment(1),
+      creditLimitProin,
+      updatedAt: timestamp,
+    }, {merge: true});
+  }
+  transaction.update(reservation.ref, {
+    status: isRedeemed ? "redeemed" : "released",
+    resolvedAt: timestamp,
+    availableProinAfter: availableAfter,
+    reservedProinAfter: reservedAfter,
+    updatedAt: timestamp,
+  });
+  transaction.create(
+    firestore.collection("proinLedger")
+      .doc(`discount_salon_credit_${isRedeemed ? "redeem" : "release"}_${bookingId}`),
+    {
+      transactionId:
+        `discount_salon_credit_${isRedeemed ? "redeem" : "release"}_${bookingId}`,
+      walletId: refs.salonPromotionWalletRef.id,
+      walletType: "salon_promotion_credits",
+      accountId: String(booking.salonId || ""),
+      type: isRedeemed ? "discount_redeem" : "discount_release",
+      direction: isRedeemed ? "debit" : "credit",
+      amountProin: payoutAmount,
+      creditLineProin,
+      lotBackedProin,
+      bookingId,
+      salonId: String(booking.salonId || ""),
+      campaignId: String(booking.discountCampaignId || ""),
+      lotAllocations,
+      createdByType: "system",
+      createdByUid: "",
+      balanceAfter: {
+        availableProin: availableAfter,
+        reservedProin: reservedAfter,
+        creditLimitProin,
+      },
+      createdAt: timestamp,
+    },
+  );
+}
+
+async function readDiscountResolutionFundingState({
+  transaction,
+  firestore,
+  refs,
+  booking,
+  bookingId,
+}) {
+  const vaultSnapshot = await transaction.get(refs.vaultRef);
+  const fundingState = {vault: vaultSnapshot.data()};
+  if (!isSalonPromotionCreditFundedDiscount(booking)) {
+    return fundingState;
+  }
+  const [walletSnapshot, reservationSnapshot] = await Promise.all([
+    transaction.get(refs.salonPromotionWalletRef),
+    transaction.get(refs.salonPromotionReservationRef.doc(bookingId)),
+  ]);
+  const reservation = reservationSnapshot.data();
+  const lotRefs = (Array.isArray(reservation?.lotAllocations) ?
+    reservation.lotAllocations : [])
+    .map((allocation) => String(allocation?.lotId || "").trim())
+    .filter(Boolean)
+    .map((lotId) => firestore.collection("proinLots").doc(lotId));
+  const lotSnapshots = await Promise.all(
+    lotRefs.map((lotRef) => transaction.get(lotRef)),
+  );
+  return {
+    ...fundingState,
+    salonCreditWallet: walletSnapshot.data(),
+    salonCreditReservation: reservationSnapshot.exists ?
+      {id: reservationSnapshot.id, ref: reservationSnapshot.ref, ...reservation} :
+      null,
+    salonCreditLots: lotSnapshots.map((snapshot) => ({
+      id: snapshot.id,
+      ref: snapshot.ref,
+      ...snapshot.data(),
+    })),
+  };
+}
+
+function isSalonPromotionCreditFundedDiscount(booking = {}) {
+  return String(booking.discountFundingSource || "").trim() ===
+    "salon_promotion_credits";
+}
+
+function discountSalonPromotionCreditLimit(vault = {}, wallet = {}) {
+  if (Object.prototype.hasOwnProperty.call(wallet || {}, "creditLimitProin")) {
+    return money(wallet?.creditLimitProin);
+  }
+  if (Object.prototype.hasOwnProperty.call(vault || {}, "salonCreditLimitAmount")) {
+    return money(vault?.salonCreditLimitAmount);
+  }
+  return DEFAULT_SALON_PROMOTION_CREDIT_LIMIT;
+}
+
+function discountPromotionLotStatus({
+  availableProin,
+  reservedProin,
+  redeemedProin,
+  expiredProin,
+  revokedProin,
+}) {
+  if (money(availableProin) > 0) return "active";
+  if (money(reservedProin) > 0) return "reserved";
+  if (money(expiredProin) > 0) return "expired";
+  if (money(revokedProin) > 0) return "revoked";
+  if (money(redeemedProin) > 0) return "redeemed";
+  return "spent";
+}
 
 function requireAuthenticatedUid(request) {
   const uid = String(request.auth?.uid ?? "").trim();
@@ -1689,12 +6827,745 @@ function requireAuthenticatedUid(request) {
   return uid;
 }
 
+function requireCustomerArrivalBooking(booking, uid) {
+  if (!booking) throw new HttpsError("not-found", "Booking not found.");
+  if (booking.customerUid !== uid) {
+    throw new HttpsError("permission-denied", "Not allowed.");
+  }
+  if (!["confirmed", "inProgress"].includes(booking.status)) {
+    throw new HttpsError(
+      "failed-precondition",
+      "Arrival updates are only available for active confirmed bookings.",
+    );
+  }
+}
+
+function customerLocationPayload(data) {
+  return {
+    latitude: Number(data?.latitude),
+    longitude: Number(data?.longitude),
+    accuracyMeters: Number(data?.accuracyMeters),
+    speedMetersPerSecond: Math.max(0, Number(data?.speedMetersPerSecond) || 0),
+    capturedAtMillis: Number(data?.capturedAtMillis),
+  };
+}
+
+function customerArrivalMetrics(location, salon) {
+  const salonCoordinates = coordinatesFromSalon(salon);
+  if (!salonCoordinates) {
+    return {distanceMeters: 0, estimatedArrivalMinutes: 0, hasSalonPin: false};
+  }
+  const distance = distanceMeters(location, salonCoordinates);
+  return {
+    distanceMeters: Math.round(distance || 0),
+    estimatedArrivalMinutes: estimatedArrivalMinutes(
+      distance,
+      location.speedMetersPerSecond,
+    ),
+    hasSalonPin: true,
+  };
+}
+
+function customerArrivalLocationDeletes() {
+  const remove = admin.firestore.FieldValue.delete();
+  return {
+    latestLatitude: remove,
+    latestLongitude: remove,
+    accuracyMeters: remove,
+    speedMetersPerSecond: remove,
+    lastLocationAt: remove,
+    distanceMeters: remove,
+    estimatedArrivalMinutes: remove,
+    hasSalonPin: remove,
+  };
+}
+
+function customerArrivalStatusLabel(status) {
+  return ({
+    notStarted: "Not started",
+    leavingNow: "Leaving now",
+    onTheWay: "On the way",
+    runningLate: "Running late",
+    arrived: "Arrived",
+  })[status] || "Arrival updated";
+}
+
+async function enforceReferralAttemptLimit(firestore, uid) {
+  const attemptRef = firestore.collection("referralAttempts").doc(uid);
+  const nowMillis = Date.now();
+  await firestore.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(attemptRef);
+    const data = snapshot.data() ?? {};
+    const windowStartMillis = data.windowStartedAt?.toMillis?.() ?? 0;
+    const insideWindow = nowMillis - windowStartMillis <
+      REFERRAL_ATTEMPT_WINDOW_MS;
+    const attemptCount = insideWindow ? money(data.attemptCount) : 0;
+    if (attemptCount >= REFERRAL_ATTEMPT_LIMIT) {
+      throw new HttpsError(
+        "resource-exhausted",
+        "Too many referral attempts. Try again later.",
+      );
+    }
+    transaction.set(attemptRef, {
+      attemptCount: attemptCount + 1,
+      windowStartedAt: insideWindow && data.windowStartedAt ?
+        data.windowStartedAt : admin.firestore.Timestamp.fromMillis(nowMillis),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+}
+
+async function enforceHourlyAttemptLimit({
+  firestore,
+  collection,
+  uid,
+  limit,
+  message,
+}) {
+  const attemptRef = firestore.collection(collection).doc(uid);
+  const nowMillis = Date.now();
+  await firestore.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(attemptRef);
+    const data = snapshot.data() ?? {};
+    const windowStartMillis = data.windowStartedAt?.toMillis?.() ?? 0;
+    const insideWindow = nowMillis - windowStartMillis <
+      REFERRAL_ATTEMPT_WINDOW_MS;
+    const attemptCount = insideWindow ? money(data.attemptCount) : 0;
+    if (attemptCount >= limit) {
+      throw new HttpsError("resource-exhausted", message);
+    }
+    transaction.set(attemptRef, {
+      attemptCount: attemptCount + 1,
+      windowStartedAt: insideWindow && data.windowStartedAt ?
+        data.windowStartedAt : admin.firestore.Timestamp.fromMillis(nowMillis),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+}
+
+async function enforceAdminPasswordAttemptLimit({
+  firestore,
+  request,
+  credentialId,
+}) {
+  const fingerprint = adminAuthenticationFingerprint(request);
+  const attemptId = crypto.createHash("sha256")
+    .update(`${credentialId}:${fingerprint.networkHash}`)
+    .digest("hex");
+  const attemptRef = firestore
+    .collection("adminPasswordAttemptBuckets")
+    .doc(attemptId);
+  const nowMillis = Date.now();
+  await firestore.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(attemptRef);
+    const data = snapshot.data() || {};
+    const windowStartedAtMillis = data.windowStartedAt?.toMillis?.() || 0;
+    const insideWindow = nowMillis - windowStartedAtMillis <
+      ADMIN_PASSWORD_ATTEMPT_WINDOW_MS;
+    const attemptCount = insideWindow ?
+      Math.max(0, Number(data.attemptCount) || 0) : 0;
+    if (attemptCount >= ADMIN_PASSWORD_ATTEMPT_LIMIT) {
+      throw new HttpsError(
+        "resource-exhausted",
+        "Too many attempts. Try again in 15 minutes.",
+      );
+    }
+    transaction.set(attemptRef, {
+      attemptCount: attemptCount + 1,
+      windowStartedAt: insideWindow && data.windowStartedAt ?
+        data.windowStartedAt :
+        admin.firestore.Timestamp.fromMillis(nowMillis),
+      expiresAt: admin.firestore.Timestamp.fromMillis(
+        nowMillis + ADMIN_PASSWORD_LOCKOUT_MS,
+      ),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+}
+
+function adminAuthenticationFingerprint(request) {
+  const forwarded = String(
+    request.rawRequest?.headers?.["x-forwarded-for"] || "",
+  ).split(",")[0].trim();
+  const network = String(request.rawRequest?.ip || forwarded || "unknown");
+  const userAgent = String(
+    request.rawRequest?.headers?.["user-agent"] || "unknown",
+  ).slice(0, 500);
+  return {
+    networkHash: crypto.createHash("sha256").update(network).digest("hex"),
+    userAgentHash: crypto
+      .createHash("sha256")
+      .update(userAgent)
+      .digest("hex"),
+  };
+}
+
+async function recordAdminAuthenticationEvent({
+  firestore,
+  request,
+  credentialId,
+  outcome,
+  authUid = "",
+}) {
+  const fingerprint = adminAuthenticationFingerprint(request);
+  try {
+    await firestore.collection("adminAuthenticationEvents").add({
+      credentialId,
+      outcome,
+      authUid,
+      networkHash: fingerprint.networkHash,
+      userAgentHash: fingerprint.userAgentHash,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (error) {
+    console.error("Administrator authentication audit failed", {
+      credentialId,
+      outcome,
+      error: error.message,
+    });
+  }
+}
+
+async function requirePlatformAdministrator(request) {
+  const uid = requireAuthenticatedUid(request);
+  const snapshot = await admin.firestore()
+    .collection("platformAdmins").doc(uid).get();
+  if (
+    request.auth?.token?.platformAdmin === true &&
+    snapshot.exists &&
+    snapshot.data()?.active !== false
+  ) {
+    return uid;
+  }
+  if (snapshot.exists && snapshot.data()?.active === false) {
+    throw new HttpsError(
+      "permission-denied",
+      "This account is not a Pritze platform administrator.",
+    );
+  }
+  const email = normalizeEmail(request.auth?.token?.email);
+  const emailHash = email ?
+    crypto.createHash("sha256").update(email).digest("hex") : "";
+  if (snapshot.data()?.active !== false && snapshot.exists) return uid;
+  if (request.auth?.token?.email_verified !== false &&
+      PLATFORM_ADMIN_EMAIL_HASHES.has(emailHash)) {
+    return uid;
+  }
+  throw new HttpsError(
+    "permission-denied",
+    "This account is not a Pritze platform administrator.",
+  );
+}
+
+async function runProinCallable(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof ProinValidationError) {
+      throw new HttpsError("invalid-argument", error.message);
+    }
+    throw error;
+  }
+}
+
+async function runDiscountAdminCallable(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof DiscountAdminValidationError) {
+      throw new HttpsError("invalid-argument", error.message);
+    }
+    throw error;
+  }
+}
+
+function discountCampaignAdminView(campaignId, data = {}) {
+  return {
+    campaignId,
+    name: adminString(data.name),
+    active: data.active === true,
+    priority: money(data.priority),
+    discountType: data.discountType === "fixed" ? "fixed" : "percent",
+    discountPercent: Number(data.discountPercent) || 0,
+    fixedDiscountAmount: money(data.fixedDiscountAmount),
+    voucherOnly: data.voucherOnly === true,
+    visibleAtCheckout: data.visibleAtCheckout === true,
+    fundingSource: discountFundingSource(data),
+    voucherCodeHash: adminString(data.voucherCodeHash),
+    voucherMaskedCode: adminString(data.voucherMaskedCode),
+    payoutMultiplier: Number(data.payoutMultiplier) || 2,
+    totalPayoutBudget: money(data.totalPayoutBudget),
+    maximumUsesPerCustomer: money(data.maximumUsesPerCustomer),
+    maximumDiscountAmount: money(data.maximumDiscountAmount),
+    minimumServiceAmount: money(data.minimumServiceAmount),
+    perSalonPayoutBudget: money(data.perSalonPayoutBudget),
+    perCustomerPayoutBudget: money(data.perCustomerPayoutBudget),
+    startsAtMillis: adminMillis(data.startsAt),
+    endsAtMillis: adminMillis(data.endsAt),
+    salonIds: adminStringList(data.salonIds, 200),
+    excludedSalonIds: adminStringList(data.excludedSalonIds, 200),
+    customerUids: adminStringList(data.customerUids, 500),
+    serviceIds: adminStringList(data.serviceIds, 200),
+    eligibleBookingNumbers: Array.isArray(data.eligibleBookingNumbers) ?
+      data.eligibleBookingNumbers.map(Number).filter(Number.isSafeInteger) : [],
+    minimumBookingNumber: Math.max(1, money(data.minimumBookingNumber) || 1),
+    maximumBookingNumber: money(data.maximumBookingNumber),
+    newToSalonOnly: data.newToSalonOnly === true,
+    returningToSalonOnly: data.returningToSalonOnly === true,
+    termsVersion: adminString(data.termsVersion),
+    version: money(data.version),
+  };
+}
+
+function discountUsageAdminView(data = {}) {
+  return {
+    reservedPayoutAmount: money(data?.reservedPayoutAmount),
+    realizedPayoutAmount: money(data?.realizedPayoutAmount),
+    releasedPayoutAmount: money(data?.releasedPayoutAmount),
+    reservedDiscountAmount: money(data?.reservedDiscountAmount),
+    realizedDiscountAmount: money(data?.realizedDiscountAmount),
+    releasedDiscountAmount: money(data?.releasedDiscountAmount),
+    reservedUses: money(data?.reservedUses),
+    realizedUses: money(data?.realizedUses),
+    releasedUses: money(data?.releasedUses),
+  };
+}
+
+function discountTotalsAdminView(data = {}) {
+  return {
+    reservedPayoutAmount: money(data?.reservedPayoutAmount),
+    realizedPayoutAmount: money(data?.realizedPayoutAmount),
+    releasedPayoutAmount: money(data?.releasedPayoutAmount),
+    reservedDiscountAmount: money(data?.reservedDiscountAmount),
+    realizedDiscountAmount: money(data?.realizedDiscountAmount),
+    releasedDiscountAmount: money(data?.releasedDiscountAmount),
+    reservedUses: money(data?.reservedUses),
+    realizedUses: money(data?.realizedUses),
+    releasedUses: money(data?.releasedUses),
+  };
+}
+
+function discountVaultAdminView(data = {}) {
+  const availableAmount = money(data?.availableAmount);
+  const reservedAmount = money(data?.reservedAmount);
+  const spentAmount = money(data?.spentAmount);
+  const salonCreditLimitAmount = data &&
+    Object.prototype.hasOwnProperty.call(data, "salonCreditLimitAmount") ?
+    money(data?.salonCreditLimitAmount) :
+    DEFAULT_SALON_PROMOTION_CREDIT_LIMIT;
+  return {
+    approvedAmount: money(data?.approvedAmount) ||
+      availableAmount + reservedAmount + spentAmount,
+    availableAmount,
+    reservedAmount,
+    spentAmount,
+    salonCreditLimitAmount,
+    budgetVersion: money(data?.budgetVersion),
+  };
+}
+
+function adminMillis(value) {
+  if (value && typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : 0;
+}
+
+function adminString(value) {
+  return String(value ?? "").trim();
+}
+
+function adminStringList(value, limit = 12) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(adminString)
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function adminHttpsUrl(value) {
+  const url = adminString(value);
+  if (!url) return "";
+  if (url.length > 2048 || !/^https:\/\//i.test(url)) return null;
+  try {
+    return new URL(url).toString();
+  } catch (_) {
+    return null;
+  }
+}
+
+function adminSalonTime(value) {
+  const time = adminString(value).toUpperCase().replace(/\./g, "");
+  const match = /^(\d{1,2})(?::(\d{2}))?\s*([AP]M)?$/.exec(time);
+  if (!match) return "";
+  let hours = Number(match[1]);
+  const minutes = Number(match[2] || 0);
+  const period = match[3] || "";
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes) || minutes > 59) {
+    return "";
+  }
+  if (period) {
+    if (hours < 1 || hours > 12) return "";
+    if (period === "AM") hours = hours === 12 ? 0 : hours;
+    if (period === "PM" && hours !== 12) hours += 12;
+  } else if (hours > 23) {
+    return "";
+  }
+  const suffix = hours >= 12 ? "PM" : "AM";
+  const displayHours = hours % 12 || 12;
+  return `${displayHours}:${String(minutes).padStart(2, "0")} ${suffix}`;
+}
+
+function adminSalonMinutes(value) {
+  const time = adminSalonTime(value);
+  const match = /^(\d{1,2}):(\d{2})\s([AP]M)$/.exec(time);
+  if (!match) return -1;
+  let hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (match[3] === "AM") hours = hours === 12 ? 0 : hours;
+  if (match[3] === "PM" && hours !== 12) hours += 12;
+  return hours * 60 + minutes;
+}
+
+function adminCustomerProfileView(customerUid, data = {}) {
+  return {
+    id: customerUid,
+    name: adminString(data.name) || "Customer",
+    phone: adminString(data.phone || data.contact),
+    email: adminString(data.email),
+    gender: adminString(data.gender),
+    birthDate: adminString(data.birthDate),
+    preferredStyles: adminStringList(data.preferredStyles),
+    photoUrl: adminString(data.photoUrl),
+    stylePhotoUrls: adminStringList(data.stylePhotoUrls, 8),
+    provider: adminString(data.provider),
+    adminSuspended: data.adminSuspended === true,
+    referralOnboardingCompleted: data.referralOnboardingCompleted === true,
+    registeredAtMillis: adminMillis(data.registeredAt),
+    updatedAtMillis: adminMillis(data.updatedAt),
+  };
+}
+
+function adminSalonProfileView(salonId, data = {}) {
+  return {
+    id: salonId,
+    name: adminString(data.name) || "Salon",
+    ownerUid: adminString(data.ownerUid),
+    ownerName: adminString(data.ownerName),
+    address: adminString(data.address),
+    directionsUrl: adminString(data.directionsUrl),
+    phone: adminString(data.phone),
+    email: adminString(data.email),
+    logoUrl: adminString(data.logoUrl),
+    photoUrls: adminStringList(data.photoUrls, 8),
+    distanceLabel: adminString(data.distanceLabel) || "Nearby",
+    openTime: adminString(data.openTime),
+    closeTime: adminString(data.closeTime),
+    isOpen: data.isOpen === true,
+    instantBookingsEnabled: data.instantBookingsEnabled !== false,
+    instantBookingsPausedDate: adminString(data.instantBookingsPausedDate),
+    adminSuspended: data.adminSuspended === true,
+    proinReferralApproved: data.proinReferralApproved === true,
+    updatedAtMillis: adminMillis(data.updatedAt),
+  };
+}
+
+function adminAuditRecord({
+  adminUid,
+  action,
+  targetType,
+  targetId,
+  reason,
+  before,
+  after,
+}) {
+  return {
+    adminUid,
+    action,
+    targetType,
+    targetId,
+    reason,
+    before,
+    after,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+function referralCodeUserField(inviterRole, targetRole) {
+  if (inviterRole === "customer" && targetRole === "customer") {
+    return "customerReferralCode";
+  }
+  if (inviterRole === "owner" && targetRole === "customer") {
+    return "ownerCustomerReferralCode";
+  }
+  if (inviterRole === "owner" && targetRole === "owner") {
+    return "ownerSalonReferralCode";
+  }
+  return "";
+}
+
+function referralCodeAdminView(code, data = {}) {
+  return {
+    code: adminString(data.code) || code,
+    ownerUid: adminString(data.ownerUid),
+    inviterRole: adminString(data.inviterRole),
+    targetRole: adminString(data.targetRole),
+    active: data.active === true,
+    replacedByCode: adminString(data.replacedByCode),
+    replacedFromCode: adminString(data.replacedFromCode),
+    createdAtMillis: adminMillis(data.createdAt),
+    updatedAtMillis: adminMillis(data.updatedAt),
+  };
+}
+
+function isPlatformAdminEmail(email) {
+  if (!email) return false;
+  const emailHash = crypto.createHash("sha256").update(email).digest("hex");
+  return PLATFORM_ADMIN_EMAIL_HASHES.has(emailHash);
+}
+
+function adminBookingRecord(document) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    customerUid: adminString(data.customerUid),
+    salonId: adminString(data.salonId),
+    barberId: adminString(data.barberId),
+    customerName: adminString(data.customerName) || "Customer",
+    customerPhone: adminString(data.customerPhone),
+    serviceName: adminString(data.serviceName) || "Service",
+    servicePrice: Math.max(0, Number(data.servicePrice) || 0),
+    durationMinutes: positiveInteger(data.durationMinutes, 30),
+    status: adminString(data.status) || "pending",
+    isInstant: data.isInstant === true,
+    startMillis: adminMillis(data.start),
+    createdAtMillis: adminMillis(data.createdAt),
+    acceptedAtMillis: adminMillis(data.acceptedAt),
+    startedAtMillis: adminMillis(data.startedAt),
+    completedAtMillis: adminMillis(data.completedAt),
+    cancelledAtMillis: adminMillis(data.cancelledAt),
+    rejectedAtMillis: adminMillis(data.rejectedAt),
+    arrivalMinutes: Math.max(0, Number(data.arrivalMinutes) || 0),
+    cancellationReason: adminString(data.cancellationReason),
+    cancelledBy: adminString(data.cancelledBy),
+    arrivalStatus: validArrivalStatus(data.arrivalStatus) ?
+      data.arrivalStatus : "notStarted",
+    arrivalStatusUpdatedAtMillis: adminMillis(data.arrivalStatusUpdatedAt),
+    arrivalSharingActive: data.arrivalSharingActive === true,
+    arrivalSharingExpiresAtMillis: adminMillis(data.arrivalSharingExpiresAt),
+  };
+}
+
+function adminArrivalSessionRecord(document) {
+  const data = document.data() || {};
+  const latitude = Number(data.latestLatitude);
+  const longitude = Number(data.latestLongitude);
+  const hasLocation = validCoordinates(latitude, longitude);
+  const lastLocationAtMillis = adminMillis(data.lastLocationAt);
+  const expiresAtMillis = adminMillis(data.expiresAt);
+  return {
+    bookingId: adminString(data.bookingId) || document.id,
+    salonId: adminString(data.salonId),
+    sharingActive: data.sharingActive === true && expiresAtMillis > Date.now(),
+    latitude: hasLocation ? latitude : 0,
+    longitude: hasLocation ? longitude : 0,
+    hasLocation,
+    accuracyMeters: Math.max(0, Number(data.accuracyMeters) || 0),
+    distanceMeters: Math.max(0, Number(data.distanceMeters) || 0),
+    estimatedArrivalMinutes:
+      Math.max(0, Number(data.estimatedArrivalMinutes) || 0),
+    hasSalonPin: data.hasSalonPin === true,
+    lastLocationAtMillis,
+    expiresAtMillis,
+  };
+}
+
+function adminSalonRecord(document) {
+  const data = document.data() || {};
+  return {
+    ...adminSalonProfileView(document.id, data),
+    rating: Math.max(0, Number(data.rating) || 0),
+    reviewCount: Math.max(0, Number(data.reviewCount) || 0),
+    serviceCount: Array.isArray(data.services) ? data.services.length : 0,
+    services: (Array.isArray(data.services) ? data.services : [])
+      .slice(0, 100)
+      .map((service) => ({
+        id: adminString(service?.id),
+        name: adminString(service?.name) || "Service",
+        category: adminString(service?.category),
+        price: Math.max(0, Number(service?.price) || 0),
+        durationMinutes: positiveInteger(service?.durationMinutes, 30),
+        isAvailable: service?.isAvailable !== false,
+        instantBookingEnabled: service?.instantBookingEnabled !== false,
+      })),
+  };
+}
+
+function adminBarberRecord(document) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    uid: adminString(data.uid),
+    salonId: adminString(data.salonId),
+    name: adminString(data.name) || "Barber",
+    phone: adminString(data.phone),
+    email: adminString(data.email),
+    speciality: adminString(data.speciality),
+    experienceYears: Math.max(0, Number(data.experienceYears) || 0),
+    resumeSummary: adminString(data.resumeSummary).slice(0, 1000),
+    serviceIds: adminStringList(data.serviceIds, 100),
+    serviceCount: Array.isArray(data.serviceIds) ? data.serviceIds.length : 0,
+    isActive: data.isActive !== false,
+  };
+}
+
+function adminCustomerRecord(document) {
+  const data = document.data() || {};
+  return {
+    ...adminCustomerProfileView(document.id, data),
+    salonRating: Math.max(0, Number(data.salonRating) || 0),
+    salonRatingCount: Math.max(0, Number(data.salonRatingCount) || 0),
+  };
+}
+
+function adminReviewRecord(document, direction) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    bookingId: adminString(data.bookingId) || document.id,
+    customerUid: adminString(data.customerUid),
+    salonId: adminString(data.salonId),
+    salonName: adminString(data.salonName) || "Salon",
+    rating: Math.max(0, Math.min(5, Number(data.rating) || 0)),
+    note: adminString(data.note).slice(0, 500),
+    createdAtMillis: adminMillis(data.updatedAt || data.createdAt),
+    direction,
+  };
+}
+
+function adminJoinRequestRecord(document) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    salonId: adminString(data.salonId),
+    barberName: adminString(data.barberName) || "Barber",
+    barberPhone: adminString(data.barberPhone),
+    barberEmail: adminString(data.barberEmail),
+    speciality: adminString(data.speciality),
+    experienceYears: Math.max(0, Number(data.experienceYears) || 0),
+    status: adminString(data.status) || "pending",
+    requestedAtMillis: adminMillis(data.requestedAt),
+  };
+}
+
+function adminSettlementRecord(document) {
+  const data = document.data() || {};
+  return {
+    bookingId: adminString(data.bookingId) || document.id,
+    salonId: adminString(data.salonId),
+    customerUid: adminString(data.customerUid),
+    campaignId: adminString(data.campaignId),
+    originalAmount: money(data.originalAmount),
+    discountAmount: money(data.discountAmount),
+    customerCounterAmount: money(data.customerCounterAmount),
+    pritzePayoutAmount: money(data.pritzePayoutAmount),
+    salonTotalEarning: money(data.salonTotalEarning),
+    status: adminString(data.status) || "payable",
+    paymentReference: adminString(data.paymentReference),
+    createdAtMillis: adminMillis(data.createdAt),
+    paidAtMillis: adminMillis(data.paidAt),
+  };
+}
+
+function adminWalletRecord(document) {
+  const data = document.data() || {};
+  return {
+    salonId: adminString(data.salonId) || document.id,
+    payableBalance: money(data.payableBalance),
+    paidAmount: money(data.paidAmount),
+    lifetimePritzeEarnings: money(data.lifetimePritzeEarnings),
+  };
+}
+
+function adminNoteRecord(document) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    targetType: adminString(data.targetType),
+    targetId: adminString(data.targetId),
+    note: adminString(data.note).slice(0, 1000),
+    adminUid: adminString(data.adminUid),
+    createdAtMillis: adminMillis(data.createdAt),
+  };
+}
+
+function adminAuditLogRecord(document) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    action: adminString(data.action),
+    targetType: adminString(data.targetType),
+    targetId: adminString(data.targetId),
+    reason: adminString(data.reason).slice(0, 500),
+    adminUid: adminString(data.adminUid),
+    before: data.before && typeof data.before === "object" ? data.before : {},
+    after: data.after && typeof data.after === "object" ? data.after : {},
+    createdAtMillis: adminMillis(data.createdAt),
+  };
+}
+
+function adminAutomationRuleRecords(snapshot) {
+  const stored = Object.fromEntries(snapshot.docs.map((document) =>
+    [document.id, document.data()]));
+  const rules = normalizedRules(stored);
+  return Object.entries(rules).map(([id, rule]) => ({
+    id,
+    enabled: rule.enabled,
+    threshold: rule.threshold,
+    updatedAtMillis: adminMillis(stored[id]?.updatedAt),
+  }));
+}
+
+function adminOperationalAlertRecord(document) {
+  const data = document.data() || {};
+  return {
+    id: document.id,
+    type: adminString(data.type),
+    severity: adminString(data.severity) || "info",
+    status: adminString(data.status) || "active",
+    targetType: adminString(data.targetType),
+    targetId: adminString(data.targetId),
+    salonId: adminString(data.salonId),
+    title: adminString(data.title).slice(0, 200),
+    detail: adminString(data.detail).slice(0, 500),
+    recommendedAction: adminString(data.recommendedAction).slice(0, 500),
+    detectedAtMillis: adminMillis(data.detectedAt),
+    acknowledgedAtMillis: adminMillis(data.acknowledgedAt),
+    occurrenceCount: Math.max(0, Number(data.occurrenceCount) || 0),
+  };
+}
+
 function requiredId(value, label) {
   const id = String(value ?? "").trim();
   if (!id) {
     throw new HttpsError("invalid-argument", `Missing ${label}.`);
   }
   return id;
+}
+
+function requiredAdminReason(value) {
+  const reason = String(value ?? "").trim().slice(0, 500);
+  if (reason.length < 5) {
+    throw new HttpsError(
+      "invalid-argument",
+      "Enter a reason of at least 5 characters.",
+    );
+  }
+  return reason;
 }
 
 function requireStoredRole(user, expectedRole) {
@@ -1822,7 +7693,7 @@ async function assertNoBlockingMarker(transaction, markerSnapshots, nowMillis) {
     if (isBlockingBooking(snapshot.data(), nowMillis)) {
       throw new HttpsError(
         "already-exists",
-        "Cancel or complete your current booking before making another.",
+        "You already have an active booking.",
       );
     }
   }
@@ -1909,14 +7780,21 @@ function bookingStatusMessage(booking) {
     case "inProgress":
       return {
         title: "Service started",
-        body: `${service} for ${booking.customerName || "the customer"} is now in progress.`,
+        body: `${service} is now in progress. The final payable amount will appear after the salon ends the service.`,
       };
     case "completed":
       return {
-        title: "Service completed",
-        body: `${service} for ${booking.customerName || "the customer"} is completed.`,
+        title: booking.completionSource === "automatic_timeout" ?
+          "Service completed automatically" : "Service completed",
+        body: `${service} is completed. Final payable amount: ₹${money(booking.customerPayableAmount)}. Pay at the salon counter.`,
       };
     case "cancelled":
+      if (booking.cancelledBy === "system") {
+        return {
+            title: "Oops, looks like the salon is busy",
+            body: "Please try again or see other nearby salons.",
+        };
+      }
       if (booking.cancelledBy === "customer") {
         return {
           title: "Customer cancelled booking",
@@ -2080,6 +7958,111 @@ async function claimOwnerBookingAlert(bookingRef, eventId) {
     });
     return true;
   });
+}
+
+async function expirePendingInstantBooking(bookingRef, bookingId) {
+  let expiredBooking = null;
+  let proinWalletToRefresh = "";
+  const firestore = admin.firestore();
+  await firestore.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(bookingRef);
+    const booking = snapshot.data();
+    if (
+      !booking ||
+      booking.isInstant !== true ||
+      booking.status !== "pending"
+    ) {
+      return;
+    }
+    const customerUid = String(booking.customerUid ?? "").trim();
+    const activeCustomerRef = customerUid ? admin.firestore()
+      .collection("activeCustomerBookings").doc(customerUid) : null;
+    const activeInstantRef = customerUid ? admin.firestore()
+      .collection("activeInstantBookings").doc(customerUid) : null;
+    const activeCustomer = activeCustomerRef ?
+      await transaction.get(activeCustomerRef) : null;
+    const activeInstant = activeInstantRef ?
+      await transaction.get(activeInstantRef) : null;
+    let discountResolution = null;
+    if (booking.discountStatus === "reserved" &&
+        String(booking.discountCampaignId ?? "").trim()) {
+      const refs = discountReferences(
+        firestore,
+        booking.discountCampaignId,
+        booking.salonId,
+        booking.customerUid,
+      );
+      await transaction.get(refs.campaignUsageRef);
+      await transaction.get(refs.salonUsageRef);
+      await transaction.get(refs.customerUsageRef);
+      const fundingState = await readDiscountResolutionFundingState({
+        transaction,
+        firestore,
+        refs,
+        booking,
+        bookingId,
+      });
+      discountResolution = {refs, fundingState};
+    }
+    let proinResolutionFields = null;
+    if (booking.proinStatus === "reserved") {
+      const resolution = await runProinCallable(() =>
+        proinBackend.resolveBookingRedemptionInTransaction({
+          transaction,
+          bookingId,
+          booking,
+          outcome: "released",
+          nowMillis: Date.now(),
+        }));
+      if (resolution) {
+        const {walletId, ...bookingFields} = resolution;
+        proinWalletToRefresh = walletId;
+        proinResolutionFields = bookingFields;
+      }
+    }
+    const update = {
+      status: "cancelled",
+      cancelledBy: "system",
+      cancellationReason: "No response from salon within 150 seconds",
+      cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      responseTimedOutAt: admin.firestore.FieldValue.serverTimestamp(),
+      discountStatus: discountResolution ? "released" :
+        (booking.discountStatus || "none"),
+      ...(proinResolutionFields || {}),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    transaction.update(bookingRef, update);
+    if (discountResolution) {
+      resolveReservedDiscountInTransaction({
+        transaction,
+        firestore,
+        refs: discountResolution.refs,
+        booking,
+        bookingId,
+        outcome: "released",
+        fundingState: discountResolution.fundingState,
+      });
+    }
+    if (activeCustomerRef && activeCustomer?.data()?.bookingId === bookingId) {
+      transaction.set(activeCustomerRef, {
+        active: false,
+        resolvedStatus: "cancelled",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+    if (activeInstantRef && activeInstant?.data()?.bookingId === bookingId) {
+      transaction.set(activeInstantRef, {
+        active: false,
+        resolvedStatus: "cancelled",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+    }
+    expiredBooking = {...booking, ...update};
+  });
+  if (proinWalletToRefresh) {
+    await proinBackend.refreshWalletExpiry(proinWalletToRefresh);
+  }
+  return expiredBooking;
 }
 
 async function sendOwnerBookingRequest(bookingId, booking, attempt) {

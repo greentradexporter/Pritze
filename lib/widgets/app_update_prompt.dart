@@ -222,26 +222,23 @@ class _AppUpdatePromptState extends State<AppUpdatePrompt> {
     _updateDialogShown = true;
     return showDialog<void>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        icon: const Icon(Icons.system_update_alt_rounded),
-        title: const Text('Update available'),
-        content: const Text(
-          'There is an update available for Pritze. Update the app to get the latest features and fixes.',
+      barrierDismissible: false,
+      builder: (dialogContext) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          icon: const Icon(Icons.system_update_alt_rounded),
+          title: const Text('Update available'),
+          content: const Text(
+            'A new version of Pritze is available. Update now to continue with the latest features and fixes.',
+          ),
+          actions: [
+            FilledButton.icon(
+              onPressed: () => _openStore(storeUrl, isIOS: isIOS),
+              icon: const Icon(Icons.open_in_new_rounded),
+              label: const Text('Update now'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('Later'),
-          ),
-          FilledButton.icon(
-            onPressed: () async {
-              Navigator.pop(dialogContext);
-              await _openStore(storeUrl, isIOS: isIOS);
-            },
-            icon: const Icon(Icons.open_in_new_rounded),
-            label: const Text('Update'),
-          ),
-        ],
       ),
     );
   }

@@ -7,6 +7,8 @@ const TERMINAL_BOOKING_STATUSES = new Set([
 const INSTANT_ARRIVAL_MINUTES = new Set([15, 20, 25]);
 const RESCHEDULE_CUTOFF_MS = 2 * 60 * 60 * 1000;
 const SALON_ARRIVAL_GRACE_MS = 5 * 60 * 1000;
+const INSTANT_RESPONSE_TIMEOUT_MS = 150 * 1000;
+const SERVICE_AUTO_COMPLETE_GRACE_MS = 5 * 60 * 1000;
 
 function asMillis(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -26,6 +28,25 @@ function bookingEndMillis(booking) {
   const duration = Number(booking?.durationMinutes) > 0 ?
     Number(booking.durationMinutes) : 30;
   return startMillis + duration * 60 * 1000;
+}
+
+function serviceAutoCompleteAtMillis(booking) {
+  const startedAtMillis = asMillis(booking?.startedAt);
+  if (!Number.isFinite(startedAtMillis)) {
+    return NaN;
+  }
+  const duration = Number(booking?.durationMinutes) > 0 ?
+    Number(booking.durationMinutes) : 30;
+  return startedAtMillis +
+    duration * 60 * 1000 + SERVICE_AUTO_COMPLETE_GRACE_MS;
+}
+
+function shouldAutoCompleteService(booking, nowMillis = Date.now()) {
+  if (!booking || booking.status !== "inProgress") {
+    return false;
+  }
+  const deadline = serviceAutoCompleteAtMillis(booking);
+  return Number.isFinite(deadline) && nowMillis >= deadline;
 }
 
 function isBlockingBooking(booking, nowMillis = Date.now()) {
@@ -104,7 +125,7 @@ function bookingTransitionError({
     return mayCancel ? null : "Customers can only cancel an active booking.";
   }
 
-  if (actorRole !== "owner") {
+  if (actorRole !== "owner" && actorRole !== "admin") {
     return "Only the customer or salon owner can update this booking.";
   }
 
@@ -219,8 +240,10 @@ function slotSegmentMillis(startMillis, durationMinutes) {
 
 module.exports = {
   INSTANT_ARRIVAL_MINUTES,
+  INSTANT_RESPONSE_TIMEOUT_MS,
   RESCHEDULE_CUTOFF_MS,
   SALON_ARRIVAL_GRACE_MS,
+  SERVICE_AUTO_COMPLETE_GRACE_MS,
   TERMINAL_BOOKING_STATUSES,
   asMillis,
   bookingArrivalReminderDue,
@@ -230,6 +253,8 @@ module.exports = {
   isBlockingBooking,
   isWithinSalonHours,
   parseClockMinutes,
+  serviceAutoCompleteAtMillis,
+  shouldAutoCompleteService,
   slotSegmentMillis,
   zonedDateParts,
 };

@@ -48,6 +48,14 @@ class FirebaseBootstrap {
       }
     }
 
+    if (kDebugMode && defaultTargetPlatform == TargetPlatform.android) {
+      try {
+        await FirebaseAuth.instance.setSettings(forceRecaptchaFlow: true);
+      } catch (error) {
+        debugPrint('Firebase Auth debug reCAPTCHA fallback failed: $error');
+      }
+    }
+
     return FirebaseBootstrap._(
       enabled: true,
       firestore: FirebaseFirestore.instance,

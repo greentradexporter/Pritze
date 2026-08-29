@@ -2,18 +2,23 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:nashik_salon_booking/main.dart';
 import 'package:nashik_salon_booking/models/app_models.dart';
 import 'package:nashik_salon_booking/models/service_catalog.dart';
 import 'package:nashik_salon_booking/screens/barber/barber_dashboard_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/customer_home_screen.dart';
+import 'package:nashik_salon_booking/screens/customer/customer_completion_receipt_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/customer_profile_editor.dart';
 import 'package:nashik_salon_booking/screens/customer/customer_profile_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/my_bookings_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/salon_booking_screen.dart';
 import 'package:nashik_salon_booking/screens/customer/salon_detail_screen.dart';
+import 'package:nashik_salon_booking/screens/referrals/referral_onboarding_screen.dart';
+import 'package:nashik_salon_booking/screens/referrals/referral_screen.dart';
 import 'package:nashik_salon_booking/screens/partner/partner_hub_screen.dart';
 import 'package:nashik_salon_booking/screens/salon/salon_dashboard_screen.dart';
 import 'package:nashik_salon_booking/screens/salon/salon_profile_setup_screen.dart';
@@ -21,10 +26,12 @@ import 'package:nashik_salon_booking/services/android_phone_hint.dart';
 import 'package:nashik_salon_booking/state/app_state.dart';
 import 'package:nashik_salon_booking/state/app_state_scope.dart';
 import 'package:nashik_salon_booking/widgets/account_actions.dart';
+import 'package:nashik_salon_booking/widgets/app_error_dialog.dart';
 import 'package:nashik_salon_booking/widgets/auth_login_panel.dart';
 import 'package:nashik_salon_booking/widgets/booking_status_timeline.dart';
 import 'package:nashik_salon_booking/widgets/customer_booking_confirmation_gate.dart';
 import 'package:nashik_salon_booking/widgets/app_update_prompt.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -36,11 +43,731 @@ void main() {
     expect(AppState().supportPhone, '+91 89996 08278');
   });
 
+  test('service catalogue contains only the approved thirty services', () {
+    expect(serviceCatalog.map((service) => service.name).toList(), [
+      'Haircut Men',
+      'Haircut Women',
+      'Hair Wash Men',
+      'Hair wash Women',
+      'Haircut + Hair Wash',
+      'Blow Dry / Hair Styling',
+      'Hair Spa',
+      'Hair Colour',
+      'Root Touch-up',
+      'Keratin / Smoothening',
+      'Head Massage',
+      'Facial',
+      'Face Cleanup',
+      'D-Tan',
+      'Bleach',
+      'Beard Trim',
+      'Shave',
+      'Beard Styling',
+      'Haircut + Beard',
+      'Beard Colour',
+      'Eyebrow Threading',
+      'Upper Lip Threading',
+      'Full Face Threading',
+      'Full Arms Waxing',
+      'Full Legs Waxing',
+      'Underarms Waxing',
+      'Full Body Waxing',
+      'Manicure',
+      'Pedicure',
+      'Party / Bridal Makeup.',
+    ]);
+    expect(serviceCatalog, hasLength(30));
+  });
+
+  test(
+    'listed salons use the exact canonical menu and preserve matched data',
+    () {
+      final services = canonicalSalonServices(const [
+        SalonService(
+          id: 'approved',
+          name: 'Haircut Men',
+          category: 'Hair',
+          price: 400,
+          durationMinutes: 30,
+        ),
+        SalonService(
+          id: 'retired',
+          name: 'Kids Haircut',
+          category: 'Hair',
+          price: 300,
+          durationMinutes: 30,
+        ),
+        SalonService(
+          id: 'custom',
+          name: 'Royal Signature Cut',
+          category: 'Hair',
+          price: 800,
+          durationMinutes: 45,
+          isCustom: true,
+        ),
+      ]);
+
+      expect(services, hasLength(30));
+      expect(
+        services.map((service) => service.name),
+        serviceCatalog.map((service) => service.name),
+      );
+      expect(services.first.id, 'approved');
+      expect(services.first.price, 400);
+      expect(
+        services.any((service) => service.name == 'Royal Signature Cut'),
+        isFalse,
+      );
+      expect(services.every((service) => !service.isCustom), isTrue);
+      expect(inferServiceIsCustom('Kids Haircut', null), isFalse);
+      expect(inferServiceIsCustom('Royal Signature Cut', null), isTrue);
+    },
+  );
+
+  test('authentication errors never expose backend terminology', () {
+    final conflict = friendlyAuthenticationError(
+      StateError('This number is already registered as a salon owner.'),
+    );
+    final unknown = friendlyAuthenticationError(
+      Exception('[firebase_auth/internal-error] Internal failure'),
+    );
+    final phoneBlocked = friendlyAuthenticationError(
+      FirebaseAuthException(code: 'invalid-app-credential'),
+    );
+
+    expect(conflict.title, 'Phone number already registered');
+    expect(conflict.message, contains('salon owner'));
+    expect(conflict.message.toLowerCase(), isNot(contains('firebase')));
+    expect(phoneBlocked.title, 'Phone verification blocked');
+    expect(phoneBlocked.message.toLowerCase(), isNot(contains('firebase')));
+    expect(unknown.title, 'Something went wrong');
+    expect(unknown.message, contains('Please try again'));
+    expect(unknown.message.toLowerCase(), isNot(contains('firebase')));
+  });
+
+  test('operational errors never expose SDK details or stack traces', () {
+    final unauthenticated = friendlyOperationError(
+      Exception(
+        '[firebase_functions/unauthenticated] Sign in first.\n'
+        '#0 MethodChannel._invokeMethod (package:flutter/src/services/platform_channel.dart:424)',
+      ),
+    );
+    final internal = friendlyErrorMessage(
+      Exception(
+        '[cloud_firestore/internal] PlatformException(internal, failed)\n'
+        '#0 package:cloud_firestore/src/document_reference.dart:99',
+      ),
+      fallback: 'The request could not be completed. Try again.',
+    );
+
+    expect(unauthenticated.title, 'Secure session check failed');
+    expect(unauthenticated.message, contains('verify this app session'));
+    expect(unauthenticated.message.toLowerCase(), isNot(contains('firebase')));
+    expect(internal, 'The request could not be completed. Try again.');
+    expect(internal.toLowerCase(), isNot(contains('platformexception')));
+    expect(internal.toLowerCase(), isNot(contains('package:')));
+  });
+
+  test('salon hours always render with minutes and AM or PM', () {
+    expect(formatSalonClockTime('13:30'), '1:30 PM');
+    expect(formatSalonClockTime('9 AM'), '9:00 AM');
+    expect(formatSalonClockTime('12:05 am'), '12:05 AM');
+    const salon = Salon(
+      id: 'hours',
+      name: 'Hours Salon',
+      ownerName: 'Owner',
+      address: 'Address',
+      directionsUrl: '',
+      phone: '+919000000000',
+      email: 'owner@example.com',
+      logoUrl: '',
+      photoUrls: [],
+      distanceLabel: '',
+      rating: 0,
+      reviewCount: 0,
+      openTime: '9',
+      closeTime: '18:30',
+      isOpen: true,
+      services: [],
+    );
+    expect(formatSalonHoursRange(salon), '9:00 AM – 6:30 PM');
+  });
+
+  test('unanswered instant booking stops being active after 150 seconds', () {
+    final state = AppState();
+    final createdAt = DateTime(2026, 8, 21, 10);
+    final booking = Booking(
+      id: 'unanswered-instant',
+      salonId: 'salon',
+      serviceId: 'service',
+      barberId: '',
+      customerName: 'Customer',
+      customerPhone: '+919876543210',
+      start: createdAt.add(const Duration(minutes: 15)),
+      status: BookingStatus.pending,
+      createdAt: createdAt,
+      isInstant: true,
+      arrivalMinutes: 15,
+    );
+
+    expect(
+      state.isCustomerBookingActive(
+        booking,
+        now: createdAt.add(const Duration(seconds: 149)),
+      ),
+      isTrue,
+    );
+    expect(
+      state.isCustomerBookingActive(
+        booking,
+        now: createdAt.add(instantBookingResponseTimeout),
+      ),
+      isFalse,
+    );
+    state.dispose();
+  });
+
   test('phone hints normalize Indian SIM number formats', () {
     expect(indianMobileDigitsFromHint('+91 98765 43210'), '9876543210');
     expect(indianMobileDigitsFromHint('09876543210'), '9876543210');
     expect(indianMobileDigitsFromHint('9876543210'), '9876543210');
     expect(indianMobileDigitsFromHint('+1 555 123 4567'), isNull);
+  });
+
+  test('referral onboarding is required once only for a new account', () async {
+    final state = AppState();
+    await state.loginCustomerWithPhone(
+      name: 'New customer',
+      phone: '9876500100',
+      verificationId: 'verification',
+      smsCode: '123456',
+    );
+    expect(state.referralOnboardingRequired, isTrue);
+
+    await state.completeReferralOnboarding();
+    expect(state.referralOnboardingRequired, isFalse);
+    await state.signOutActiveUser();
+    await state.loginCustomerWithPhone(
+      name: '',
+      phone: '9876500100',
+      verificationId: 'verification',
+      smsCode: '123456',
+    );
+    expect(state.referralOnboardingRequired, isFalse);
+  });
+
+  test(
+    'customer and salon referral codes stay unique and role-specific',
+    () async {
+      final state = AppState();
+      await _loginCustomer(state, phone: '9876500101');
+      final customerCodes = await state.ensureReferralCodes();
+      expect(
+        customerCodes.customerInviteCode,
+        matches(RegExp(r'^(?=.*[A-Z])(?=.*\d)[A-Z\d]{6}$')),
+      );
+      expect(customerCodes.salonInviteCode, isEmpty);
+
+      await state.signOutActiveUser();
+      await state.loginOwnerWithEmail(
+        name: 'Owner one',
+        email: 'owner-one@example.com',
+      );
+      await expectLater(
+        state.completeReferralOnboarding(
+          referralCode: customerCodes.customerInviteCode,
+        ),
+        throwsA(isA<StateError>()),
+      );
+      await state.completeReferralOnboarding();
+      final ownerCodes = await state.ensureReferralCodes();
+      expect(
+        ownerCodes.customerInviteCode,
+        isNot(customerCodes.customerInviteCode),
+      );
+      expect(ownerCodes.salonInviteCode, isNotEmpty);
+      expect(ownerCodes.salonInviteCode, isNot(ownerCodes.customerInviteCode));
+
+      await state.signOutActiveUser();
+      await state.loginCustomerWithPhone(
+        name: 'Referred customer',
+        phone: '9876500102',
+        verificationId: 'verification',
+        smsCode: '123456',
+      );
+      await state.completeReferralOnboarding(
+        referralCode: ownerCodes.customerInviteCode,
+      );
+      expect(state.referralOnboardingRequired, isFalse);
+
+      await state.signOutActiveUser();
+      await state.loginOwnerWithEmail(
+        name: 'Owner two',
+        email: 'owner-two@example.com',
+      );
+      await state.completeReferralOnboarding(
+        referralCode: ownerCodes.salonInviteCode,
+      );
+      expect(state.referralOnboardingRequired, isFalse);
+    },
+  );
+
+  testWidgets('new registration offers referral code or no-code choices', (
+    tester,
+  ) async {
+    final state = AppState();
+    await state.loginCustomerWithPhone(
+      name: 'New customer',
+      phone: '9876500103',
+      verificationId: 'verification',
+      smsCode: '123456',
+    );
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: ReferralOnboardingScreen()),
+      ),
+    );
+
+    expect(find.text('Put referral code'), findsOneWidget);
+    expect(find.text("I don't have a referral code"), findsOneWidget);
+    await tester.tap(find.text('Put referral code'));
+    await tester.pump();
+    expect(
+      find.byKey(const ValueKey('referral-onboarding-code')),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Back'));
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('skip-referral-code')));
+    await tester.pump();
+    expect(state.referralOnboardingRequired, isFalse);
+  });
+
+  testWidgets('customer profile opens the customer referral page', (
+    tester,
+  ) async {
+    final state = AppState();
+    await _loginCustomer(state, phone: '9876500104');
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerProfileScreen()),
+      ),
+    );
+
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('customer-profile-referrals')),
+      400,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.byKey(const ValueKey('customer-profile-referrals')));
+    await tester.pumpAndSettle();
+    expect(find.byType(ReferralScreen), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('customer-referral-code-card')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('salon-referral-code-card')),
+      findsNothing,
+    );
+    expect(
+      find.text('You and the new customer each earn 40 Proin'),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('referral-earned-proin')), findsOneWidget);
+  });
+
+  testWidgets('customer profile shows Proin balance and coupon entry', (
+    tester,
+  ) async {
+    final state = AppState();
+    await _loginCustomer(state, phone: '9876500105');
+    await state.claimProinCoupon('SAVE50');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerProfileScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('customer-proin-wallet')),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byKey(const ValueKey('customer-proin-wallet')), findsOneWidget);
+    expect(find.text('100'), findsOneWidget);
+    expect(find.text('Upcoming expiries'), findsOneWidget);
+    expect(find.textContaining('100 Proin · Coupon'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('customer-proin-coupon-field')),
+      findsOneWidget,
+    );
+    expect(find.text('Put your coupon'), findsOneWidget);
+
+    await tester.tap(
+      find.byKey(const ValueKey('customer-proin-view-activity')),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('customer-proin-activity-sheet')),
+      findsOneWidget,
+    );
+    expect(find.text('Proin earned'), findsOneWidget);
+    expect(find.text('Coupon reward'), findsOneWidget);
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const ValueKey('customer-proin-coupon-field')),
+      'save50',
+    );
+    await tester.pump();
+    expect(find.text('SAVE50'), findsOneWidget);
+  });
+
+  testWidgets('customer Proin failure shows a compact safe message', (
+    tester,
+  ) async {
+    final state = _FailingProinAppState();
+    await _loginCustomer(state, phone: '9876500107');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerProfileScreen()),
+      ),
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('customer-proin-wallet')),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('customer-proin-safe-error')),
+      findsOneWidget,
+    );
+    expect(
+      find.text(
+        'We could not verify this app session. Try again, or reopen the app if it continues.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.textContaining('firebase_functions'), findsNothing);
+    expect(find.textContaining('MethodChannel'), findsNothing);
+    expect(find.textContaining('package:flutter'), findsNothing);
+  });
+
+  testWidgets('booking checkout applies only the eligible Proin quote', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Proin barber',
+      phone: '9888888819',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Proin checkout test.',
+      serviceIds: [service.id],
+    );
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500106');
+    await state.claimProinCoupon('SAVE50');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonBookingScreen(salonId: salonId, serviceId: service.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final eligible = (service.price * 0.25).floor();
+    expect(find.text('Use Proin for booking'), findsOneWidget);
+    expect(find.textContaining('Available Proin'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('booking-use-proin-switch')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('₹$eligible will be deducted'), findsOneWidget);
+    expect(find.text('Proin used'), findsOneWidget);
+    expect(find.text('₹${service.price - eligible}'), findsOneWidget);
+  });
+
+  testWidgets(
+    'booking checkout can claim a Proin coupon and use it immediately',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(390, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final state = await _stateWithSalonService(signOut: false);
+      final salonId = state.ownerSalon.id;
+      final service = state.ownerSalon.services.single;
+      await state.updateOwnerSalon(
+        name: state.ownerSalon.name,
+        ownerName: state.ownerSalon.ownerName,
+        address: state.ownerSalon.address,
+        phone: state.ownerSalon.phone,
+        openTime: '12:00 AM',
+        closeTime: '11:59 PM',
+      );
+      await state.addOwnerBarber(
+        name: 'Coupon barber',
+        phone: '9888888820',
+        speciality: 'Haircut specialist',
+        experienceYears: 3,
+        resumeSummary: 'Proin coupon checkout test.',
+        serviceIds: [service.id],
+      );
+      await state.signOutActiveUser();
+      await _loginCustomer(state, phone: '9876500108');
+
+      await tester.pumpWidget(
+        AppStateProvider(
+          createAppState: () => state,
+          child: MaterialApp(
+            home: SalonBookingScreen(salonId: salonId, serviceId: service.id),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Available Proin: 0'), findsOneWidget);
+      await tester.enterText(
+        find.byKey(const ValueKey('checkout-coupon-input')),
+        'proin50',
+      );
+      await tester.tap(find.byKey(const ValueKey('checkout-coupon-apply')));
+      await tester.pumpAndSettle();
+
+      final eligible = (service.price * 0.25).floor();
+      expect(find.textContaining('Proin is ready to use'), findsOneWidget);
+      expect(
+        find.textContaining('₹$eligible will be deducted'),
+        findsOneWidget,
+      );
+      expect(find.text('Proin used'), findsOneWidget);
+      expect(find.text('₹${service.price - eligible}'), findsOneWidget);
+    },
+  );
+
+  testWidgets('booking checkout accepts a direct discount voucher', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(390, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    final service = state.ownerSalon.services.single;
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500198');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonBookingScreen(salonId: salonId, serviceId: service.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final couponInput = find.byKey(const ValueKey('checkout-coupon-input'));
+    await tester.scrollUntilVisible(
+      couponInput,
+      420,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.enterText(couponInput, 'save');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pumpAndSettle();
+
+    final expectedDiscount = (service.price * 0.1).floor();
+    expect(
+      find.text('Voucher applied. You save ₹$expectedDiscount.'),
+      findsOneWidget,
+    );
+    await tester.scrollUntilVisible(
+      find.text('Voucher offer discount'),
+      -420,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.text('Voucher offer discount'), findsOneWidget);
+    expect(find.text('-₹$expectedDiscount'), findsOneWidget);
+  });
+
+  testWidgets('booking checkout shows visible discounts before booking', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(390, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    final service = state.ownerSalon.services.single;
+    state.configureMockVisibleCheckoutDiscountOffer(
+      campaignId: 'visible-save20',
+      campaignName: 'Visible SAVE20',
+      salonId: salonId,
+      discountPercent: 20,
+    );
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500199');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonBookingScreen(salonId: salonId, serviceId: service.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final visibleOfferCard = find.byKey(
+      const ValueKey('checkout-visible-discount-offers'),
+    );
+    await tester.scrollUntilVisible(
+      visibleOfferCard,
+      420,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.text('Available discount'), findsOneWidget);
+    expect(find.text('Visible SAVE20'), findsOneWidget);
+    expect(find.text('Save ₹40 · Pay ₹160'), findsOneWidget);
+
+    await tester.tap(find.text('Visible SAVE20'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Visible SAVE20 applied. You save ₹40.'), findsOneWidget);
+    expect(find.text('Visible SAVE20 discount'), findsOneWidget);
+    expect(find.text('-₹40'), findsOneWidget);
+    expect(find.text('₹160'), findsOneWidget);
+  });
+
+  test(
+    'visible checkout discount quote is used by the created booking',
+    () async {
+      final state = await _stateWithSalonService(signOut: false);
+      final salonId = state.ownerSalon.id;
+      final service = state.ownerSalon.services.single;
+      await state.addOwnerBarber(
+        name: 'Ravi',
+        phone: '9888888878',
+        speciality: 'Haircut specialist',
+        experienceYears: 3,
+        resumeSummary: 'Haircut specialist.',
+        serviceIds: [service.id],
+      );
+      state.configureMockVisibleCheckoutDiscountOffer(
+        campaignId: 'visible-save20',
+        campaignName: 'Visible SAVE20',
+        salonId: salonId,
+        discountPercent: 20,
+      );
+      await state.signOutActiveUser();
+      await _loginCustomer(state, phone: '9876500200');
+
+      final applied = await state.applyVisibleCheckoutDiscount(
+        salonId: salonId,
+        serviceIds: [service.id],
+        campaignId: 'visible-save20',
+      );
+      final quote = applied.discountQuote!;
+      final booking = await state.createBooking(
+        slot: state.slotsForService(salonId, service.id).first,
+        quoteId: quote.quoteId,
+      );
+
+      expect(booking.discountCampaignId, 'visible-save20');
+      expect(booking.discountCampaignName, 'Visible SAVE20');
+      expect(booking.discountAmount, 40);
+      expect(booking.customerPayableAmount, 160);
+      expect(booking.pritzePayoutAmount, 80);
+      expect(booking.salonTotalEarning, 240);
+    },
+  );
+
+  test(
+    'an eligible discount is not applied until the customer selects it',
+    () async {
+      final state = await _stateWithSalonService(signOut: false);
+      final salonId = state.ownerSalon.id;
+      final service = state.ownerSalon.services.single;
+      await state.addOwnerBarber(
+        name: 'Ravi',
+        phone: '9888888879',
+        speciality: 'Haircut specialist',
+        experienceYears: 3,
+        resumeSummary: 'Haircut specialist.',
+        serviceIds: [service.id],
+      );
+      state.configureMockDiscountCampaign(
+        discountPercent: 20,
+        salonId: salonId,
+      );
+      await state.signOutActiveUser();
+      await _loginCustomer(state, phone: '9876500201');
+
+      final booking = await state.createBooking(
+        slot: state.slotsForService(salonId, service.id).first,
+      );
+
+      expect(booking.discountCampaignId, isEmpty);
+      expect(booking.discountAmount, 0);
+      expect(booking.customerPayableAmount, service.price);
+    },
+  );
+
+  testWidgets('salon three-dot menu opens both salon referral codes', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Account menu'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Refer and invite'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ReferralScreen), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('customer-referral-code-card')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('salon-referral-code-card')),
+      findsOneWidget,
+    );
+    expect(
+      find.text(
+        'Qualifies after the new salon is approved and completes its first booking',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.text('You and the new salon each earn 500 Proin'),
+      findsOneWidget,
+    );
   });
 
   test('app update prompt compares platform build numbers', () {
@@ -63,6 +790,58 @@ void main() {
       isNewerAppVersion(installed: '1.0.15', available: '1.0.14'),
       isFalse,
     );
+  });
+
+  testWidgets('Android update prompt is mandatory and uses the app navigator', (
+    tester,
+  ) async {
+    PackageInfo.setMockInitialValues(
+      appName: 'Pritze',
+      packageName: 'com.trimtime.app',
+      version: '1.0.17',
+      buildNumber: '30',
+      buildSignature: '',
+    );
+    const updateChannel = MethodChannel('de.ffuf.in_app_update/methods');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(updateChannel, (call) async {
+          expect(call.method, 'checkForUpdate');
+          return <String, Object?>{
+            'updateAvailability': 2,
+            'immediateAllowed': true,
+            'immediateAllowedPreconditions': <int>[],
+            'flexibleAllowed': true,
+            'flexibleAllowedPreconditions': <int>[],
+            'availableVersionCode': 31,
+            'installStatus': 0,
+            'packageName': 'com.trimtime.app',
+            'clientVersionStalenessDays': 0,
+            'updatePriority': 0,
+          };
+        });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(updateChannel, null),
+    );
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: AppUpdatePrompt(child: Scaffold(body: Text('Home'))),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Update available'), findsOneWidget);
+    expect(find.text('Update now'), findsOneWidget);
+    expect(find.text('Later'), findsNothing);
+
+    await tester.tapAt(const Offset(5, 5));
+    await tester.pumpAndSettle();
+    expect(find.text('Update available'), findsOneWidget);
+
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.text('Update available'), findsOneWidget);
   });
 
   test('push permission policy handles iOS and Android first launch', () {
@@ -538,7 +1317,7 @@ void main() {
     expect(find.text('Request instant booking'), findsOneWidget);
     expect(find.text('Choose barber'), findsNothing);
     expect(find.text('Available slots'), findsNothing);
-    expect(find.textContaining('any available barber'), findsOneWidget);
+    expect(find.textContaining('any available barber'), findsNothing);
     expect(find.widgetWithText(FilledButton, 'Book for ₹0'), findsNothing);
   });
 
@@ -771,6 +1550,11 @@ void main() {
       find.byType(SalonBookingScreen),
     );
     expect(bookingScreen.instantOnly, isFalse);
+    await tester.scrollUntilVisible(
+      find.text('Available slots'),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
     expect(find.text('Available slots'), findsOneWidget);
     expect(find.text('Request instant booking'), findsNothing);
   });
@@ -931,7 +1715,7 @@ void main() {
     expect(find.text('1 barber'), findsNWidgets(2));
     expect(find.text('0 booking fee'), findsNothing);
     expect(find.text('Book this slot'), findsNothing);
-    expect(find.text('Book for ₹0'), findsOneWidget);
+    expect(find.text('Confirm appointment'), findsOneWidget);
     expect(tester.takeException(), isNull);
     debugDefaultTargetPlatformOverride = null;
   });
@@ -1007,7 +1791,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Android booking action makes the zero cost explicit', (
+  testWidgets('Android booking action confirms the selected appointment', (
     tester,
   ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
@@ -1027,7 +1811,10 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.widgetWithText(FilledButton, 'Book for ₹0'), findsOneWidget);
+    expect(
+      find.widgetWithText(FilledButton, 'Confirm appointment'),
+      findsOneWidget,
+    );
     expect(find.text('Book this slot'), findsNothing);
     expect(find.text('0 booking fee'), findsNothing);
     debugDefaultTargetPlatformOverride = null;
@@ -1074,12 +1861,16 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await tester.scrollUntilVisible(
+      find.text(firstSlotLabel),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
     final slotFinder = find.text(firstSlotLabel).first;
-    await tester.ensureVisible(slotFinder);
     await tester.pumpAndSettle();
     await tester.tap(slotFinder);
     await tester.pump();
-    await tester.tap(find.widgetWithText(FilledButton, 'Book for ₹0'));
+    await tester.tap(find.widgetWithText(FilledButton, 'Confirm appointment'));
     await tester.pumpAndSettle();
 
     expect(find.byKey(const ValueKey('booking-login-sheet')), findsOneWidget);
@@ -1132,12 +1923,16 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await tester.scrollUntilVisible(
+      find.text(firstSlotLabel),
+      500,
+      scrollable: find.byType(Scrollable).first,
+    );
     final slotFinder = find.text(firstSlotLabel).first;
-    await tester.ensureVisible(slotFinder);
     await tester.pumpAndSettle();
     await tester.tap(slotFinder);
     await tester.pump();
-    await tester.tap(find.widgetWithText(FilledButton, 'Book for ₹0'));
+    await tester.tap(find.widgetWithText(FilledButton, 'Confirm appointment'));
     await tester.pumpAndSettle();
 
     expect(
@@ -1398,6 +2193,46 @@ void main() {
     expect(find.text('Rejected'), findsOneWidget);
   });
 
+  testWidgets('started service hides payable amount until completion', (
+    tester,
+  ) async {
+    final booking = Booking(
+      id: 'in-service-payable',
+      salonId: 'salon-1',
+      serviceId: 'service-1',
+      barberId: 'barber-1',
+      customerName: 'Customer',
+      customerPhone: '9876543210',
+      start: DateTime(2026, 8, 29, 12),
+      durationMinutes: 30,
+      serviceName: 'Haircut Men',
+      servicePrice: 399,
+      customerPayableAmount: 359,
+      status: BookingStatus.inProgress,
+      createdAt: DateTime(2026, 8, 29, 11),
+      startedAt: DateTime(2026, 8, 29, 12),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          bottomNavigationBar: CurrentBookingBottomPanel(
+            booking: booking,
+            onTap: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      find.text(
+        'Your final payable amount will be shown after the salon ends the service.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.textContaining('₹359'), findsNothing);
+  });
+
   testWidgets('customer home shows live current booking progress', (
     tester,
   ) async {
@@ -1500,6 +2335,57 @@ void main() {
     expect(state.customerBookings.single.status, BookingStatus.cancelled);
     expect(find.byKey(const Key('current-booking-bottom-panel')), findsNothing);
   });
+
+  testWidgets(
+    'system timeout removes the unanswered instant booking bottom card',
+    (tester) async {
+      final state = await _stateWithSalonService(signOut: false);
+      final service = state.ownerSalon.services.single;
+      await state.addOwnerBarber(
+        name: 'Ravi',
+        phone: '9898989897',
+        speciality: 'Haircut specialist',
+        experienceYears: 3,
+        resumeSummary: 'Haircuts.',
+        serviceIds: [service.id],
+      );
+      final salonId = state.ownerSalon.id;
+      await state.signOutActiveUser();
+      await _loginCustomer(state);
+      await state.createInstantBooking(salonId: salonId, serviceId: service.id);
+
+      await tester.pumpWidget(
+        AppStateProvider(
+          createAppState: () => state,
+          child: const MaterialApp(
+            home: CustomerBookingConfirmationGate(child: CustomerHomeScreen()),
+          ),
+        ),
+      );
+      expect(
+        find.byKey(const Key('current-booking-bottom-panel')),
+        findsOneWidget,
+      );
+
+      await state.updateBookingStatus(
+        state.activeCustomerBooking!.id,
+        BookingStatus.cancelled,
+        cancellationReason:
+            'Oops, looks like the salon is busy. Please try again or see other nearby salons.',
+        cancelledBy: 'system',
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(state.activeCustomerBooking, isNull);
+      expect(
+        find.byKey(const Key('current-booking-bottom-panel')),
+        findsNothing,
+      );
+      expect(find.text('No response from salon'), findsOneWidget);
+      expect(find.textContaining('salon is busy'), findsOneWidget);
+    },
+  );
 
   testWidgets('salon booking desk shows the ordered service snapshot', (
     tester,
@@ -1786,7 +2672,7 @@ void main() {
           isA<StateError>().having(
             (error) => error.message,
             'message',
-            contains('current booking'),
+            contains('active booking'),
           ),
         ),
       );
@@ -1803,7 +2689,7 @@ void main() {
           isA<StateError>().having(
             (error) => error.message,
             'message',
-            contains('current booking'),
+            contains('active booking'),
           ),
         ),
       );
@@ -2126,6 +3012,109 @@ void main() {
       find.textContaining('accepted your Haircut booking'),
       findsOneWidget,
     );
+  });
+
+  testWidgets('rejected booking opens a clear customer outcome popup', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      directionsUrl: state.ownerSalon.directionsUrl,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9333333342',
+      speciality: 'Haircut specialist',
+      experienceYears: 4,
+      resumeSummary: 'Customer bookings.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final booking = await state.createInstantBooking(
+      salonId: salonId,
+      serviceId: service.id,
+    );
+    await state.updateBookingStatus(
+      booking.id,
+      BookingStatus.rejected,
+      cancellationReason: 'Rejected by salon',
+      cancelledBy: 'owner',
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(
+          home: CustomerBookingConfirmationGate(child: Scaffold()),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Booking rejected'), findsOneWidget);
+    expect(find.textContaining('could not accept'), findsOneWidget);
+    expect(find.text('Find another salon'), findsOneWidget);
+  });
+
+  testWidgets('salon cancellation opens a clear customer outcome popup', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      directionsUrl: state.ownerSalon.directionsUrl,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9333333343',
+      speciality: 'Haircut specialist',
+      experienceYears: 4,
+      resumeSummary: 'Customer bookings.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final booking = await state.createInstantBooking(
+      salonId: salonId,
+      serviceId: service.id,
+    );
+    await state.updateBookingStatus(
+      booking.id,
+      BookingStatus.cancelled,
+      cancellationReason: 'Cancelled by salon',
+      cancelledBy: 'owner',
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(
+          home: CustomerBookingConfirmationGate(child: Scaffold()),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Booking cancelled'), findsOneWidget);
+    expect(find.textContaining('cancelled your booking'), findsOneWidget);
   });
 
   test('instant booking toggle pauses today and resets next day', () async {
@@ -2489,7 +3478,7 @@ void main() {
     expect(state.slotQueryCount, lessThanOrEqualTo(4));
   });
 
-  test('catalog import only adds selected service categories', () async {
+  test('catalog import always restores all standard services', () async {
     final state = AppState();
     await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
     await state.updateOwnerSalon(
@@ -2502,15 +3491,102 @@ void main() {
     );
 
     final added = await state.addOwnerServicesFromCatalog(
-      categories: {'Beard'},
+      serviceNames: {'Beard Trim', 'Hair Spa'},
     );
 
-    expect(added, greaterThan(0));
+    expect(added, 30);
     expect(
-      state.ownerSalon.services.map((service) => service.category).toSet(),
-      {'Beard'},
+      state.ownerSalon.services.map((service) => service.name),
+      serviceCatalog.map((service) => service.name),
     );
   });
+
+  testWidgets(
+    'first-time service import stays on registration and preserves typed details',
+    (tester) async {
+      final state = AppState();
+      await state.loginOwnerWithEmail(
+        name: 'New owner',
+        email: 'new-owner@example.com',
+      );
+
+      await tester.pumpWidget(
+        AppStateProvider(
+          createAppState: () => state,
+          child: const MaterialApp(home: SalonDashboardScreen()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.byKey(const ValueKey('salon-registration-name-field')),
+        'Draft Glow Salon',
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('salon-registration-owner-field')),
+        'Aman Owner',
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('salon-registration-address-field')),
+        'Chembur Main Road',
+      );
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('salon-import-services-button')),
+        500,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('salon-import-services-button')),
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('salon-confirm-import-services-button')),
+      );
+      await tester.tap(
+        find.byKey(const ValueKey('salon-confirm-import-services-button')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(state.ownerSalonOrNull, isNull);
+      expect(state.ownerSalon.services, hasLength(30));
+      expect(find.byType(SalonProfileSetupScreen), findsOneWidget);
+      expect(find.text('Overview'), findsNothing);
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('salon-registration-name-field')),
+        -500,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<TextFormField>(
+              find.byKey(const ValueKey('salon-registration-name-field')),
+            )
+            .controller
+            ?.text,
+        'Draft Glow Salon',
+      );
+      expect(
+        tester
+            .widget<TextFormField>(
+              find.byKey(const ValueKey('salon-registration-owner-field')),
+            )
+            .controller
+            ?.text,
+        'Aman Owner',
+      );
+      expect(
+        tester
+            .widget<TextFormField>(
+              find.byKey(const ValueKey('salon-registration-address-field')),
+            )
+            .controller
+            ?.text,
+        'Chembur Main Road',
+      );
+    },
+  );
 
   test('any available shows each appointment time only once', () async {
     final state = await _stateWithSalonService(signOut: false);
@@ -2563,6 +3639,123 @@ void main() {
       state.barberMonthlyEarnings(barber.id, now: booking.start),
       service.price,
     );
+  });
+
+  testWidgets(
+    'discount receipt and salon earnings follow the protected Pritze split',
+    (tester) async {
+      final state = await _stateWithSalonService(signOut: false);
+      final originalService = state.ownerSalon.services.single;
+      await state.updateOwnerService(
+        serviceId: originalService.id,
+        name: originalService.name,
+        category: originalService.category,
+        price: 100,
+        durationMinutes: originalService.durationMinutes,
+      );
+      await state.addOwnerBarber(
+        name: 'Ravi',
+        phone: '9888888876',
+        speciality: 'Haircut specialist',
+        experienceYears: 3,
+        resumeSummary: 'Haircut specialist.',
+        serviceIds: [originalService.id],
+      );
+      final salonId = state.ownerSalon.id;
+      state.configureMockDiscountCampaign(
+        discountPercent: 10,
+        salonId: salonId,
+      );
+      await state.signOutActiveUser();
+      await _loginCustomer(state);
+      final applied = await state.applyVisibleCheckoutDiscount(
+        salonId: salonId,
+        serviceIds: [originalService.id],
+        campaignId: 'mock-campaign',
+      );
+      final booking = await state.createBooking(
+        slot: state.slotsForService(salonId, originalService.id).first,
+        quoteId: applied.discountQuote!.quoteId,
+      );
+
+      expect(booking.servicePrice, 100);
+      expect(booking.discountAmount, 10);
+      expect(booking.customerPayableAmount, 90);
+      expect(booking.pritzePayoutAmount, 20);
+      expect(booking.salonTotalEarning, 110);
+      expect(booking.discountStatus, 'reserved');
+
+      await state.updateBookingStatus(booking.id, BookingStatus.completed);
+      final completed = state.bookings.singleWhere(
+        (item) => item.id == booking.id,
+      );
+      expect(completed.discountStatus, 'redeemed');
+      expect(state.totalOriginalServiceValue(salonId), 100);
+      expect(state.totalCustomerCounterCollection(salonId), 90);
+      expect(state.totalPritzeEarnings(salonId), 20);
+      expect(state.totalCollection(salonId), 110);
+
+      await tester.pumpWidget(
+        AppStateProvider(
+          createAppState: () => state,
+          child: MaterialApp(
+            home: CustomerCompletionReceiptScreen(booking: completed),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Service completed'), findsOneWidget);
+      expect(find.text('₹100'), findsOneWidget);
+      expect(find.text('-₹10'), findsOneWidget);
+      expect(find.text('₹90'), findsOneWidget);
+      expect(find.text('Pay ₹90 at the salon counter'), findsOneWidget);
+      expect(find.text('Continue to feedback'), findsOneWidget);
+    },
+  );
+
+  test('multi-service revenue is allocated to every ordered service', () async {
+    final state = await _stateWithSalonService(signOut: false);
+    final haircut = state.ownerSalon.services.single;
+    await state.addOwnerService(
+      name: 'Hair spa',
+      category: 'Hair',
+      price: 100,
+      durationMinutes: 30,
+    );
+    final spa = state.ownerSalon.services.last;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9888888877',
+      speciality: 'Hair specialist',
+      experienceYears: 3,
+      resumeSummary: 'Hair specialist.',
+      serviceIds: [haircut.id, spa.id],
+    );
+    final salonId = state.ownerSalon.id;
+    state.configureMockDiscountCampaign(discountPercent: 10, salonId: salonId);
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final applied = await state.applyVisibleCheckoutDiscount(
+      salonId: salonId,
+      serviceIds: [haircut.id, spa.id],
+      campaignId: 'mock-campaign',
+    );
+    final booking = await state.createInstantBooking(
+      salonId: salonId,
+      serviceIds: [haircut.id, spa.id],
+      arrivalMinutes: 15,
+      quoteId: applied.discountQuote!.quoteId,
+    );
+    await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
+    await state.updateBookingStatus(booking.id, BookingStatus.inProgress);
+    await state.updateBookingStatus(booking.id, BookingStatus.completed);
+
+    final revenue = state.serviceRevenue(salonId);
+    expect(revenue.keys, containsAll([haircut.id, spa.id]));
+    expect(revenue[haircut.id], 220);
+    expect(revenue[spa.id], 110);
+    expect(revenue.values.fold<int>(0, (sum, value) => sum + value), 330);
   });
 
   test('started cutting marks barber occupied until completion', () async {
@@ -3402,6 +4595,195 @@ void main() {
     expect(find.text('Owner name'), findsNothing);
   });
 
+  testWidgets('returning owner login opens the dashboard, not salon setup', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService();
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Email'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('email-login-field')),
+      'owner@example.com',
+    );
+    await tester.tap(find.widgetWithText(FilledButton, 'Continue'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('email-otp-field')),
+      '123456',
+    );
+    await tester.tap(find.widgetWithText(FilledButton, 'Verify and sign in'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SalonProfileSetupScreen), findsNothing);
+    expect(find.text(state.ownerSalon.name), findsOneWidget);
+    expect(find.text('Overview'), findsOneWidget);
+    expect(find.text('Bookings'), findsOneWidget);
+    expect(find.text('Team'), findsOneWidget);
+  });
+
+  testWidgets('owner promotional credits live in menu, not overview', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Overview'), findsOneWidget);
+    expect(find.text('Salon promotional Proin'), findsNothing);
+    expect(find.text('Promotional credits'), findsNothing);
+    expect(find.text('Earning breakdown'), findsNothing);
+
+    await tester.tap(find.byTooltip('Account menu'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Revenue details'), findsOneWidget);
+    expect(find.text('Promotional credits'), findsOneWidget);
+
+    await tester.tap(find.text('Promotional credits'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Promotional credits'), findsOneWidget);
+    expect(find.text('Earning breakdown'), findsOneWidget);
+    expect(find.textContaining('credits'), findsWidgets);
+  });
+
+  testWidgets('owner revenue details open from menu with period breakdowns', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9888888876',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircut specialist.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+    );
+    await state.updateBookingStatus(booking.id, BookingStatus.completed);
+    await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Account menu'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Revenue details'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SalonRevenueDetailsScreen), findsOneWidget);
+    expect(find.text('Salon earning'), findsOneWidget);
+    expect(find.text('₹200'), findsWidgets);
+
+    await tester.drag(find.byType(ListView).last, const Offset(0, -500));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Earning breakdown'), findsOneWidget);
+    expect(find.text('Week by week'), findsOneWidget);
+
+    await tester.drag(find.byType(ListView).last, const Offset(0, -1100));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Month by month'), findsOneWidget);
+
+    await tester.drag(find.byType(ListView).last, const Offset(0, -900));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Revenue by service'), findsOneWidget);
+    expect(find.text('Revenue by barber'), findsOneWidget);
+    expect(find.text('Discount and Proin impact'), findsOneWidget);
+  });
+
+  testWidgets('salon can avail a promotional coupon from the menu', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Account menu'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Promotional credits'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const ValueKey('salon-proin-coupon-field')),
+      'salon100',
+    );
+    await tester.tap(find.byKey(const ValueKey('salon-proin-coupon-apply')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.textContaining('100 credits added to this salon'),
+      findsOneWidget,
+    );
+    expect(state.salonProinWallet(state.ownerSalon.id).availableProin, 100);
+  });
+
+  testWidgets('missing team setup opens the team page from overview', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+
+    expect(
+      state.missingSalonSetupItems(state.ownerSalon.id),
+      contains('Add at least one barber'),
+    );
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonDashboardScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Complete the remaining salon setup'), findsOneWidget);
+    expect(find.text('No barbers have joined the team yet.'), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('complete-salon-setup-action')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SalonProfileSetupScreen), findsNothing);
+    expect(find.text('No barbers have joined the team yet.'), findsOneWidget);
+    expect(
+      find.text('Add your first barber to build the salon team.'),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('new salon owner must register a shop before overview', (
     tester,
   ) async {
@@ -3474,11 +4856,19 @@ void main() {
       phoneField.autofillHints,
       contains(AutofillHints.telephoneNumberDevice),
     );
-    expect(phoneField.decoration?.prefixText, '+91 ');
+    expect(phoneField.decoration?.prefixIcon, isNotNull);
+    expect(find.text('+91'), findsOneWidget);
     expect(
       find.byKey(const ValueKey('suggest-phone-number-button')),
       findsOneWidget,
     );
+    final phoneSuggestionAlign = tester.widget<Align>(
+      find.ancestor(
+        of: find.byKey(const ValueKey('suggest-phone-number-button')),
+        matching: find.byType(Align),
+      ),
+    );
+    expect(phoneSuggestionAlign.alignment, Alignment.center);
   });
 
   testWidgets('Android automatic OTP completion advances without typing code', (
@@ -3544,6 +4934,11 @@ void main() {
       '9876543298',
     );
     await tester.tap(find.text('Save phone and continue'));
+    await tester.pump();
+
+    expect(find.text('Do you have a referral code?'), findsOneWidget);
+    expect(loginCompleted, isFalse);
+    await tester.tap(find.byKey(const ValueKey('skip-referral-code')));
     await tester.pumpAndSettle();
 
     expect(loginCompleted, isTrue);
@@ -3643,6 +5038,11 @@ void main() {
     );
     await tester.tap(find.text('Create customer account'));
     await tester.pump();
+
+    expect(find.text('Do you have a referral code?'), findsOneWidget);
+    expect(loginCompleted, isFalse);
+    await tester.tap(find.byKey(const ValueKey('skip-referral-code')));
+    await tester.pumpAndSettle();
 
     expect(loginCompleted, isTrue);
     expect(state.hasActiveCustomerSession, isTrue);
@@ -3789,6 +5189,9 @@ void main() {
 
     await tester.enterText(otpField, '123456');
     tester.widget<TextField>(otpField).onSubmitted?.call('123456');
+    await tester.pump();
+    expect(find.text('Do you have a referral code?'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('skip-referral-code')));
     await tester.pumpAndSettle();
     expect(state.hasActiveOwnerSession, isTrue);
   });
@@ -3825,10 +5228,37 @@ void main() {
     expect(state.ownerSalon.phone, isEmpty);
   });
 
-  test('haircut and waxing assets map to the correct supplied artwork', () {
+  test('service assets map to the closest supplied artwork', () {
     expect(
       serviceIconAssetForCategory('Haircut & Styling'),
       'assets/service_icons/haircut.jpeg',
+    );
+    expect(
+      serviceIconAssetForService('Hair Wash Men', category: 'Hair Care'),
+      'assets/service_icons/spa.jpeg',
+    );
+    expect(
+      serviceIconAssetForService('Haircut + Hair Wash', category: 'Hair'),
+      'assets/service_icons/haircut.jpeg',
+    );
+    expect(
+      serviceIconAssetForService(
+        'Keratin / Smoothening',
+        category: 'Hair Texture',
+      ),
+      'assets/service_icons/hair_color.jpeg',
+    );
+    expect(
+      serviceIconAssetForService('Beard Colour', category: 'Hair Color'),
+      'assets/service_icons/beard.jpeg',
+    );
+    expect(
+      serviceIconAssetForService('Party / Bridal Makeup.', category: 'Makeup'),
+      'assets/service_icons/facial.jpeg',
+    );
+    expect(
+      serviceIconAssetForService('Eyebrow Threading', category: 'Threading'),
+      'assets/service_icons/threading.jpeg',
     );
     expect(
       serviceIconAssetForCategory('Waxing'),
@@ -3883,13 +5313,17 @@ Future<UserAccount> _loginCustomer(
   AppState state, {
   String name = 'Customer',
   String phone = '9876500000',
-}) {
-  return state.loginCustomerWithPhone(
+}) async {
+  final account = await state.loginCustomerWithPhone(
     name: name,
     phone: phone,
     verificationId: 'test-verification',
     smsCode: '123456',
   );
+  if (state.referralOnboardingRequired) {
+    await state.completeReferralOnboarding();
+  }
+  return account;
 }
 
 Future<AppState> _stateWithSalonService({
@@ -3898,6 +5332,9 @@ Future<AppState> _stateWithSalonService({
 }) async {
   final state = appState ?? AppState();
   await state.loginOwnerWithEmail(name: 'Owner', email: 'owner@example.com');
+  if (state.referralOnboardingRequired) {
+    await state.completeReferralOnboarding();
+  }
   await state.updateOwnerSalon(
     name: 'Pritze Cuts',
     ownerName: 'Owner',
@@ -3985,6 +5422,17 @@ class _AutoVerifiedPhoneAppState extends AppState {
 class _NotificationPreferencesLoadingState extends AppState {
   @override
   bool notificationPreferencesReady(UserRole role) => false;
+}
+
+class _FailingProinAppState extends AppState {
+  @override
+  Future<ProinWalletSummary> refreshCustomerProinWallet() {
+    throw Exception(
+      '[firebase_functions/unauthenticated] Sign in first.\n'
+      '#0 MethodChannel._invokeMethod '
+      '(package:flutter/src/services/platform_channel.dart:424)',
+    );
+  }
 }
 
 class _RestoringAppState extends AppState {

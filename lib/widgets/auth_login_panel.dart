@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -8,7 +7,9 @@ import '../models/app_models.dart';
 import '../services/android_phone_hint.dart';
 import '../state/app_state.dart';
 import '../state/app_state_scope.dart';
+import '../screens/referrals/referral_onboarding_screen.dart';
 import 'app_ui.dart';
+import 'app_error_dialog.dart';
 
 enum AuthLoginMethod { phone, email }
 
@@ -155,13 +156,12 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
                     ? 'Add your mobile number. No phone OTP is required.'
                     : widget.phoneHelperText ?? 'We will send an OTP.',
                 errorText: _phoneValidationMessage,
-                prefixText: '+91 ',
-                prefixIcon: const Icon(Icons.phone_android_outlined),
+                prefixIcon: const _PhonePrefix(),
               ),
             ),
             if (!_phoneOtpSent && !_customerNameRequired) ...[
               Align(
-                alignment: Alignment.centerRight,
+                alignment: Alignment.center,
                 child: TextButton.icon(
                   key: const ValueKey('suggest-phone-number-button'),
                   onPressed: _isSubmitting || _isPickingPhoneNumber
@@ -436,9 +436,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_friendlyLoginError(error))));
+      await _showLoginError(error);
     } finally {
       if (mounted) {
         setState(() => _isSubmitting = false);
@@ -451,7 +449,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     setState(() => _isSubmitting = true);
     try {
       await _loginWithGoogle(appState);
-      widget.onLoggedIn?.call();
+      await _finishLogin();
     } on CustomerPhoneRequiredException {
       if (!mounted) {
         return;
@@ -474,9 +472,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_friendlyLoginError(error))));
+      await _showLoginError(error);
     } finally {
       if (mounted) {
         setState(() => _isSubmitting = false);
@@ -508,7 +504,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       if (mounted) {
         setState(() => _customerGooglePhoneRequired = false);
       }
-      widget.onLoggedIn?.call();
+      await _finishLogin();
       return;
     }
     if (_customerNameRequired) {
@@ -522,7 +518,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
         name: name,
         phone: phone,
       );
-      widget.onLoggedIn?.call();
+      await _finishLogin();
       return;
     }
     if (!_phoneOtpSent) {
@@ -566,7 +562,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
   Future<void> _completePhoneOtpLogin(AppState appState) async {
     try {
       await _loginWithPhone(appState);
-      widget.onLoggedIn?.call();
+      await _finishLogin();
     } on CustomerNameRequiredException {
       if (!mounted) {
         return;
@@ -610,7 +606,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       );
     } catch (error) {
       if (mounted) {
-        _showSnack(_friendlyLoginError(error));
+        await _showLoginError(error);
       }
     } finally {
       _isAutoCompletingPhoneOtp = false;
@@ -676,7 +672,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       _phoneOtpFocusNode.requestFocus();
     } catch (error) {
       if (mounted) {
-        _showSnack(_friendlyLoginError(error));
+        await _showLoginError(error);
       }
     } finally {
       if (mounted) {
@@ -770,7 +766,17 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       return;
     }
     await _loginWithEmail(appState);
-    widget.onLoggedIn?.call();
+    await _finishLogin();
+  }
+
+  Future<void> _finishLogin() async {
+    if (!mounted) {
+      return;
+    }
+    await showReferralOnboardingIfRequired(context);
+    if (mounted) {
+      widget.onLoggedIn?.call();
+    }
   }
 
   Future<void> _resendEmailOtp() async {
@@ -790,7 +796,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       _emailOtpFocusNode.requestFocus();
     } catch (error) {
       if (mounted) {
-        _showSnack(_friendlyLoginError(error));
+        await _showLoginError(error);
       }
     } finally {
       if (mounted) {
@@ -881,81 +887,37 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     _showSnack(message);
   }
 
-  String _friendlyLoginError(Object error) {
-    if (error is FirebaseFunctionsException) {
-      final detail = error.message?.toLowerCase() ?? '';
-      if (error.code == 'already-exists') {
-        return error.message ??
-            'This phone number is already registered for another account type.';
-      }
-      if (error.code == 'permission-denied' &&
-          detail.contains('incorrect email otp')) {
-        return 'That email OTP is not correct. Please check the code and try again.';
-      }
-      if (error.code == 'not-found') {
-        return 'Request a new email OTP, then try again.';
-      }
-      if (error.code == 'deadline-exceeded') {
-        return 'That email OTP has expired. Request a new code.';
-      }
-      if (error.code == 'resource-exhausted') {
-        return detail.contains('wait')
-            ? 'Please wait before requesting another email OTP.'
-            : 'Too many OTP attempts. Request a new code.';
-      }
-      if (error.code == 'invalid-argument') {
-        return error.message ?? 'Enter a valid email address and OTP.';
-      }
-    }
-    final message = error.toString();
-    if (message.contains('firebase_functions/permission-denied') ||
-        message.contains('PERMISSION_DENIED')) {
-      return 'Email OTP is blocked by Firebase app verification. Please install the latest build and make sure this app is registered in Firebase App Check.';
-    }
-    if (message.contains('firebase_functions/failed-precondition') ||
-        message.contains('Service Account Token Creator') ||
-        message.contains('signBlob') ||
-        message.contains('auth/insufficient-permission')) {
-      return 'Email OTP is verified, but Firebase cannot finish sign-in yet. The Cloud Function service account needs the Service Account Token Creator role.';
-    }
-    if (message.contains('firebase_functions/internal')) {
-      return 'Email OTP verification reached Firebase, but sign-in could not be completed. Please try again after the server permission fix is applied.';
-    }
-    if (message.contains('Invalid app info') ||
-        message.contains('app-not-authorized') ||
-        message.contains('17028')) {
-      return 'Phone OTP is blocked by Firebase app verification. Add the app signing certificate in Firebase, wait a few minutes, then try again.';
-    }
-    if (message.contains('too-many-requests') || message.contains('quota')) {
-      return 'Too many OTP attempts. Please wait and try again.';
-    }
-    if (message.contains('invalid-phone-number')) {
-      return 'Enter a valid 10-digit Indian mobile number.';
-    }
-    if (message.contains('credential-already-in-use') ||
-        message.contains('account-exists-with-different-credential')) {
-      return 'This phone number belongs to another login. Sign in using the phone number instead.';
-    }
-    if (message.contains('invalid-verification-code')) {
-      return 'That OTP is not correct. Please check the code and try again.';
-    }
-    if (message.contains('replaced by a newer code')) {
-      return 'That OTP is no longer valid. Enter the latest code we sent.';
-    }
-    if (message.contains('network-request-failed') ||
-        message.contains('unavailable')) {
-      return 'Unable to contact the login service. Check your internet connection and try again.';
-    }
-    if (message.toLowerCase().contains('canceled') ||
-        message.toLowerCase().contains('cancelled')) {
-      return 'Google sign-in was cancelled.';
-    }
-    if (message.contains('already registered as a')) {
-      return message
-          .replaceFirst('Bad state: ', '')
-          .replaceFirst('Exception: ', '');
-    }
-    return 'Login failed: $message';
+  Future<void> _showLoginError(Object error) {
+    return showAppErrorDialog(context, friendlyAuthenticationError(error));
+  }
+}
+
+class _PhonePrefix extends StatelessWidget {
+  const _PhonePrefix();
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 78,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.phone_android_outlined,
+            size: 21,
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '+91',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              fontWeight: FontWeight.w800,
+              color: Theme.of(context).colorScheme.onSurface,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

@@ -5,6 +5,7 @@ import 'package:image_picker/image_picker.dart';
 import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/app_error_dialog.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/booking_status_timeline.dart';
 import 'my_bookings_screen.dart';
@@ -279,7 +280,12 @@ class _CustomerProfileEditorState extends State<CustomerProfileEditor> {
       );
       if (mounted) setState(() => _photoUrl = url);
     } catch (error) {
-      _showError('Profile photo upload failed: $error');
+      _showError(
+        friendlyErrorMessage(
+          error,
+          fallback: 'Profile photo could not be uploaded. Please try again.',
+        ),
+      );
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -304,7 +310,12 @@ class _CustomerProfileEditorState extends State<CustomerProfileEditor> {
         if (mounted) setState(() => _stylePhotoUrls.add(url));
       }
     } catch (error) {
-      _showError('Style photo upload failed: $error');
+      _showError(
+        friendlyErrorMessage(
+          error,
+          fallback: 'Style photos could not be uploaded. Please try again.',
+        ),
+      );
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -316,7 +327,12 @@ class _CustomerProfileEditorState extends State<CustomerProfileEditor> {
       await AppStateScope.read(context).removeCustomerStylePhoto(url);
       if (mounted) setState(() => _stylePhotoUrls.remove(url));
     } catch (error) {
-      _showError('Could not remove photo: $error');
+      _showError(
+        friendlyErrorMessage(
+          error,
+          fallback: 'The photo could not be removed. Please try again.',
+        ),
+      );
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -365,7 +381,12 @@ class _CustomerProfileEditorState extends State<CustomerProfileEditor> {
       Navigator.pop(context);
       messenger.showSnackBar(const SnackBar(content: Text('Profile updated.')));
     } catch (error) {
-      _showError('Could not update profile: $error');
+      _showError(
+        friendlyErrorMessage(
+          error,
+          fallback: 'Your profile could not be updated. Please try again.',
+        ),
+      );
     } finally {
       if (mounted) setState(() => _saving = false);
     }

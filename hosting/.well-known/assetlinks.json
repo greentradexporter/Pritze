@@ -1,0 +1,14 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.trimtime.app",
+      "sha256_cert_fingerprints": [
+        "26:81:8C:F3:64:62:15:1C:CD:A4:A2:C4:BC:56:3E:B8:16:9B:3F:81:35:F9:99:6C:FD:0D:58:EF:8B:EC:3A:58",
+        "FF:DD:C0:89:6E:E3:C8:6E:D3:3D:D0:77:A0:B6:5F:B2:F9:68:27:50:04:C2:7D:DF:8A:49:20:A2:F4:DC:52:DF",
+        "55:EB:86:02:BE:A3:17:4D:D2:9C:C0:59:6E:CF:0B:12:67:EE:B9:8F:E6:AB:72:F4:2D:7F:81:2E:BD:17:94:3E"
+      ]
+    }
+  }
+]

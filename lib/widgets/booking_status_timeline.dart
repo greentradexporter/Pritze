@@ -117,6 +117,10 @@ class CurrentBookingBottomPanel extends StatelessWidget {
                     ),
             ),
           ],
+          if (booking.status == BookingStatus.inProgress) ...[
+            const SizedBox(height: 10),
+            const _BookingPanelInset(child: _ServicePayablePendingLine()),
+          ],
           const SizedBox(height: 11),
           _BookingPanelInset(
             child: BookingStatusTimeline(
@@ -397,6 +401,30 @@ class _PendingOwnerDecisionLine extends StatelessWidget {
         color: AppColors.goldDeep,
         fontWeight: FontWeight.w600,
       ),
+    );
+  }
+}
+
+class _ServicePayablePendingLine extends StatelessWidget {
+  const _ServicePayablePendingLine();
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Icon(Icons.payments_outlined, size: 18, color: AppColors.blue),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            'Your final payable amount will be shown after the salon ends the service.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: AppColors.primaryDark,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

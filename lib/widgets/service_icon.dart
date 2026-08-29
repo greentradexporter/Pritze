@@ -5,12 +5,14 @@ import '../theme/app_theme.dart';
 
 class ServiceImageIcon extends StatelessWidget {
   final String category;
+  final String? serviceName;
   final double size;
   final Color? color;
 
   const ServiceImageIcon({
     super.key,
     required this.category,
+    this.serviceName,
     this.size = 48,
     this.color,
   });
@@ -36,7 +38,10 @@ class ServiceImageIcon extends StatelessWidget {
       child: ClipRRect(
         borderRadius: BorderRadius.circular(7),
         child: Image.asset(
-          serviceIconAssetForCategory(category),
+          serviceIconAssetForService(
+            serviceName ?? category,
+            category: category,
+          ),
           fit: BoxFit.contain,
           errorBuilder: (context, error, stackTrace) {
             return ColoredBox(

@@ -4,7 +4,9 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'models/app_models.dart';
 import 'screens/customer/customer_home_screen.dart';
 import 'screens/salon/salon_dashboard_screen.dart';
+import 'screens/referrals/referral_onboarding_screen.dart';
 import 'services/firebase_bootstrap.dart';
+import 'services/referral_link_service.dart';
 import 'state/app_state_scope.dart';
 import 'state/app_state.dart';
 import 'theme/app_theme.dart';
@@ -14,6 +16,7 @@ import 'widgets/app_update_prompt.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await ReferralLinkService.initialize();
   final firebase = await FirebaseBootstrap.initialize();
 
   if (!firebase.enabled) {
@@ -44,9 +47,9 @@ class TrimtimeApp extends StatelessWidget {
     return MaterialApp(
       title: 'Pritze',
       theme: AppTheme.build(),
-      home: const AppEntryScreen(),
-      builder: (context, child) =>
-          AppUpdatePrompt(child: child ?? const SizedBox.shrink()),
+      // Keep the update prompt inside the app Navigator so its mandatory
+      // dialog can always be presented above the currently visible route.
+      home: const AppUpdatePrompt(child: AppEntryScreen()),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -60,6 +63,9 @@ class AppEntryScreen extends StatelessWidget {
     final appState = AppStateScope.watch(context);
     if (appState.isRestoringSession) {
       return const _SessionRestoreScreen();
+    }
+    if (appState.activeRole != null && appState.referralOnboardingRequired) {
+      return const ReferralOnboardingScreen();
     }
     return switch (appState.activeRole) {
       UserRole.owner => const SalonDashboardScreen(),

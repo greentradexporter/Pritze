@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/app_models.dart';
 import '../../models/service_catalog.dart';
@@ -8,6 +9,7 @@ import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/url_launcher_utils.dart';
+import '../../widgets/app_error_dialog.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/auth_login_panel.dart';
@@ -26,12 +28,40 @@ class SalonDashboardScreen extends StatefulWidget {
 class _SalonDashboardScreenState extends State<SalonDashboardScreen> {
   final GlobalKey<_OwnerBookingsState> _bookingsKey = GlobalKey();
 
+  Future<void> _showPromotionalCredits(BuildContext context, String salonId) {
+    return showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (sheetContext) => Padding(
+        padding: EdgeInsets.fromLTRB(
+          18,
+          0,
+          18,
+          18 + MediaQuery.of(sheetContext).viewInsets.bottom,
+        ),
+        child: SingleChildScrollView(
+          child: _SalonPromotionalCreditsSheet(salonId: salonId),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openRevenueDetails(BuildContext context, String salonId) {
+    return Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SalonRevenueDetailsScreen(salonId: salonId),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final salon = appState.ownerSalon;
 
-    if (appState.ownerAccount == null) {
+    if (!appState.hasActiveOwnerSession) {
       return const _OwnerLoginGate();
     }
     if (appState.ownerSalonOrNull == null) {
@@ -74,6 +104,10 @@ class _SalonDashboardScreenState extends State<SalonDashboardScreen> {
                 AccountOverflowMenu(
                   role: UserRole.owner,
                   canLogout: true,
+                  onRevenueDetailsOpened: () =>
+                      _openRevenueDetails(dashboardContext, salon.id),
+                  onPromotionalCreditsOpened: () =>
+                      _showPromotionalCredits(dashboardContext, salon.id),
                   onNotificationOpened: (destination, {bookingId}) =>
                       _openNotificationDestination(
                         dashboardContext,
@@ -196,6 +230,270 @@ class _OwnerRefresh extends StatelessWidget {
   }
 }
 
+class SalonRevenueDetailsScreen extends StatefulWidget {
+  final String salonId;
+
+  const SalonRevenueDetailsScreen({super.key, required this.salonId});
+
+  @override
+  State<SalonRevenueDetailsScreen> createState() =>
+      _SalonRevenueDetailsScreenState();
+}
+
+class _SalonRevenueDetailsScreenState extends State<SalonRevenueDetailsScreen> {
+  _RevenueRangePreset _preset = _RevenueRangePreset.thisMonth;
+  DateTimeRange? _customRange;
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    final salon = appState.getSalon(widget.salonId);
+    final completedBookings = appState
+        .bookingsForSalon(widget.salonId)
+        .where((booking) => booking.status == BookingStatus.completed)
+        .toList(growable: false);
+    final range = _selectedRange();
+    final rangeBookings = completedBookings
+        .where((booking) => range.contains(_bookingRevenueDate(booking)))
+        .toList(growable: false);
+    final totals = _RevenueTotals.fromBookings(rangeBookings);
+    final weekly = _recentWeeklyRanges()
+        .map(
+          (item) => _RevenuePeriodSummary(
+            label: item.label,
+            totals: _RevenueTotals.fromBookings(
+              completedBookings
+                  .where(
+                    (booking) => item.contains(_bookingRevenueDate(booking)),
+                  )
+                  .toList(growable: false),
+            ),
+          ),
+        )
+        .toList(growable: false);
+    final monthly = _recentMonthlyRanges()
+        .map(
+          (item) => _RevenuePeriodSummary(
+            label: item.label,
+            totals: _RevenueTotals.fromBookings(
+              completedBookings
+                  .where(
+                    (booking) => item.contains(_bookingRevenueDate(booking)),
+                  )
+                  .toList(growable: false),
+            ),
+          ),
+        )
+        .toList(growable: false);
+    final serviceRows = _serviceRevenueRows(appState, rangeBookings);
+    final barberRows = _barberRevenueRows(appState, rangeBookings);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Revenue details')),
+      body: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(18, 14, 18, 28),
+        children: [
+          AppHeroHeader(
+            eyebrow: salon == null
+                ? 'Salon revenue'
+                : 'Revenue at ${salon.displayName}',
+            title: _money(totals.totalEarning),
+            subtitle:
+                '${totals.completedBookings} completed appointments · ${range.label}',
+            icon: Icons.query_stats_outlined,
+          ),
+          const SizedBox(height: 14),
+          _RevenueRangePicker(
+            selected: _preset,
+            rangeLabel: range.label,
+            onSelected: (preset) async {
+              if (preset == _RevenueRangePreset.custom) {
+                await _pickCustomRange();
+                return;
+              }
+              setState(() => _preset = preset);
+            },
+          ),
+          const SizedBox(height: 14),
+          GridView.count(
+            shrinkWrap: true,
+            crossAxisCount: 2,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            childAspectRatio: 1.45,
+            physics: const NeverScrollableScrollPhysics(),
+            children: [
+              _MetricCard(
+                icon: Icons.payments_outlined,
+                label: 'Salon earning',
+                value: _money(totals.totalEarning),
+                color: AppColors.success,
+              ),
+              _MetricCard(
+                icon: Icons.receipt_long_outlined,
+                label: 'Bookings',
+                value: '${totals.completedBookings}',
+                color: AppColors.primary,
+              ),
+              _MetricCard(
+                icon: Icons.point_of_sale_outlined,
+                label: 'Counter collection',
+                value: _money(totals.customerCollection),
+                color: AppColors.goldDeep,
+              ),
+              _MetricCard(
+                icon: Icons.timeline_outlined,
+                label: 'Avg order',
+                value: _money(totals.averageOrderValue),
+                color: AppColors.amber,
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          _SalonEarningBreakdown(
+            serviceValue: totals.serviceValue,
+            customerCollection: totals.customerCollection,
+            pritzeEarning: totals.pritzeContribution,
+            discountSupport: totals.discountSupport,
+            proinReimbursement: totals.proinReimbursement,
+            totalEarning: totals.totalEarning,
+          ),
+          const SizedBox(height: 18),
+          const SectionHeader(title: 'Week by week'),
+          const SizedBox(height: 10),
+          _RevenuePeriodCard(periods: weekly),
+          const SizedBox(height: 18),
+          const SectionHeader(title: 'Month by month'),
+          const SizedBox(height: 10),
+          _RevenuePeriodCard(periods: monthly),
+          const SizedBox(height: 18),
+          const SectionHeader(title: 'Revenue by service'),
+          const SizedBox(height: 10),
+          _RevenueRankedCard(
+            emptyText: 'Completed service revenue will appear here.',
+            rows: serviceRows,
+          ),
+          const SizedBox(height: 18),
+          const SectionHeader(title: 'Revenue by barber'),
+          const SizedBox(height: 10),
+          _RevenueRankedCard(
+            emptyText: 'Completed barber revenue will appear here.',
+            rows: barberRows,
+          ),
+          const SizedBox(height: 18),
+          const SectionHeader(title: 'Discount and Proin impact'),
+          const SizedBox(height: 10),
+          GlassCard(
+            child: Column(
+              children: [
+                _EarningLine(
+                  label: 'Customer discounts',
+                  amount: totals.customerDiscount,
+                  color: AppColors.coral,
+                ),
+                const SizedBox(height: 9),
+                _EarningLine(
+                  label: 'Pritze discount support',
+                  amount: totals.discountSupport,
+                  color: AppColors.success,
+                ),
+                const SizedBox(height: 9),
+                _EarningLine(
+                  label: 'Reward reimbursement',
+                  amount: totals.proinReimbursement,
+                  color: AppColors.success,
+                ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Divider(height: 1),
+                ),
+                _EarningLine(
+                  label: 'Total Pritze contribution',
+                  amount: totals.pritzeContribution,
+                  emphasized: true,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickCustomRange() async {
+    final now = DateTime.now();
+    final initial =
+        _customRange ??
+        DateTimeRange(
+          start: _startOfDay(now.subtract(const Duration(days: 6))),
+          end: _startOfDay(now).add(const Duration(days: 1)),
+        );
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(now.year - 2),
+      lastDate: DateTime(now.year + 1, 12, 31),
+      initialDateRange: DateTimeRange(
+        start: _startOfDay(initial.start),
+        end: _startOfDay(initial.end),
+      ),
+    );
+    if (!mounted || picked == null) {
+      return;
+    }
+    setState(() {
+      _preset = _RevenueRangePreset.custom;
+      _customRange = DateTimeRange(
+        start: _startOfDay(picked.start),
+        end: _startOfDay(picked.end).add(const Duration(days: 1)),
+      );
+    });
+  }
+
+  _RevenueDateRange _selectedRange() {
+    final now = DateTime.now();
+    final today = _startOfDay(now);
+    return switch (_preset) {
+      _RevenueRangePreset.today => _RevenueDateRange(
+        label: 'Today',
+        start: today,
+        end: today.add(const Duration(days: 1)),
+      ),
+      _RevenueRangePreset.thisWeek => _RevenueDateRange(
+        label: 'This week',
+        start: _startOfWeek(now),
+        end: _startOfWeek(now).add(const Duration(days: 7)),
+      ),
+      _RevenueRangePreset.thisMonth => _RevenueDateRange(
+        label: 'This month',
+        start: DateTime(now.year, now.month),
+        end: DateTime(now.year, now.month + 1),
+      ),
+      _RevenueRangePreset.lastMonth => _RevenueDateRange(
+        label: 'Last month',
+        start: DateTime(now.year, now.month - 1),
+        end: DateTime(now.year, now.month),
+      ),
+      _RevenueRangePreset.custom => _customRevenueRange(now),
+    };
+  }
+
+  _RevenueDateRange _customRevenueRange(DateTime now) {
+    final range =
+        _customRange ??
+        DateTimeRange(
+          start: _startOfDay(now.subtract(const Duration(days: 6))),
+          end: _startOfDay(now).add(const Duration(days: 1)),
+        );
+    return _RevenueDateRange(
+      label:
+          '${_shortDate(range.start)} – ${_shortDate(range.end.subtract(const Duration(days: 1)))}',
+      start: range.start,
+      end: range.end,
+    );
+  }
+}
+
 class _OwnerOverview extends StatelessWidget {
   final Salon salon;
 
@@ -218,7 +516,7 @@ class _OwnerOverview extends StatelessWidget {
       children: [
         AppHeroHeader(
           eyebrow: 'Revenue at ${salon.displayName}',
-          title: '₹${appState.totalCollection(salon.id)} total revenue',
+          title: '₹${appState.totalCollection(salon.id)} total earning',
           subtitle:
               '${appState.todayBookingCount(salon.id)} appointments today. Track staff, revenue, and booking status.',
           icon: Icons.insights,
@@ -604,7 +902,15 @@ class _InstantBookingControl extends StatelessWidget {
                         return;
                       }
                       ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Update failed: $error')),
+                        SnackBar(
+                          content: Text(
+                            friendlyErrorMessage(
+                              error,
+                              fallback:
+                                  'Instant booking availability could not be updated. Try again.',
+                            ),
+                          ),
+                        ),
                       );
                     }
                   },
@@ -971,8 +1277,19 @@ class _OwnerBookingCard extends StatelessWidget {
           ),
           _SmallDetail(
             icon: Icons.payments_outlined,
-            label:
-                'Service ₹${booking.resolvedServicePrice(service)} · booking fee ₹${booking.bookingFee}',
+            label: [
+              'Service ₹${booking.resolvedServicePrice(service)}',
+              'customer pays ₹${booking.customerPayableAmount}',
+              if (booking.hasDiscount) 'discount ₹${booking.discountAmount}',
+              if (booking.pritzePayoutAmount > 0)
+                'discount support ₹${booking.pritzePayoutAmount}',
+              if (booking.hasProin)
+                'Proin reimbursement ₹${booking.proinAppliedAmount}',
+              if (booking.hasDiscount || booking.hasProin)
+                'Pritze contribution ₹${booking.totalPritzeContribution}',
+              if (booking.hasDiscount || booking.hasProin)
+                'total ₹${booking.salonTotalEarning}',
+            ].join(' · '),
           ),
           const SizedBox(height: 14),
           if (canRespond ||
@@ -1160,7 +1477,15 @@ class _OwnerBookingCard extends StatelessWidget {
                         if (!dialogContext.mounted) return;
                         setDialogState(() => submitting = false);
                         ScaffoldMessenger.of(pageContext).showSnackBar(
-                          SnackBar(content: Text('Rating failed: $error')),
+                          SnackBar(
+                            content: Text(
+                              friendlyErrorMessage(
+                                error,
+                                fallback:
+                                    'The customer rating could not be saved. Try again.',
+                              ),
+                            ),
+                          ),
                         );
                       }
                     },
@@ -1592,9 +1917,16 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
       }
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Barber save failed: $error')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              friendlyErrorMessage(
+                error,
+                fallback: 'The barber details could not be saved. Try again.',
+              ),
+            ),
+          ),
+        );
         setState(() => _isSaving = false);
       }
     }
@@ -1775,7 +2107,14 @@ class _JoinRequestCardState extends State<_JoinRequestCard> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('${accept ? 'Accept' : 'Reject'} failed: $error'),
+            content: Text(
+              friendlyErrorMessage(
+                error,
+                fallback: accept
+                    ? 'The join request could not be accepted. Try again.'
+                    : 'The join request could not be rejected. Try again.',
+              ),
+            ),
           ),
         );
         setState(() => _isProcessing = false);
@@ -1891,7 +2230,15 @@ class _StaffCard extends StatelessWidget {
                     return;
                   }
                   ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Remove failed: $error')),
+                    SnackBar(
+                      content: Text(
+                        friendlyErrorMessage(
+                          error,
+                          fallback:
+                              'The barber could not be removed. Try again.',
+                        ),
+                      ),
+                    ),
                   );
                 }
               },
@@ -1940,9 +2287,7 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
             role: UserRole.owner,
             onLoggedIn: () {
               Navigator.of(context).pushReplacement(
-                MaterialPageRoute(
-                  builder: (_) => const SalonProfileSetupScreen(),
-                ),
+                MaterialPageRoute(builder: (_) => const SalonDashboardScreen()),
               );
             },
           ),
@@ -1961,6 +2306,7 @@ class _OwnerSetupBanner extends StatelessWidget {
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
     final missingItems = appState.missingSalonSetupItems(salon.id);
+    final opensTeam = _setupActionOpensTeam(missingItems);
 
     return GlassCard(
       color: AppColors.mint,
@@ -1985,15 +2331,12 @@ class _OwnerSetupBanner extends StatelessWidget {
                 ),
               ),
               IconButton(
-                onPressed: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => const SalonProfileSetupScreen(),
-                    ),
-                  );
-                },
+                key: const ValueKey('complete-salon-setup-action'),
+                onPressed: () => _openRemainingSetup(context, missingItems),
                 icon: const Icon(Icons.arrow_forward),
-                tooltip: 'Complete salon setup',
+                tooltip: opensTeam
+                    ? 'Complete team setup'
+                    : 'Complete salon setup',
               ),
             ],
           ),
@@ -2010,6 +2353,41 @@ class _OwnerSetupBanner extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  bool _setupActionOpensTeam(List<String> missingItems) {
+    final normalized = missingItems
+        .map((item) => item.trim().toLowerCase())
+        .toList(growable: false);
+    final hasTeamWork = normalized.any(
+      (item) => item.contains('barber') || item.contains('team'),
+    );
+    final hasProfileWork = normalized.any(
+      (item) =>
+          item.contains('salon name') ||
+          item.contains('owner name') ||
+          item.contains('salon address') ||
+          item.contains('owner phone') ||
+          item.contains('owner email') ||
+          item.contains('opening') ||
+          item.contains('closing') ||
+          item == 'add at least one available service' ||
+          item.contains('save the salon profile'),
+    );
+    return hasTeamWork && !hasProfileWork;
+  }
+
+  void _openRemainingSetup(BuildContext context, List<String> missingItems) {
+    if (_setupActionOpensTeam(missingItems)) {
+      final tabController = DefaultTabController.maybeOf(context);
+      if (tabController != null) {
+        tabController.animateTo(2);
+        return;
+      }
+    }
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const SalonProfileSetupScreen()));
   }
 }
 
@@ -2045,6 +2423,988 @@ class _SetupCheckRow extends StatelessWidget {
     );
   }
 }
+
+class _SalonPromotionCreditCard extends StatefulWidget {
+  final String salonId;
+
+  const _SalonPromotionCreditCard({required this.salonId});
+
+  @override
+  State<_SalonPromotionCreditCard> createState() =>
+      _SalonPromotionCreditCardState();
+}
+
+class _SalonPromotionCreditCardState extends State<_SalonPromotionCreditCard> {
+  final _couponController = TextEditingController();
+  final _couponFocusNode = FocusNode();
+  bool _loading = false;
+  bool _couponSubmitting = false;
+  String _error = '';
+  String _couponMessage = '';
+  bool _couponSuccess = false;
+
+  @override
+  void dispose() {
+    _couponController.dispose();
+    _couponFocusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
+  }
+
+  Future<void> _refresh() async {
+    if (!mounted || _loading) return;
+    setState(() {
+      _loading = true;
+      _error = '';
+    });
+    try {
+      await AppStateScope.read(context).refreshSalonProinWallet(widget.salonId);
+    } catch (_) {
+      if (mounted) {
+        setState(
+          () =>
+              _error = 'Promotional credits could not be refreshed. Try again.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _claimCoupon() async {
+    if (_couponSubmitting) return;
+    final code = _couponController.text.trim();
+    if (code.isEmpty) {
+      _couponFocusNode.requestFocus();
+      setState(() {
+        _couponSuccess = false;
+        _couponMessage = 'Enter a salon coupon code.';
+      });
+      return;
+    }
+    setState(() {
+      _couponSubmitting = true;
+      _couponMessage = '';
+    });
+    try {
+      final result = await AppStateScope.read(
+        context,
+      ).claimSalonProinCoupon(salonId: widget.salonId, code: code);
+      if (!mounted) return;
+      _couponController.clear();
+      FocusManager.instance.primaryFocus?.unfocus();
+      final expiresAt = result.expiresAt;
+      final expiryText = expiresAt == null
+          ? ''
+          : ' Valid until ${_salonProinDate(expiresAt)}.';
+      setState(() {
+        _couponSuccess = true;
+        _couponMessage = result.alreadyClaimed
+            ? 'This coupon was already added to this salon.'
+            : '${result.amountProin} credits added to this salon.$expiryText';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _couponSuccess = false;
+        _couponMessage = friendlyErrorMessage(
+          error,
+          fallback: 'This salon coupon could not be applied. Try again.',
+        );
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _couponSubmitting = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final wallet = AppStateScope.watch(
+      context,
+    ).salonProinWallet(widget.salonId);
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SoftIconBox(
+                icon: Icons.toll_outlined,
+                color: AppColors.amber,
+                size: 42,
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Promotional credits',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Credits for eligible salon campaigns',
+                      style: TextStyle(color: AppColors.muted, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                onPressed: _loading ? null : _refresh,
+                tooltip: 'Refresh promotional credits',
+                icon: _loading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh_rounded),
+              ),
+            ],
+          ),
+          const SizedBox(height: 15),
+          Row(
+            children: [
+              Expanded(
+                child: _SalonProinMetric(
+                  label: 'Balance',
+                  value: '${wallet.availableProin} credits',
+                  valueColor: wallet.availableProin < 0
+                      ? AppColors.coral
+                      : null,
+                ),
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: _SalonProinMetric(
+                  label: 'Can spend',
+                  value: '${wallet.effectiveSpendableProin} credits',
+                  valueColor: AppColors.success,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 9),
+          Row(
+            children: [
+              Expanded(
+                child: _SalonProinMetric(
+                  label: 'Credit line',
+                  value: '${wallet.creditLimitProin} credits',
+                ),
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: _SalonProinMetric(
+                  label: 'Reserved',
+                  value: '${wallet.reservedProin} credits',
+                ),
+              ),
+            ],
+          ),
+          if (wallet.isUsingCreditLine) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(11),
+              decoration: BoxDecoration(
+                color: AppColors.coral.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: AppColors.coral.withValues(alpha: 0.22),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.info_outline_rounded,
+                    color: AppColors.coral,
+                    size: 18,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Using ${wallet.creditLineUsedProin} credits from the salon credit line.',
+                      style: const TextStyle(
+                        color: AppColors.coral,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+            decoration: BoxDecoration(
+              color: AppColors.canvas,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: AppColors.line),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.confirmation_number_outlined,
+                  size: 20,
+                  color: AppColors.goldDeep,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    key: const ValueKey('salon-proin-coupon-field'),
+                    controller: _couponController,
+                    focusNode: _couponFocusNode,
+                    enabled: !_couponSubmitting,
+                    textCapitalization: TextCapitalization.characters,
+                    textInputAction: TextInputAction.done,
+                    maxLength: 20,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.allow(RegExp('[A-Za-z0-9]')),
+                      TextInputFormatter.withFunction((oldValue, newValue) {
+                        return newValue.copyWith(
+                          text: newValue.text.toUpperCase(),
+                          selection: TextSelection.collapsed(
+                            offset: newValue.text.length,
+                          ),
+                        );
+                      }),
+                    ],
+                    decoration: const InputDecoration(
+                      hintText: 'Enter salon coupon code',
+                      border: InputBorder.none,
+                      counterText: '',
+                      isDense: true,
+                    ),
+                    onSubmitted: (_) => _claimCoupon(),
+                  ),
+                ),
+                IconButton(
+                  key: const ValueKey('salon-proin-coupon-apply'),
+                  tooltip: 'Avail salon coupon',
+                  onPressed: _couponSubmitting ? null : _claimCoupon,
+                  icon: _couponSubmitting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.arrow_forward_rounded),
+                ),
+              ],
+            ),
+          ),
+          if (_couponMessage.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              _couponMessage,
+              style: TextStyle(
+                color: _couponSuccess ? AppColors.success : AppColors.coral,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+          if (wallet.expiringLots.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            const Text(
+              'Upcoming expiries',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 7),
+            for (final lot in wallet.expiringLots.take(3))
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.schedule_outlined,
+                      size: 16,
+                      color: AppColors.amber,
+                    ),
+                    const SizedBox(width: 7),
+                    Expanded(
+                      child: Text(
+                        '${lot.amountProin} credits · ${_salonProinSourceLabel(lot.sourceType)}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                    Text(
+                      _salonProinDate(lot.expiresAt),
+                      style: const TextStyle(
+                        color: AppColors.muted,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+          if (_error.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text(
+              _error,
+              style: const TextStyle(color: AppColors.coral, fontSize: 12),
+            ),
+          ],
+          const SizedBox(height: 10),
+          const Text(
+            'Promotional credits fund eligible salon campaigns. If the balance is negative, the salon is using the approved credit line; new spending stops once the limit is reached.',
+            style: TextStyle(
+              color: AppColors.muted,
+              fontSize: 11,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SalonPromotionalCreditsSheet extends StatelessWidget {
+  final String salonId;
+
+  const _SalonPromotionalCreditsSheet({required this.salonId});
+
+  @override
+  Widget build(BuildContext context) {
+    final appState = AppStateScope.watch(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _SalonPromotionCreditCard(salonId: salonId),
+        const SizedBox(height: 14),
+        _SalonEarningBreakdown(
+          serviceValue: appState.totalOriginalServiceValue(salonId),
+          customerCollection: appState.totalCustomerCounterCollection(salonId),
+          pritzeEarning: appState.totalPritzeEarnings(salonId),
+          discountSupport: appState.totalDiscountPritzeEarnings(salonId),
+          proinReimbursement: appState.totalProinReimbursements(salonId),
+          totalEarning: appState.totalCollection(salonId),
+        ),
+      ],
+    );
+  }
+}
+
+class _SalonProinMetric extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color? valueColor;
+
+  const _SalonProinMetric({
+    required this.label,
+    required this.value,
+    this.valueColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.canvas,
+        borderRadius: BorderRadius.circular(13),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(color: AppColors.muted, fontSize: 11),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: TextStyle(
+              color: valueColor,
+              fontSize: 15,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _salonProinDate(DateTime date) =>
+    '${date.day.toString().padLeft(2, '0')}/'
+    '${date.month.toString().padLeft(2, '0')}/${date.year}';
+
+String _salonProinSourceLabel(String value) => switch (value.trim()) {
+  'coupon' => 'Coupon',
+  'referral_salon' => 'Salon referral',
+  'promotion' => 'Promotion',
+  'manual' => 'Support credit',
+  _ => 'Reward',
+};
+
+class _SalonEarningBreakdown extends StatelessWidget {
+  final int serviceValue;
+  final int customerCollection;
+  final int pritzeEarning;
+  final int discountSupport;
+  final int proinReimbursement;
+  final int totalEarning;
+
+  const _SalonEarningBreakdown({
+    required this.serviceValue,
+    required this.customerCollection,
+    required this.pritzeEarning,
+    required this.discountSupport,
+    required this.proinReimbursement,
+    required this.totalEarning,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              SoftIconBox(
+                icon: Icons.account_balance_wallet_outlined,
+                color: AppColors.primary,
+                size: 42,
+              ),
+              SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'Earning breakdown',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _EarningLine(label: 'Service value', amount: serviceValue),
+          const SizedBox(height: 9),
+          _EarningLine(
+            label: 'Collected from customers',
+            amount: customerCollection,
+          ),
+          const SizedBox(height: 9),
+          _EarningLine(
+            label: 'Pritze earning',
+            amount: pritzeEarning,
+            color: AppColors.success,
+          ),
+          if (pritzeEarning > 0) ...[
+            const SizedBox(height: 7),
+            Padding(
+              padding: const EdgeInsets.only(left: 12),
+              child: Column(
+                children: [
+                  _EarningLine(
+                    label: 'Discount support',
+                    amount: discountSupport,
+                    color: AppColors.success,
+                  ),
+                  const SizedBox(height: 7),
+                  _EarningLine(
+                    label: 'Reward reimbursement',
+                    amount: proinReimbursement,
+                    color: AppColors.success,
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Divider(height: 1),
+          ),
+          _EarningLine(
+            label: 'Total salon earning',
+            amount: totalEarning,
+            emphasized: true,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EarningLine extends StatelessWidget {
+  final String label;
+  final int amount;
+  final Color? color;
+  final bool emphasized;
+
+  const _EarningLine({
+    required this.label,
+    required this.amount,
+    this.color,
+    this.emphasized = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            label,
+            style: TextStyle(
+              color: color ?? AppColors.ink,
+              fontWeight: emphasized ? FontWeight.w700 : FontWeight.w500,
+            ),
+          ),
+        ),
+        Text(
+          '₹$amount',
+          style: TextStyle(
+            color: color ?? AppColors.ink,
+            fontSize: emphasized ? 19 : 14,
+            fontWeight: emphasized ? FontWeight.w800 : FontWeight.w700,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+enum _RevenueRangePreset { today, thisWeek, thisMonth, lastMonth, custom }
+
+class _RevenueRangePicker extends StatelessWidget {
+  final _RevenueRangePreset selected;
+  final String rangeLabel;
+  final ValueChanged<_RevenueRangePreset> onSelected;
+
+  const _RevenueRangePicker({
+    required this.selected,
+    required this.rangeLabel,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            rangeLabel,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                for (final preset in _RevenueRangePreset.values) ...[
+                  ChoiceChip(
+                    selected: selected == preset,
+                    label: Text(_revenuePresetLabel(preset)),
+                    onSelected: (_) => onSelected(preset),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RevenueDateRange {
+  final String label;
+  final DateTime start;
+  final DateTime end;
+
+  const _RevenueDateRange({
+    required this.label,
+    required this.start,
+    required this.end,
+  });
+
+  bool contains(DateTime value) =>
+      !value.isBefore(start) && value.isBefore(end);
+}
+
+class _RevenueTotals {
+  final int completedBookings;
+  final int serviceValue;
+  final int customerCollection;
+  final int customerDiscount;
+  final int discountSupport;
+  final int proinReimbursement;
+  final int pritzeContribution;
+  final int totalEarning;
+
+  const _RevenueTotals({
+    required this.completedBookings,
+    required this.serviceValue,
+    required this.customerCollection,
+    required this.customerDiscount,
+    required this.discountSupport,
+    required this.proinReimbursement,
+    required this.pritzeContribution,
+    required this.totalEarning,
+  });
+
+  factory _RevenueTotals.fromBookings(List<Booking> bookings) {
+    return _RevenueTotals(
+      completedBookings: bookings.length,
+      serviceValue: bookings.fold(
+        0,
+        (total, booking) => total + _bookingOriginalValue(booking),
+      ),
+      customerCollection: bookings.fold(
+        0,
+        (total, booking) => total + booking.customerPayableAmount,
+      ),
+      customerDiscount: bookings.fold(
+        0,
+        (total, booking) => total + booking.discountAmount,
+      ),
+      discountSupport: bookings.fold(
+        0,
+        (total, booking) => total + booking.pritzePayoutAmount,
+      ),
+      proinReimbursement: bookings.fold(
+        0,
+        (total, booking) => total + booking.proinRedeemedAmount,
+      ),
+      pritzeContribution: bookings.fold(
+        0,
+        (total, booking) => total + booking.totalPritzeContribution,
+      ),
+      totalEarning: bookings.fold(
+        0,
+        (total, booking) => total + booking.salonTotalEarning,
+      ),
+    );
+  }
+
+  int get averageOrderValue =>
+      completedBookings == 0 ? 0 : (totalEarning / completedBookings).round();
+}
+
+class _RevenuePeriodSummary {
+  final String label;
+  final _RevenueTotals totals;
+
+  const _RevenuePeriodSummary({required this.label, required this.totals});
+}
+
+class _RevenuePeriodCard extends StatelessWidget {
+  final List<_RevenuePeriodSummary> periods;
+
+  const _RevenuePeriodCard({required this.periods});
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      child: Column(
+        children: [
+          for (var index = 0; index < periods.length; index++) ...[
+            _RevenuePeriodRow(summary: periods[index]),
+            if (index != periods.length - 1)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 10),
+                child: Divider(height: 1),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _RevenuePeriodRow extends StatelessWidget {
+  final _RevenuePeriodSummary summary;
+
+  const _RevenuePeriodRow({required this.summary});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                summary.label,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                '${summary.totals.completedBookings} completed · ${_money(summary.totals.customerCollection)} counter',
+                style: const TextStyle(color: AppColors.muted, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+        Text(
+          _money(summary.totals.totalEarning),
+          style: const TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ],
+    );
+  }
+}
+
+class _RevenueRankedRow {
+  final String label;
+  final int amount;
+  final int count;
+
+  const _RevenueRankedRow({
+    required this.label,
+    required this.amount,
+    required this.count,
+  });
+}
+
+class _RevenueRankedCard extends StatelessWidget {
+  final String emptyText;
+  final List<_RevenueRankedRow> rows;
+
+  const _RevenueRankedCard({required this.emptyText, required this.rows});
+
+  @override
+  Widget build(BuildContext context) {
+    if (rows.isEmpty) {
+      return GlassCard(child: Text(emptyText));
+    }
+    final maxAmount = rows
+        .map((row) => row.amount)
+        .fold<int>(0, (max, amount) => amount > max ? amount : max);
+    return GlassCard(
+      child: Column(
+        children: [
+          for (var index = 0; index < rows.take(10).length; index++) ...[
+            _RevenueRankedTile(row: rows[index], maxAmount: maxAmount),
+            if (index != rows.take(10).length - 1)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 10),
+                child: Divider(height: 1),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _RevenueRankedTile extends StatelessWidget {
+  final _RevenueRankedRow row;
+  final int maxAmount;
+
+  const _RevenueRankedTile({required this.row, required this.maxAmount});
+
+  @override
+  Widget build(BuildContext context) {
+    final fraction = maxAmount <= 0 ? 0.0 : row.amount / maxAmount;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                row.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(
+              _money(row.amount),
+              style: const TextStyle(fontWeight: FontWeight.w800),
+            ),
+          ],
+        ),
+        const SizedBox(height: 5),
+        LinearProgressIndicator(
+          value: fraction.clamp(0.0, 1.0),
+          minHeight: 6,
+          borderRadius: BorderRadius.circular(99),
+          backgroundColor: AppColors.canvas,
+          color: AppColors.primary,
+        ),
+        const SizedBox(height: 5),
+        Text(
+          '${row.count} completed',
+          style: const TextStyle(color: AppColors.muted, fontSize: 12),
+        ),
+      ],
+    );
+  }
+}
+
+DateTime _bookingRevenueDate(Booking booking) =>
+    booking.completedAt ?? booking.start;
+
+int _bookingOriginalValue(Booking booking) {
+  final breakdownTotal = booking.servicePriceBreakdown.values.fold<int>(
+    0,
+    (total, price) => total + price,
+  );
+  return breakdownTotal > 0 ? breakdownTotal : booking.servicePrice;
+}
+
+List<_RevenueRankedRow> _serviceRevenueRows(
+  AppState appState,
+  List<Booking> bookings,
+) {
+  final amounts = <String, int>{};
+  final counts = <String, int>{};
+  for (final booking in bookings) {
+    final breakdown = booking.servicePriceBreakdown.isNotEmpty
+        ? booking.servicePriceBreakdown
+        : <String, int>{booking.serviceId: booking.servicePrice};
+    final originalTotal = breakdown.values.fold<int>(
+      0,
+      (total, price) => total + price,
+    );
+    if (originalTotal <= 0 || booking.salonTotalEarning <= 0) {
+      continue;
+    }
+    var assigned = 0;
+    final entries = breakdown.entries.toList(growable: false);
+    for (var index = 0; index < entries.length; index++) {
+      final entry = entries[index];
+      final amount = index == entries.length - 1
+          ? booking.salonTotalEarning - assigned
+          : (booking.salonTotalEarning * entry.value / originalTotal).floor();
+      assigned += amount;
+      final serviceName =
+          appState.getService(booking.salonId, entry.key)?.name ??
+          (entries.length == 1
+              ? booking.resolvedServiceName()
+              : 'Booked service');
+      amounts[serviceName] = (amounts[serviceName] ?? 0) + amount;
+      counts[serviceName] = (counts[serviceName] ?? 0) + 1;
+    }
+  }
+  return amounts.entries
+      .map(
+        (entry) => _RevenueRankedRow(
+          label: entry.key,
+          amount: entry.value,
+          count: counts[entry.key] ?? 0,
+        ),
+      )
+      .toList(growable: false)
+    ..sort((left, right) => right.amount.compareTo(left.amount));
+}
+
+List<_RevenueRankedRow> _barberRevenueRows(
+  AppState appState,
+  List<Booking> bookings,
+) {
+  final amounts = <String, int>{};
+  final counts = <String, int>{};
+  for (final booking in bookings) {
+    if (booking.salonTotalEarning <= 0) {
+      continue;
+    }
+    final barberName = booking.barberId.trim().isEmpty
+        ? 'Any available barber'
+        : appState.getBarber(booking.barberId)?.name ?? 'Former team member';
+    amounts[barberName] =
+        (amounts[barberName] ?? 0) + booking.salonTotalEarning;
+    counts[barberName] = (counts[barberName] ?? 0) + 1;
+  }
+  return amounts.entries
+      .map(
+        (entry) => _RevenueRankedRow(
+          label: entry.key,
+          amount: entry.value,
+          count: counts[entry.key] ?? 0,
+        ),
+      )
+      .toList(growable: false)
+    ..sort((left, right) => right.amount.compareTo(left.amount));
+}
+
+List<_RevenueDateRange> _recentWeeklyRanges() {
+  final currentWeekStart = _startOfWeek(DateTime.now());
+  return List.generate(8, (index) {
+    final start = currentWeekStart.subtract(Duration(days: index * 7));
+    final end = start.add(const Duration(days: 7));
+    return _RevenueDateRange(
+      label: index == 0
+          ? 'This week'
+          : '${_shortDate(start)} – ${_shortDate(end.subtract(const Duration(days: 1)))}',
+      start: start,
+      end: end,
+    );
+  });
+}
+
+List<_RevenueDateRange> _recentMonthlyRanges() {
+  final now = DateTime.now();
+  return List.generate(6, (index) {
+    final start = DateTime(now.year, now.month - index);
+    final end = DateTime(now.year, now.month - index + 1);
+    return _RevenueDateRange(
+      label: index == 0 ? 'This month' : _monthYear(start),
+      start: start,
+      end: end,
+    );
+  });
+}
+
+DateTime _startOfDay(DateTime value) =>
+    DateTime(value.year, value.month, value.day);
+
+DateTime _startOfWeek(DateTime value) {
+  final day = _startOfDay(value);
+  return day.subtract(Duration(days: day.weekday - DateTime.monday));
+}
+
+String _revenuePresetLabel(_RevenueRangePreset preset) => switch (preset) {
+  _RevenueRangePreset.today => 'Today',
+  _RevenueRangePreset.thisWeek => 'This week',
+  _RevenueRangePreset.thisMonth => 'This month',
+  _RevenueRangePreset.lastMonth => 'Last month',
+  _RevenueRangePreset.custom => 'Custom',
+};
+
+String _money(int amount) => '₹$amount';
+
+String _shortDate(DateTime date) => '${date.day} ${_monthName(date.month)}';
+
+String _monthYear(DateTime date) => '${_monthName(date.month)} ${date.year}';
+
+String _monthName(int month) => const [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+][month.clamp(1, 12) - 1];
 
 class _MetricCard extends StatelessWidget {
   final IconData icon;
@@ -2217,17 +3577,10 @@ class _StatusButtonState extends State<_StatusButton> {
                     if (widget.status != BookingStatus.completed) {
                       return;
                     }
-                    final service = appState.getService(
-                      widget.booking.salonId,
-                      widget.booking.serviceId,
-                    );
-                    final price = widget.booking.servicePrice > 0
-                        ? widget.booking.servicePrice
-                        : service?.price ?? 0;
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
                         content: Text(
-                          'Service completed. ₹$price added to revenue.',
+                          'Service completed. ₹${widget.booking.salonTotalEarning} total earning added, including ₹${widget.booking.totalPritzeContribution} from Pritze.',
                         ),
                       ),
                     );
@@ -2239,7 +3592,15 @@ class _StatusButtonState extends State<_StatusButton> {
                     }
                     setState(() => _submitted = false);
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Status update failed: $error')),
+                      SnackBar(
+                        content: Text(
+                          friendlyErrorMessage(
+                            error,
+                            fallback:
+                                'The booking status could not be updated. Try again.',
+                          ),
+                        ),
+                      ),
                     );
                   }),
             );

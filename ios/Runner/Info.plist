@@ -58,6 +58,8 @@
 	<string>Pritze lets salon owners choose photos for their salon profile.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Pritze lets you choose a phone number to fill the sign-in form.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Pritze uses your location only while the app is open when you choose to share your journey to a confirmed salon booking.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

@@ -1,13 +1,14 @@
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../models/app_models.dart';
 import '../../models/service_catalog.dart';
+import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_ui.dart';
+import '../../widgets/app_error_dialog.dart';
 import '../../widgets/service_icon.dart';
 import '../customer/customer_home_screen.dart';
 
@@ -32,6 +33,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
   List<String> _photoUrls = [];
   bool _loaded = false;
   bool _isSaving = false;
+  bool _isImportingServices = false;
   bool _isUploadingPhotos = false;
 
   @override
@@ -40,7 +42,8 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     if (_loaded) {
       return;
     }
-    final salon = AppStateScope.read(context).ownerSalon;
+    final appState = AppStateScope.read(context);
+    final salon = appState.ownerSalon;
     _salonNameController.text = salon.name;
     _ownerNameController.text = salon.ownerName;
     _addressController.text = salon.address;
@@ -52,9 +55,22 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         ? salon.email
         : (ownerContact.contains('@') ? ownerContact : '');
     _photoUrls = [...salon.photoUrls];
-    _openTimeController.text = salon.openTime;
-    _closeTimeController.text = salon.closeTime;
+    _openTimeController.text = formatSalonClockTime(salon.openTime);
+    _closeTimeController.text = formatSalonClockTime(salon.closeTime);
     _loaded = true;
+    if (appState.ownerSalonOrNull == null &&
+        !hasCanonicalSalonServices(salon.services)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        try {
+          await AppStateScope.read(context).addOwnerServicesFromCatalog();
+        } catch (error) {
+          if (mounted) {
+            await showAppErrorDialog(context, friendlyOnboardingError(error));
+          }
+        }
+      });
+    }
   }
 
   @override
@@ -108,6 +124,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
               child: Column(
                 children: [
                   TextFormField(
+                    key: const ValueKey('salon-registration-name-field'),
                     controller: _salonNameController,
                     decoration: const InputDecoration(
                       labelText: 'Salon name',
@@ -117,6 +134,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   ),
                   const SizedBox(height: 12),
                   TextFormField(
+                    key: const ValueKey('salon-registration-owner-field'),
                     controller: _ownerNameController,
                     decoration: const InputDecoration(
                       labelText: 'Owner name',
@@ -126,6 +144,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   ),
                   const SizedBox(height: 12),
                   TextFormField(
+                    key: const ValueKey('salon-registration-address-field'),
                     controller: _addressController,
                     minLines: 2,
                     maxLines: 3,
@@ -240,11 +259,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
               onRemovePhoto: (url) => _removeSalonPhoto(context, url),
             ),
             const SizedBox(height: 24),
-            SectionHeader(
-              title: 'Service menu',
-              actionLabel: 'Add custom',
-              onAction: () => _showAddServiceDialog(context),
-            ),
+            SectionHeader(title: 'Service menu'),
             const SizedBox(height: 10),
             GlassCard(
               color: AppColors.champagne.withAlpha(70),
@@ -254,7 +269,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
-                      'Choose and import only the service categories offered by this shop.',
+                      'Every salon uses the same 30-service Pritze menu. You can set each price, duration and availability.',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: AppColors.ink,
                         fontWeight: FontWeight.w600,
@@ -263,14 +278,17 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   ),
                   const SizedBox(width: 10),
                   FilledButton(
-                    onPressed: _isSaving
+                    key: const ValueKey('salon-import-services-button'),
+                    onPressed: _isSaving || _isImportingServices
                         ? null
                         : () => _showServiceImportSheet(context),
                     style: FilledButton.styleFrom(
                       minimumSize: const Size(0, 48),
                       padding: const EdgeInsets.symmetric(horizontal: 16),
                     ),
-                    child: const Text('Import'),
+                    child: Text(
+                      _isImportingServices ? 'Restoring...' : 'View all 30',
+                    ),
                   ),
                 ],
               ),
@@ -297,15 +315,12 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     );
   }
 
-  Future<void> _addMasterServices(
-    BuildContext context,
-    Set<String> categories,
-  ) async {
-    setState(() => _isSaving = true);
+  Future<void> _addMasterServices(BuildContext context) async {
+    setState(() => _isImportingServices = true);
     try {
       final added = await AppStateScope.read(
         context,
-      ).addOwnerServicesFromCatalog(categories: categories);
+      ).addOwnerServicesFromCatalog();
       if (!context.mounted) {
         return;
       }
@@ -322,83 +337,68 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Import failed: $error')));
+      await showAppErrorDialog(context, friendlyOnboardingError(error));
     } finally {
       if (mounted) {
-        setState(() => _isSaving = false);
+        setState(() => _isImportingServices = false);
       }
     }
   }
 
   Future<void> _showServiceImportSheet(BuildContext context) async {
-    final selected = <String>{};
     final confirmed = await showModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       builder: (sheetContext) {
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            return FractionallySizedBox(
-              heightFactor: 0.82,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Import service categories',
-                      style: Theme.of(context).textTheme.headlineSmall,
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      'Choose only the service types this shop actually offers.',
-                      style: Theme.of(context).textTheme.bodyMedium,
-                    ),
-                    const SizedBox(height: 12),
-                    Expanded(
-                      child: ListView(
-                        children: [
-                          for (final category in serviceCategoryLabels)
-                            CheckboxListTile(
-                              value: selected.contains(category),
-                              title: Text(category),
-                              controlAffinity: ListTileControlAffinity.leading,
-                              onChanged: (checked) {
-                                setSheetState(() {
-                                  if (checked == true) {
-                                    selected.add(category);
-                                  } else {
-                                    selected.remove(category);
-                                  }
-                                });
-                              },
-                            ),
-                        ],
-                      ),
-                    ),
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        onPressed: selected.isEmpty
-                            ? null
-                            : () => Navigator.pop(sheetContext, true),
-                        icon: const Icon(Icons.download_done),
-                        label: Text('Import ${selected.length} categories'),
-                      ),
-                    ),
-                  ],
+        return FractionallySizedBox(
+          heightFactor: 0.82,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Standard service menu',
+                  style: Theme.of(context).textTheme.headlineSmall,
                 ),
-              ),
-            );
-          },
+                const SizedBox(height: 6),
+                Text(
+                  'These exact 30 services are used by every salon. Adjust price, duration and availability after closing this list.',
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: ListView(
+                    children: [
+                      for (final service in serviceCatalog)
+                        ListTile(
+                          leading: const Icon(Icons.check_circle_outline),
+                          title: Text(service.name),
+                          subtitle: Text(
+                            '${service.category} · ₹${service.price} · ${service.durationMinutes} min',
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    key: const ValueKey('salon-confirm-import-services-button'),
+                    onPressed: () => Navigator.pop(sheetContext, true),
+                    icon: const Icon(Icons.download_done),
+                    label: const Text('Use this 30-service menu'),
+                  ),
+                ),
+              ],
+            ),
+          ),
         );
       },
     );
     if (confirmed == true && context.mounted) {
-      await _addMasterServices(context, selected);
+      await _addMasterServices(context);
     }
   }
 
@@ -484,7 +484,10 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     if (selected == null || !mounted) {
       return;
     }
-    setState(() => controller.text = selected.format(context));
+    final minute = selected.minute.toString().padLeft(2, '0');
+    setState(
+      () => controller.text = formatSalonClockTime('${selected.hour}:$minute'),
+    );
   }
 
   TimeOfDay? _timeOfDay(String value) {
@@ -551,9 +554,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_saveError(error))));
+      await showAppErrorDialog(context, friendlyOnboardingError(error));
     } finally {
       if (mounted) {
         setState(() => _isSaving = false);
@@ -622,9 +623,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Photo upload failed: $error')));
+      await showAppErrorDialog(context, friendlyOnboardingError(error));
     } finally {
       if (mounted) {
         setState(() => _isUploadingPhotos = false);
@@ -649,9 +648,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Could not remove photo: $error')));
+      await showAppErrorDialog(context, friendlyOnboardingError(error));
     } finally {
       if (mounted) {
         setState(() => _isUploadingPhotos = false);
@@ -671,166 +668,6 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       return 'Paste a complete link beginning with https://';
     }
     return null;
-  }
-
-  String _saveError(Object error) {
-    if (error is FirebaseFunctionsException &&
-        error.message?.trim().isNotEmpty == true) {
-      return error.message!.trim();
-    }
-    final message = error.toString().replaceFirst(
-      RegExp(r'^(StateError|FormatException|Invalid argument)\s*:\s*'),
-      '',
-    );
-    return message.isEmpty ? 'Could not save the salon profile.' : message;
-  }
-
-  void _showAddServiceDialog(BuildContext context) {
-    final nameController = TextEditingController();
-    final priceController = TextEditingController();
-    final durationController = TextEditingController(text: '30');
-    var category = 'Hair';
-    var isAvailable = true;
-    var instantBookingEnabled = true;
-    var isSaving = false;
-    const categories = serviceCategoryLabels;
-
-    showDialog<void>(
-      context: context,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: const Text('Add service'),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: nameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Service name',
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    DropdownButtonFormField<String>(
-                      initialValue: category,
-                      decoration: const InputDecoration(
-                        labelText: 'Service type',
-                      ),
-                      items: [
-                        for (final item in categories)
-                          DropdownMenuItem(value: item, child: Text(item)),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          setDialogState(() => category = value);
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: priceController,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(labelText: 'Price (₹)'),
-                    ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: durationController,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: 'Duration minutes',
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('Available to customers'),
-                      subtitle: const Text(
-                        'Show this service and allow scheduled bookings.',
-                      ),
-                      value: isAvailable,
-                      onChanged: (value) {
-                        setDialogState(() => isAvailable = value);
-                      },
-                    ),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('Allow instant booking'),
-                      subtitle: const Text(
-                        'Customers can request this service immediately.',
-                      ),
-                      value: instantBookingEnabled,
-                      onChanged: isAvailable
-                          ? (value) {
-                              setDialogState(
-                                () => instantBookingEnabled = value,
-                              );
-                            }
-                          : null,
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: isSaving
-                      ? null
-                      : () async {
-                          final price = int.tryParse(priceController.text) ?? 0;
-                          final duration =
-                              int.tryParse(durationController.text) ?? 30;
-                          if (nameController.text.trim().isEmpty ||
-                              price <= 0 ||
-                              duration <= 0) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text(
-                                  'Enter a service name, price, and duration greater than zero.',
-                                ),
-                              ),
-                            );
-                            return;
-                          }
-                          setDialogState(() => isSaving = true);
-                          try {
-                            await AppStateScope.read(context).addOwnerService(
-                              name: nameController.text,
-                              category: category,
-                              price: price,
-                              durationMinutes: duration,
-                              isAvailable: isAvailable,
-                              instantBookingEnabled: instantBookingEnabled,
-                            );
-                            if (context.mounted) {
-                              Navigator.pop(context);
-                            }
-                          } catch (error) {
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text('Service save failed: $error'),
-                                ),
-                              );
-                            }
-                          } finally {
-                            if (context.mounted) {
-                              setDialogState(() => isSaving = false);
-                            }
-                          }
-                        },
-                  child: Text(isSaving ? 'Saving...' : 'Add'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
   }
 }
 
@@ -1071,6 +908,7 @@ class _ServiceCardState extends State<_ServiceCard> {
         children: [
           ServiceImageIcon(
             category: service.category,
+            serviceName: service.name,
             color: serviceColorForCategory(service.category),
             size: 46,
           ),
@@ -1201,8 +1039,6 @@ class _ServiceCardState extends State<_ServiceCard> {
                   );
                 case 'edit':
                   _showEditServiceDialog(context);
-                case 'remove':
-                  _removeService(context);
               }
             },
             itemBuilder: (context) => [
@@ -1240,14 +1076,6 @@ class _ServiceCardState extends State<_ServiceCard> {
                 child: ListTile(
                   leading: Icon(Icons.edit_outlined),
                   title: Text('Edit service'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              PopupMenuItem(
-                value: 'remove',
-                child: ListTile(
-                  leading: Icon(Icons.delete_outline),
-                  title: Text('Remove service'),
                   contentPadding: EdgeInsets.zero,
                 ),
               ),
@@ -1299,9 +1127,7 @@ class _ServiceCardState extends State<_ServiceCard> {
       }
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Price update failed: $error')));
+        await showAppErrorDialog(context, friendlyOnboardingError(error));
       }
     } finally {
       if (mounted) {
@@ -1329,22 +1155,7 @@ class _ServiceCardState extends State<_ServiceCard> {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Update failed: $error')));
-    }
-  }
-
-  Future<void> _removeService(BuildContext context) async {
-    try {
-      await AppStateScope.read(context).removeOwnerService(service.id);
-    } catch (error) {
-      if (!context.mounted) {
-        return;
-      }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Remove failed: $error')));
+      await showAppErrorDialog(context, friendlyOnboardingError(error));
     }
   }
 
@@ -1354,7 +1165,7 @@ class _ServiceCardState extends State<_ServiceCard> {
     final durationController = TextEditingController(
       text: '${service.durationMinutes}',
     );
-    var category = service.category;
+    final category = service.category;
     var isAvailable = service.isAvailable;
     var instantBookingEnabled = service.instantBookingEnabled;
     var isSaving = false;
@@ -1372,27 +1183,19 @@ class _ServiceCardState extends State<_ServiceCard> {
                   children: [
                     TextField(
                       controller: nameController,
+                      readOnly: true,
                       decoration: const InputDecoration(
                         labelText: 'Service name',
+                        helperText: 'Names follow the standard Pritze menu.',
                       ),
                     ),
                     const SizedBox(height: 10),
-                    DropdownButtonFormField<String>(
-                      initialValue: serviceCategoryLabels.contains(category)
-                          ? category
-                          : serviceCategoryLabels.first,
+                    TextFormField(
+                      initialValue: category,
+                      readOnly: true,
                       decoration: const InputDecoration(
                         labelText: 'Service type',
                       ),
-                      items: [
-                        for (final item in serviceCategoryLabels)
-                          DropdownMenuItem(value: item, child: Text(item)),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          setDialogState(() => category = value);
-                        }
-                      },
                     ),
                     const SizedBox(height: 10),
                     TextField(
@@ -1480,12 +1283,9 @@ class _ServiceCardState extends State<_ServiceCard> {
                             }
                           } catch (error) {
                             if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(
-                                  content: Text(
-                                    'Service update failed: $error',
-                                  ),
-                                ),
+                              await showAppErrorDialog(
+                                context,
+                                friendlyOnboardingError(error),
                               );
                             }
                           } finally {

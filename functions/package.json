@@ -6,11 +6,17 @@
     "node": "22"
   },
   "scripts": {
-    "test": "node --test"
+    "admin:provision-password-users": "node scripts/provision_admin_password_users.js",
+    "test": "node --test",
+    "test:firestore": "firebase emulators:exec --config ../firebase.json --project demo-pritze-rules --only firestore \"node --test firestore_rules.integration.test.js proin_backend.integration.test.js\""
   },
   "dependencies": {
     "firebase-admin": "^12.7.0",
     "firebase-functions": "^6.4.0",
+    "google-auth-library": "^10.9.1",
     "nodemailer": "^6.9.16"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.2"
   }
 }

@@ -43,8 +43,46 @@ service cloud.firestore {
         request.resource.data.closeTime is string &&
         request.resource.data.closeTime.size() > 0 &&
         request.resource.data.isOpen is bool &&
-        request.resource.data.services is list &&
+        hasCanonicalSalonServiceMenu() &&
         hasRequiredSalonContact();
+    }
+
+    // Every salon uses one fixed service catalogue. Salon owners may change a
+    // service's price, duration, availability and instant-booking setting, but
+    // may not add, rename, reorder or remove catalogue entries.
+    function hasCanonicalSalonServiceMenu() {
+      let services = request.resource.data.services;
+      return services is list && services.size() == 30 &&
+        services[0].name == 'Haircut Men' &&
+        services[1].name == 'Haircut Women' &&
+        services[2].name == 'Hair Wash Men' &&
+        services[3].name == 'Hair wash Women' &&
+        services[4].name == 'Haircut + Hair Wash' &&
+        services[5].name == 'Blow Dry / Hair Styling' &&
+        services[6].name == 'Hair Spa' &&
+        services[7].name == 'Hair Colour' &&
+        services[8].name == 'Root Touch-up' &&
+        services[9].name == 'Keratin / Smoothening' &&
+        services[10].name == 'Head Massage' &&
+        services[11].name == 'Facial' &&
+        services[12].name == 'Face Cleanup' &&
+        services[13].name == 'D-Tan' &&
+        services[14].name == 'Bleach' &&
+        services[15].name == 'Beard Trim' &&
+        services[16].name == 'Shave' &&
+        services[17].name == 'Beard Styling' &&
+        services[18].name == 'Haircut + Beard' &&
+        services[19].name == 'Beard Colour' &&
+        services[20].name == 'Eyebrow Threading' &&
+        services[21].name == 'Upper Lip Threading' &&
+        services[22].name == 'Full Face Threading' &&
+        services[23].name == 'Full Arms Waxing' &&
+        services[24].name == 'Full Legs Waxing' &&
+        services[25].name == 'Underarms Waxing' &&
+        services[26].name == 'Full Body Waxing' &&
+        services[27].name == 'Manicure' &&
+        services[28].name == 'Pedicure' &&
+        services[29].name == 'Party / Bridal Makeup.';
     }
 
     function updatesOnlyOwnProfileFields() {
@@ -72,6 +110,215 @@ service cloud.firestore {
     }
 
     match /loginIdentifiers/{identifierId} {
+      allow read, write: if false;
+    }
+
+    // Control Center credentials, lockouts and authentication evidence are
+    // server-only. The website signs in through a callable and never reads a
+    // password hash or administrator allow-list from the browser.
+    match /platformAdmins/{adminUid} {
+      allow read, write: if false;
+    }
+
+    match /platformAdminCredentials/{credentialId} {
+      allow read, write: if false;
+    }
+
+    match /adminPasswordAttemptBuckets/{attemptId} {
+      allow read, write: if false;
+    }
+
+    match /adminAuthenticationEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    match /adminEmailOtps/{emailId} {
+      allow read, write: if false;
+    }
+
+    match /referralCodes/{referralCode} {
+      allow read, write: if false;
+    }
+
+    match /referrals/{referredUserId} {
+      allow read, write: if false;
+    }
+
+    match /referralStats/{userId} {
+      allow read, write: if false;
+    }
+
+    match /referralAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    // Proin is a server-managed promotional reward ledger. Mobile and browser
+    // clients cannot alter programs, balances, lots, reservations, finance
+    // totals, idempotency records, or reconciliation evidence directly.
+    match /proinPrograms/{programId} {
+      allow read, write: if false;
+    }
+
+    match /proinProgramVersions/{versionId} {
+      allow read, write: if false;
+    }
+
+    match /proinWallets/{walletId} {
+      allow read, write: if false;
+    }
+
+    match /proinLots/{lotId} {
+      allow read, write: if false;
+    }
+
+    match /proinLedger/{transactionId} {
+      allow read, write: if false;
+    }
+
+    match /proinReservations/{reservationId} {
+      allow read, write: if false;
+    }
+
+    match /discountSalonPromotionCreditReservations/{reservationId} {
+      allow read, write: if false;
+    }
+
+    match /proinProgramUsage/{programId} {
+      allow read, write: if false;
+    }
+
+    match /proinProgramAccountUsage/{usageId} {
+      allow read, write: if false;
+    }
+
+    match /salonPromotionCreditUsage/{walletId} {
+      allow read, write: if false;
+    }
+
+    match /proinFinance/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /proinIdempotencyKeys/{keyId} {
+      allow read, write: if false;
+    }
+
+    match /proinReconciliationReports/{reportId} {
+      allow read, write: if false;
+    }
+
+    match /proinCoupons/{couponHash} {
+      allow read, write: if false;
+    }
+
+    match /proinCouponVersions/{versionId} {
+      allow read, write: if false;
+    }
+
+    match /proinCouponUsage/{couponHash} {
+      allow read, write: if false;
+    }
+
+    match /proinCouponClaims/{claimId} {
+      allow read, write: if false;
+    }
+
+    match /proinCouponAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    match /checkoutCouponAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    match /voucherCodeRegistry/{codeHash} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /proinQuoteAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    match /proinSalonReimbursements/{bookingId} {
+      allow read, write: if false;
+    }
+
+    match /proinSettlementPaymentReferences/{referenceHash} {
+      allow read, write: if false;
+    }
+
+    // Discount campaign budgets, burn ledgers, vault balances, and settlement
+    // records are financial data. They are exposed only through trusted
+    // callable functions and immutable booking snapshots.
+    match /discountCampaigns/{campaignId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /discountCampaignVersions/{versionId} {
+      allow read, write: if false;
+    }
+
+    match /discountCampaignUsage/{campaignId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /discountSalonUsage/{usageId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /discountCustomerUsage/{usageId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /discountQuotes/{quoteId} {
+      allow read, write: if false;
+    }
+
+    match /discountQuoteAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    match /discountOfferAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    match /discountCustomerTotals/{customerId} {
+      allow read, write: if false;
+    }
+
+    match /discountSalonTotals/{salonId} {
+      allow read, write: if false;
+    }
+
+    match /discountPlatformTotals/{documentId} {
+      allow read, write: if false;
+    }
+
+    match /customerSalonStats/{statId} {
+      allow read, write: if false;
+    }
+
+    match /platformFinance/{documentId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /salonWallets/{salonId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /salonSettlements/{bookingId} {
+      allow read: if false;
+      allow write: if false;
+    }
+
+    match /settlementPaymentReferences/{referenceId} {
       allow read, write: if false;
     }
 
@@ -125,6 +372,12 @@ service cloud.firestore {
         (resource.data.customerUid == request.auth.uid ||
          resource.data.ownerUid == request.auth.uid);
       allow write: if false;
+    }
+
+    // Phase 4 arrival location is callable-only. Customers, salons and admins
+    // receive a purpose-limited view through trusted Cloud Functions.
+    match /bookingArrivalSessions/{bookingId} {
+      allow read, write: if false;
     }
 
     match /salonFeedback/{bookingId} {

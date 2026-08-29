@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/services.dart';
 
 import '../../models/app_models.dart';
 import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/app_error_dialog.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/auth_login_panel.dart';
 import '../../widgets/booking_status_timeline.dart';
@@ -39,11 +41,130 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   bool _isBooking = false;
   bool _isInstantBooking = false;
   int _instantArrivalMinutes = 15;
+  String _discountQuoteKey = '';
+  Future<DiscountQuote>? _discountQuoteFuture;
+  String _proinQuoteKey = '';
+  Future<ProinBookingQuote>? _proinQuoteFuture;
+  String _proinWalletKey = '';
+  Future<ProinWalletSummary>? _proinWalletFuture;
+  String _visibleDiscountOffersKey = '';
+  Future<List<CheckoutDiscountOffer>>? _visibleDiscountOffersFuture;
+  bool _useProin = false;
+  final TextEditingController _couponController = TextEditingController();
+  bool _isApplyingCoupon = false;
+  String _applyingVisibleCampaignId = '';
+  String _appliedVisibleCampaignId = '';
+  String _couponMessage = '';
+  bool _couponApplied = false;
+
+  bool get _priceSelectionPending =>
+      _isApplyingCoupon || _applyingVisibleCampaignId.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
     _selectedBarberId = widget.initialBarberId;
+  }
+
+  @override
+  void dispose() {
+    _couponController.dispose();
+    super.dispose();
+  }
+
+  String _discountKey(
+    AppState appState,
+    String salonId,
+    Iterable<String> serviceIds,
+  ) {
+    final ids = serviceIds.toSet().toList()..sort();
+    return '${appState.customerAccount?.id ?? 'guest'}|$salonId|${ids.join(',')}';
+  }
+
+  Future<DiscountQuote> _discountQuote(
+    AppState appState,
+    String salonId,
+    Iterable<String> serviceIds,
+  ) {
+    final ids = serviceIds.toSet().toList()..sort();
+    final key = _discountKey(appState, salonId, ids);
+    if (_discountQuoteFuture == null || _discountQuoteKey != key) {
+      final originalAmount = ids.fold<int>(
+        0,
+        (total, id) => total + (appState.getService(salonId, id)?.price ?? 0),
+      );
+      _discountQuoteKey = key;
+      _discountQuoteFuture = Future.value(
+        DiscountQuote(originalAmount: originalAmount),
+      );
+    }
+    return _discountQuoteFuture!;
+  }
+
+  Future<ProinBookingQuote> _proinQuote(
+    AppState appState,
+    String salonId,
+    Iterable<String> serviceIds,
+    Future<DiscountQuote> discountFuture,
+  ) {
+    final ids = serviceIds.toSet().toList()..sort();
+    final key =
+        '${appState.customerAccount?.id ?? 'guest'}|$salonId|${ids.join(',')}';
+    if (_proinQuoteFuture == null || _proinQuoteKey != key) {
+      _proinQuoteKey = key;
+      _proinQuoteFuture = discountFuture.then(
+        (discount) => appState.getProinBookingQuote(
+          salonId: salonId,
+          serviceIds: ids,
+          discountQuote: discount,
+        ),
+      );
+    }
+    return _proinQuoteFuture!;
+  }
+
+  Future<ProinWalletSummary> _customerProinWallet(AppState appState) {
+    final key = appState.customerAccount?.id ?? 'guest';
+    if (_proinWalletFuture == null || _proinWalletKey != key) {
+      _proinWalletKey = key;
+      _proinWalletFuture = appState.refreshCustomerProinWallet();
+    }
+    return _proinWalletFuture!;
+  }
+
+  Future<List<CheckoutDiscountOffer>> _visibleDiscountOffers(
+    AppState appState,
+    String salonId,
+    Iterable<String> serviceIds,
+  ) {
+    final ids = serviceIds.toSet().toList()..sort();
+    final key = _discountKey(appState, salonId, ids);
+    if (_visibleDiscountOffersFuture == null ||
+        _visibleDiscountOffersKey != key) {
+      _visibleDiscountOffersKey = key;
+      _visibleDiscountOffersFuture = appState.listCheckoutDiscountOffers(
+        salonId: salonId,
+        serviceIds: ids,
+      );
+    }
+    return _visibleDiscountOffersFuture!;
+  }
+
+  void _retryVisibleDiscountOffers() {
+    setState(() {
+      _visibleDiscountOffersKey = '';
+      _visibleDiscountOffersFuture = null;
+    });
+  }
+
+  void _setUseProin(bool value) {
+    setState(() {
+      _useProin = value;
+      if (value) {
+        _proinQuoteFuture = null;
+        _proinQuoteKey = '';
+      }
+    });
   }
 
   @override
@@ -126,6 +247,15 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
         .where((slot) => slot.key == _selectedSlotKey)
         .firstOrNull;
     const accent = AppColors.primary;
+    final pricingServiceIds = isInstantOnly
+        ? requestedInstantIds
+        : <String>[service.id];
+    final discountFuture = appState.customerAccount == null
+        ? null
+        : _discountQuote(appState, salon.id, pricingServiceIds);
+    final walletFuture = appState.customerAccount == null || isRescheduling
+        ? null
+        : _customerProinWallet(appState);
 
     return Scaffold(
       appBar: AppBar(
@@ -158,7 +288,10 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                 minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
                 child: FilledButton.icon(
                   onPressed:
-                      selectedSlot == null || _isBooking || blockingBooking
+                      selectedSlot == null ||
+                          _isBooking ||
+                          blockingBooking ||
+                          _priceSelectionPending
                       ? null
                       : () => _startBookingLogin(context, selectedSlot),
                   icon: _isBooking
@@ -175,7 +308,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                         ? 'Cancel current booking first'
                         : isRescheduling
                         ? 'Confirm new time'
-                        : 'Book for ₹0',
+                        : 'Confirm appointment',
                   ),
                   style: FilledButton.styleFrom(
                     backgroundColor: accent,
@@ -194,10 +327,124 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
             accent: accent,
             showBookingFee: false,
           ),
+          const SizedBox(height: 12),
+          if (!appState.hasActiveCustomerSession)
+            const _SignInForOfferCard()
+          else
+            FutureBuilder<DiscountQuote>(
+              future: discountFuture,
+              builder: (context, discountSnapshot) {
+                if (discountSnapshot.hasError) {
+                  return _PricingErrorCard(
+                    onRetry: _clearPricingQuotes,
+                    message: _bookingErrorText(discountSnapshot.error!),
+                  );
+                }
+                final discount = discountSnapshot.data;
+                final discountLoading =
+                    discountSnapshot.connectionState != ConnectionState.done;
+                if (isRescheduling || discount == null) {
+                  return _DiscountQuoteCard(
+                    originalAmount: service.price,
+                    quote: discount,
+                    loading: discountLoading,
+                  );
+                }
+                return FutureBuilder<ProinWalletSummary>(
+                  future: walletFuture,
+                  builder: (context, walletSnapshot) {
+                    final walletError = walletSnapshot.hasError
+                        ? _bookingErrorText(walletSnapshot.error!)
+                        : '';
+                    final wallet =
+                        walletSnapshot.data ?? appState.customerProinWallet;
+                    final walletLoading =
+                        walletSnapshot.connectionState !=
+                            ConnectionState.done &&
+                        wallet.availableProin <= 0;
+                    final canToggleProin =
+                        wallet.availableProin > 0 && walletError.isEmpty;
+                    if (!_useProin || !canToggleProin) {
+                      final useProin = false;
+                      return Column(
+                        children: [
+                          _DiscountQuoteCard(
+                            originalAmount: service.price,
+                            quote: discount,
+                            loading: discountLoading,
+                            useProin: useProin,
+                          ),
+                          const SizedBox(height: 10),
+                          _ProinRedemptionCard(
+                            wallet: wallet,
+                            quote: null,
+                            loading: walletLoading,
+                            quoteLoading: false,
+                            error: walletError,
+                            selected: false,
+                            onChanged: canToggleProin ? _setUseProin : null,
+                          ),
+                        ],
+                      );
+                    }
+                    return FutureBuilder<ProinBookingQuote>(
+                      future: _proinQuote(
+                        appState,
+                        salon.id,
+                        pricingServiceIds,
+                        discountFuture!,
+                      ),
+                      builder: (context, proinSnapshot) {
+                        final proin = proinSnapshot.data;
+                        final proinError = proinSnapshot.hasError
+                            ? _bookingErrorText(proinSnapshot.error!)
+                            : '';
+                        final useProin =
+                            _useProin &&
+                            proinError.isEmpty &&
+                            proin?.canUseProin == true;
+                        return Column(
+                          children: [
+                            _DiscountQuoteCard(
+                              originalAmount: service.price,
+                              quote: discount,
+                              loading: discountLoading,
+                              proinQuote: proin,
+                              useProin: useProin,
+                            ),
+                            const SizedBox(height: 10),
+                            _ProinRedemptionCard(
+                              wallet: wallet,
+                              quote: proin,
+                              loading: walletLoading,
+                              quoteLoading:
+                                  proinSnapshot.connectionState !=
+                                  ConnectionState.done,
+                              error: proinError,
+                              selected: _useProin && proinError.isEmpty,
+                              onChanged: canToggleProin ? _setUseProin : null,
+                            ),
+                          ],
+                        );
+                      },
+                    );
+                  },
+                );
+              },
+            ),
+          if (!isRescheduling) ...[
+            const SizedBox(height: 10),
+            _buildCheckoutDiscountControls(
+              context,
+              appState,
+              salon.id,
+              pricingServiceIds,
+            ),
+          ],
           const SizedBox(height: 14),
           if (isInstantOnly) ...[
             _InstantBookingCard(
-              enabled: canRequestInstant,
+              enabled: canRequestInstant && !_priceSelectionPending,
               isLoading: _isInstantBooking,
               selectedArrivalMinutes: _instantArrivalMinutes,
               activeBooking: activeCustomerBooking,
@@ -205,25 +452,6 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                 setState(() => _instantArrivalMinutes = minutes);
               },
               onRequest: () => _startInstantBookingLogin(context),
-            ),
-            const SizedBox(height: 14),
-            GlassCard(
-              color: accent.withAlpha(12),
-              child: Row(
-                children: [
-                  SoftIconBox(
-                    icon: Icons.people_alt_outlined,
-                    color: accent,
-                    size: 42,
-                  ),
-                  const SizedBox(width: 12),
-                  const Expanded(
-                    child: Text(
-                      'No barber selection is needed. The salon will assign any available barber after accepting your request.',
-                    ),
-                  ),
-                ],
-              ),
             ),
           ] else ...[
             if (selectedBarber == null) ...[
@@ -317,8 +545,70 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     );
   }
 
+  Widget _buildCheckoutDiscountControls(
+    BuildContext context,
+    AppState appState,
+    String salonId,
+    List<String> serviceIds,
+  ) {
+    return Column(
+      children: [
+        if (appState.customerAccount != null)
+          FutureBuilder<List<CheckoutDiscountOffer>>(
+            future: _visibleDiscountOffers(appState, salonId, serviceIds),
+            builder: (context, offerSnapshot) {
+              if (offerSnapshot.connectionState != ConnectionState.done &&
+                  !offerSnapshot.hasData) {
+                return const Padding(
+                  padding: EdgeInsets.only(bottom: 10),
+                  child: _CheckoutOffersLoadingCard(),
+                );
+              }
+              if (offerSnapshot.hasError) {
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: _CheckoutOfferLoadErrorCard(
+                    message: friendlyErrorMessage(
+                      offerSnapshot.error,
+                      fallback: 'Offers could not be loaded. Try again.',
+                    ),
+                    onRetry: _retryVisibleDiscountOffers,
+                  ),
+                );
+              }
+              final offers =
+                  offerSnapshot.data ?? const <CheckoutDiscountOffer>[];
+              if (offers.isEmpty) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _CheckoutVisibleOffersCard(
+                  offers: offers,
+                  applyingCampaignId: _applyingVisibleCampaignId,
+                  appliedCampaignId: _appliedVisibleCampaignId,
+                  onApply: (offer) => _applyVisibleCheckoutDiscount(
+                    context,
+                    salonId,
+                    serviceIds,
+                    offer,
+                  ),
+                ),
+              );
+            },
+          ),
+        _CheckoutCouponCard(
+          controller: _couponController,
+          applying: _isApplyingCoupon,
+          applied: _couponApplied,
+          message: _couponMessage,
+          onApply: () => _applyCheckoutCoupon(context, salonId, serviceIds),
+          onRemove: _removeCheckoutCoupon,
+        ),
+      ],
+    );
+  }
+
   Future<void> _startBookingLogin(BuildContext context, TimeSlot slot) async {
-    if (_isBooking) {
+    if (_isBooking || _priceSelectionPending) {
       return;
     }
     final appState = AppStateScope.read(context);
@@ -334,20 +624,37 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   }
 
   Future<void> _completeBooking(BuildContext context, TimeSlot slot) async {
-    if (_isBooking) {
+    if (_isBooking || _priceSelectionPending) {
       return;
     }
     setState(() => _isBooking = true);
     final appState = AppStateScope.read(context);
     late final Booking booking;
     try {
-      booking = widget.rescheduleBookingId == null
-          ? await appState.createBooking(slot: slot)
-          : await appState.rescheduleBooking(
-              widget.rescheduleBookingId!,
-              slot: slot,
-            );
+      if (widget.rescheduleBookingId == null) {
+        final quote = await _discountQuote(appState, widget.salonId, [
+          slot.serviceId,
+        ]);
+        var requestedProin = 0;
+        if (_useProin) {
+          final proinQuote = await _proinQuote(appState, widget.salonId, [
+            slot.serviceId,
+          ], Future.value(quote));
+          requestedProin = proinQuote.maximumRedeemableProin;
+        }
+        booking = await appState.createBooking(
+          slot: slot,
+          quoteId: quote.quoteId,
+          requestedProin: requestedProin,
+        );
+      } else {
+        booking = await appState.rescheduleBooking(
+          widget.rescheduleBookingId!,
+          slot: slot,
+        );
+      }
     } catch (error) {
+      _clearPricingQuotes();
       if (!context.mounted) {
         return;
       }
@@ -402,7 +709,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   }
 
   Future<void> _startInstantBookingLogin(BuildContext context) async {
-    if (_isInstantBooking) {
+    if (_isInstantBooking || _priceSelectionPending) {
       return;
     }
     final appState = AppStateScope.read(context);
@@ -418,21 +725,36 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   }
 
   Future<void> _completeInstantBooking(BuildContext context) async {
-    if (_isInstantBooking) {
+    if (_isInstantBooking || _priceSelectionPending) {
       return;
     }
     setState(() => _isInstantBooking = true);
     final appState = AppStateScope.read(context);
     late final Booking booking;
     try {
+      final serviceIds = widget.initialInstantServiceIds.isEmpty
+          ? [widget.serviceId]
+          : widget.initialInstantServiceIds;
+      final quote = await _discountQuote(appState, widget.salonId, serviceIds);
+      var requestedProin = 0;
+      if (_useProin) {
+        final proinQuote = await _proinQuote(
+          appState,
+          widget.salonId,
+          serviceIds,
+          Future.value(quote),
+        );
+        requestedProin = proinQuote.maximumRedeemableProin;
+      }
       booking = await appState.createInstantBooking(
         salonId: widget.salonId,
-        serviceIds: widget.initialInstantServiceIds.isEmpty
-            ? [widget.serviceId]
-            : widget.initialInstantServiceIds,
+        serviceIds: serviceIds,
         arrivalMinutes: _instantArrivalMinutes,
+        quoteId: quote.quoteId,
+        requestedProin: requestedProin,
       );
     } catch (error) {
+      _clearPricingQuotes();
       if (!context.mounted) {
         return;
       }
@@ -479,18 +801,202 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     );
   }
 
+  void _clearPricingQuotes() {
+    _discountQuoteFuture = null;
+    _discountQuoteKey = '';
+    _proinQuoteFuture = null;
+    _proinQuoteKey = '';
+    _proinWalletFuture = null;
+    _proinWalletKey = '';
+    _visibleDiscountOffersFuture = null;
+    _visibleDiscountOffersKey = '';
+    _useProin = false;
+    _applyingVisibleCampaignId = '';
+    _appliedVisibleCampaignId = '';
+    _couponMessage = '';
+    _couponApplied = false;
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _applyCheckoutCoupon(
+    BuildContext context,
+    String salonId,
+    Iterable<String> serviceIds,
+  ) async {
+    if (_isApplyingCoupon) return;
+    final code = _couponController.text.trim().toUpperCase();
+    if (!RegExp(r'^(?=.*[A-Z])[A-Z\d]{4,20}$').hasMatch(code)) {
+      setState(() {
+        _couponMessage =
+            'Enter a 4-20 character voucher or coupon code with a letter.';
+        _couponApplied = false;
+      });
+      return;
+    }
+    setState(() {
+      _isApplyingCoupon = true;
+      _couponMessage = '';
+    });
+    try {
+      var appState = AppStateScope.read(context);
+      if (!appState.hasActiveCustomerSession) {
+        final didLogin = await _showCustomerLoginSheet(context);
+        if (didLogin != true || !context.mounted) return;
+        appState = AppStateScope.read(context);
+      }
+      final result = await appState.applyCheckoutCoupon(
+        salonId: salonId,
+        serviceIds: serviceIds,
+        code: code,
+      );
+      if (!mounted) return;
+      setState(() {
+        if (result.discountQuote != null) {
+          _discountQuoteKey = _discountKey(appState, salonId, serviceIds);
+          _discountQuoteFuture = Future.value(result.discountQuote!);
+        }
+        _appliedVisibleCampaignId = '';
+        _proinQuoteKey = '';
+        _proinQuoteFuture = null;
+        _proinWalletKey = '';
+        _proinWalletFuture = result.grantsProin
+            ? Future.value(appState.customerProinWallet)
+            : null;
+        _useProin =
+            result.grantsProin &&
+            appState.customerProinWallet.availableProin > 0;
+        _couponMessage = result.grantsProin && _useProin
+            ? '${result.message} Proin is ready to use on this booking.'
+            : result.message;
+        _couponApplied = result.appliesDiscount || result.grantsProin;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _couponMessage = _bookingErrorText(error);
+        _couponApplied = false;
+      });
+    } finally {
+      if (mounted) setState(() => _isApplyingCoupon = false);
+    }
+  }
+
+  Future<void> _applyVisibleCheckoutDiscount(
+    BuildContext context,
+    String salonId,
+    Iterable<String> serviceIds,
+    CheckoutDiscountOffer offer,
+  ) async {
+    if (_applyingVisibleCampaignId.isNotEmpty) return;
+    final optimisticQuote = DiscountQuote(
+      campaignId: offer.campaignId,
+      campaignName: offer.campaignName,
+      discountType: offer.discountType,
+      discountPercent: offer.discountPercent,
+      fixedDiscountAmount: offer.fixedDiscountAmount,
+      voucherApplied: offer.voucherMaskedCode.isNotEmpty,
+      voucherMaskedCode: offer.voucherMaskedCode,
+      originalAmount: offer.originalAmount,
+      discountBaseAmount: offer.originalAmount,
+      discountAmount: offer.discountAmount,
+      customerPayableAmount: offer.customerPayableAmount,
+      campaignEndsAt: offer.campaignEndsAt,
+    );
+    setState(() {
+      _applyingVisibleCampaignId = offer.campaignId;
+      _discountQuoteKey = _discountKey(
+        AppStateScope.read(context),
+        salonId,
+        serviceIds,
+      );
+      _discountQuoteFuture = Future.value(optimisticQuote);
+      _appliedVisibleCampaignId = offer.campaignId;
+      _couponMessage = 'Applying ${offer.campaignName}...';
+      _couponApplied = true;
+      _useProin = false;
+      _proinQuoteKey = '';
+      _proinQuoteFuture = null;
+    });
+    try {
+      var appState = AppStateScope.read(context);
+      if (!appState.hasActiveCustomerSession) {
+        final didLogin = await _showCustomerLoginSheet(context);
+        if (didLogin != true || !context.mounted) return;
+        appState = AppStateScope.read(context);
+      }
+      final result = await appState.applyVisibleCheckoutDiscount(
+        salonId: salonId,
+        serviceIds: serviceIds,
+        campaignId: offer.campaignId,
+      );
+      if (!mounted) return;
+      setState(() {
+        if (result.discountQuote != null) {
+          _discountQuoteKey = _discountKey(appState, salonId, serviceIds);
+          _discountQuoteFuture = Future.value(result.discountQuote!);
+        }
+        _couponController.clear();
+        _proinQuoteKey = '';
+        _proinQuoteFuture = null;
+        _proinWalletKey = '';
+        _proinWalletFuture = null;
+        _useProin = false;
+        _appliedVisibleCampaignId = offer.campaignId;
+        _couponMessage = result.message;
+        _couponApplied = result.appliesDiscount;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _discountQuoteFuture = null;
+        _discountQuoteKey = '';
+        _couponMessage = _bookingErrorText(error);
+        _couponApplied = false;
+        _appliedVisibleCampaignId = '';
+      });
+    } finally {
+      if (mounted) setState(() => _applyingVisibleCampaignId = '');
+    }
+  }
+
+  void _removeCheckoutCoupon() {
+    _couponController.clear();
+    _discountQuoteFuture = null;
+    _discountQuoteKey = '';
+    _proinQuoteFuture = null;
+    _proinQuoteKey = '';
+    _proinWalletFuture = null;
+    _proinWalletKey = '';
+    _useProin = false;
+    _applyingVisibleCampaignId = '';
+    _appliedVisibleCampaignId = '';
+    _couponMessage = '';
+    _couponApplied = false;
+    setState(() {});
+  }
+
   String _bookingErrorText(Object error) {
     if (error is FirebaseException && error.code == 'permission-denied') {
       return 'Please sign in again, then book this slot.';
     }
     final message = error.toString();
+    final lowerMessage = message.toLowerCase();
     if (message.contains('sign in again')) {
       return 'Please sign in again, then book this slot.';
     }
-    if (message.contains('just booked')) {
+    if (lowerMessage.contains('cancel or complete your current booking') ||
+        lowerMessage.contains('active booking')) {
+      return 'You already have an active booking.';
+    }
+    if (lowerMessage.contains('just booked')) {
       return 'This slot was just booked. Please choose another time.';
     }
-    return message;
+    return friendlyErrorMessage(
+      error,
+      fallback: 'The booking could not be completed. Please try again.',
+    );
   }
 
   Future<bool?> _showCustomerLoginSheet(BuildContext context) async {
@@ -972,6 +1478,709 @@ class _BookingSuccessDetailRow extends StatelessWidget {
   }
 }
 
+class _SignInForOfferCard extends StatelessWidget {
+  const _SignInForOfferCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: AppColors.champagne.withAlpha(88),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.primary.withAlpha(32)),
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.local_offer_outlined, color: AppColors.primaryDark),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Sign in to reveal your personal Pritze discount.',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CheckoutOfferLoadErrorCard extends StatelessWidget {
+  final String message;
+  final VoidCallback onRetry;
+
+  const _CheckoutOfferLoadErrorCard({
+    required this.message,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      padding: const EdgeInsets.all(14),
+      color: AppColors.amber.withAlpha(12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SoftIconBox(
+            icon: Icons.local_offer_outlined,
+            color: AppColors.amber,
+            size: 38,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Offers could not be loaded',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 3),
+                Text(message, style: Theme.of(context).textTheme.bodySmall),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: onRetry,
+                    icon: const Icon(Icons.refresh_rounded, size: 18),
+                    label: const Text('Retry offers'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CheckoutOffersLoadingCard extends StatelessWidget {
+  const _CheckoutOffersLoadingCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      key: const ValueKey('checkout-discount-offers-loading'),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBF2),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.primary.withAlpha(44)),
+      ),
+      child: const Row(
+        children: [
+          SoftIconBox(
+            icon: Icons.local_offer_outlined,
+            color: AppColors.primary,
+            size: 38,
+          ),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Checking available discounts...',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CheckoutVisibleOffersCard extends StatelessWidget {
+  final List<CheckoutDiscountOffer> offers;
+  final String applyingCampaignId;
+  final String appliedCampaignId;
+  final ValueChanged<CheckoutDiscountOffer> onApply;
+
+  const _CheckoutVisibleOffersCard({
+    required this.offers,
+    required this.applyingCampaignId,
+    required this.appliedCampaignId,
+    required this.onApply,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleOffers = offers.take(4).toList(growable: false);
+    return Container(
+      key: const ValueKey('checkout-visible-discount-offers'),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFFFFF4D8), Color(0xFFFFFBF2)],
+        ),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.primary.withAlpha(64)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SoftIconBox(
+                icon: Icons.sell_outlined,
+                color: AppColors.primary,
+                size: 38,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      offers.length == 1
+                          ? 'Available discount'
+                          : 'Available discounts',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Tap one before booking to update your final price.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          for (var index = 0; index < visibleOffers.length; index++) ...[
+            _CheckoutVisibleOfferTile(
+              offer: visibleOffers[index],
+              applying: applyingCampaignId == visibleOffers[index].campaignId,
+              applied: appliedCampaignId == visibleOffers[index].campaignId,
+              disabled:
+                  applyingCampaignId.isNotEmpty ||
+                  (appliedCampaignId.isNotEmpty &&
+                      appliedCampaignId != visibleOffers[index].campaignId),
+              onApply: () => onApply(visibleOffers[index]),
+            ),
+            if (index < visibleOffers.length - 1) const SizedBox(height: 8),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _CheckoutVisibleOfferTile extends StatelessWidget {
+  final CheckoutDiscountOffer offer;
+  final bool applying;
+  final bool applied;
+  final bool disabled;
+  final VoidCallback onApply;
+
+  const _CheckoutVisibleOfferTile({
+    required this.offer,
+    required this.applying,
+    required this.applied,
+    required this.disabled,
+    required this.onApply,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final canTap = !disabled && !applying && !applied;
+    return Material(
+      color: Colors.white.withAlpha(220),
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        onTap: canTap ? onApply : null,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: applied
+                  ? AppColors.success.withAlpha(90)
+                  : AppColors.gold.withAlpha(70),
+            ),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withAlpha(18),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  offer.offerLabel,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: AppColors.primaryDark,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      offer.campaignName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Save ₹${offer.discountAmount} · Pay ₹${offer.customerPayableAmount}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: AppColors.muted,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: canTap ? onApply : null,
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(74, 36),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                ),
+                child: applying
+                    ? const SizedBox(
+                        height: 17,
+                        width: 17,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(applied ? 'Applied' : 'Apply'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CheckoutCouponCard extends StatelessWidget {
+  final TextEditingController controller;
+  final bool applying;
+  final bool applied;
+  final String message;
+  final VoidCallback onApply;
+  final VoidCallback onRemove;
+
+  const _CheckoutCouponCard({
+    required this.controller,
+    required this.applying,
+    required this.applied,
+    required this.message,
+    required this.onApply,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      key: const ValueKey('checkout-coupon-card'),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBF4),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: applied
+              ? AppColors.success.withAlpha(90)
+              : AppColors.primary.withAlpha(48),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              SoftIconBox(
+                icon: Icons.confirmation_number_outlined,
+                color: AppColors.primary,
+                size: 40,
+              ),
+              SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Have a coupon code?',
+                      style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Enter a code you received from Pritze.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  key: const ValueKey('checkout-coupon-input'),
+                  controller: controller,
+                  textCapitalization: TextCapitalization.characters,
+                  maxLength: 20,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp('[A-Za-z0-9]')),
+                    TextInputFormatter.withFunction((oldValue, newValue) {
+                      return newValue.copyWith(
+                        text: newValue.text.toUpperCase(),
+                        selection: TextSelection.collapsed(
+                          offset: newValue.text.length,
+                        ),
+                      );
+                    }),
+                  ],
+                  decoration: const InputDecoration(
+                    hintText: 'Coupon code',
+                    counterText: '',
+                    prefixIcon: Icon(Icons.local_offer_outlined),
+                  ),
+                  onSubmitted: (_) {
+                    if (!applying) onApply();
+                  },
+                ),
+              ),
+              const SizedBox(width: 10),
+              FilledButton(
+                key: const ValueKey('checkout-coupon-apply'),
+                onPressed: applying ? null : onApply,
+                child: applying
+                    ? const SizedBox(
+                        height: 18,
+                        width: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : Text(applied ? 'Applied' : 'Apply'),
+              ),
+            ],
+          ),
+          if (message.isNotEmpty) ...[
+            const SizedBox(height: 9),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  applied ? Icons.check_circle_outline : Icons.info_outline,
+                  size: 18,
+                  color: applied ? AppColors.success : AppColors.primaryDark,
+                ),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    message,
+                    style: TextStyle(
+                      color: applied
+                          ? AppColors.success
+                          : AppColors.primaryDark,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                if (applied)
+                  TextButton(onPressed: onRemove, child: const Text('Remove')),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _DiscountQuoteCard extends StatelessWidget {
+  final int originalAmount;
+  final DiscountQuote? quote;
+  final bool loading;
+  final ProinBookingQuote? proinQuote;
+  final bool useProin;
+
+  const _DiscountQuoteCard({
+    required this.originalAmount,
+    required this.quote,
+    required this.loading,
+    this.proinQuote,
+    this.useProin = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final value = quote ?? DiscountQuote(originalAmount: originalAmount);
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        gradient: value.hasDiscount
+            ? const LinearGradient(
+                colors: [Color(0xFFFFF4D8), Color(0xFFFFFBF2)],
+              )
+            : null,
+        color: value.hasDiscount ? null : const Color(0xFFF8F6F1),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: value.hasDiscount
+              ? AppColors.primary.withAlpha(64)
+              : AppColors.line,
+        ),
+      ),
+      child: Column(
+        children: [
+          _PriceLine(label: 'Service amount', value: value.originalAmount),
+          if (value.hasDiscount) ...[
+            const SizedBox(height: 8),
+            _PriceLine(
+              label: '${value.campaignName} discount',
+              value: -value.discountAmount,
+              color: AppColors.success,
+            ),
+            if (value.quoteId.isNotEmpty) ...[
+              const SizedBox(height: 7),
+              const Row(
+                children: [
+                  Icon(Icons.lock_clock_outlined, size: 16),
+                  SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'This price is locked for 10 minutes.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            if (value.campaignEndsAt != null) ...[
+              const SizedBox(height: 7),
+              Row(
+                children: [
+                  const Icon(Icons.event_available_outlined, size: 16),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'Offer valid until ${_discountExpiryLabel(value.campaignEndsAt!)}.',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+          if (useProin && proinQuote?.canUseProin == true) ...[
+            const SizedBox(height: 8),
+            _PriceLine(
+              label: 'Proin used',
+              value: -proinQuote!.maximumRedeemableProin,
+              color: AppColors.success,
+            ),
+          ],
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: Divider(height: 1),
+          ),
+          _PriceLine(
+            label: 'Pay at salon counter',
+            value: useProin && proinQuote != null
+                ? proinQuote!.customerPayableAmount
+                : value.customerPayableAmount,
+            emphasized: true,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProinRedemptionCard extends StatelessWidget {
+  final ProinWalletSummary wallet;
+  final ProinBookingQuote? quote;
+  final bool loading;
+  final bool quoteLoading;
+  final String error;
+  final bool selected;
+  final ValueChanged<bool>? onChanged;
+
+  const _ProinRedemptionCard({
+    required this.wallet,
+    required this.quote,
+    required this.loading,
+    required this.quoteLoading,
+    required this.error,
+    required this.selected,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final available = quote?.availableProin ?? wallet.availableProin;
+    final redeemable = quote?.maximumRedeemableProin ?? 0;
+    final canUse =
+        onChanged != null && !loading && !quoteLoading && error.isEmpty;
+    final isSelected = selected && error.isEmpty;
+    final subtitle = loading
+        ? 'Available Proin: $available · updating'
+        : error.isNotEmpty
+        ? error
+        : quoteLoading && isSelected
+        ? 'Available $available · calculating deduction'
+        : isSelected && redeemable > 0
+        ? 'Available $available · ₹$redeemable will be deducted'
+        : 'Available Proin: $available';
+    return Container(
+      key: const ValueKey('booking-proin-redemption'),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF8EE),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.gold.withAlpha(85)),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: canUse ? () => onChanged?.call(!isSelected) : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              const SoftIconBox(
+                icon: Icons.toll_rounded,
+                color: AppColors.primary,
+                size: 38,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Use Proin for booking',
+                      style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      maxLines: error.isNotEmpty ? 2 : 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: error.isNotEmpty
+                            ? AppColors.coral
+                            : AppColors.muted,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Checkbox.adaptive(
+                key: const ValueKey('booking-use-proin-switch'),
+                value: isSelected,
+                onChanged: canUse
+                    ? (value) => onChanged?.call(value ?? false)
+                    : null,
+                activeColor: AppColors.primary,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PricingErrorCard extends StatelessWidget {
+  final String message;
+  final VoidCallback onRetry;
+
+  const _PricingErrorCard({required this.message, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      child: Row(
+        children: [
+          const Icon(Icons.info_outline, color: AppColors.primaryDark),
+          const SizedBox(width: 10),
+          Expanded(child: Text('Price could not be refreshed. $message')),
+          TextButton(onPressed: onRetry, child: const Text('Retry')),
+        ],
+      ),
+    );
+  }
+}
+
+String _discountExpiryLabel(DateTime value) {
+  final hour = value.hour % 12 == 0 ? 12 : value.hour % 12;
+  final minute = value.minute.toString().padLeft(2, '0');
+  final period = value.hour >= 12 ? 'PM' : 'AM';
+  return '${value.day.toString().padLeft(2, '0')}/'
+      '${value.month.toString().padLeft(2, '0')}/${value.year} '
+      '$hour:$minute $period';
+}
+
+class _PriceLine extends StatelessWidget {
+  final String label;
+  final int value;
+  final Color? color;
+  final bool emphasized;
+
+  const _PriceLine({
+    required this.label,
+    required this.value,
+    this.color,
+    this.emphasized = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final amount = value < 0 ? '-₹${value.abs()}' : '₹$value';
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            label,
+            style: TextStyle(
+              color: color ?? AppColors.ink,
+              fontWeight: emphasized ? FontWeight.w700 : FontWeight.w500,
+            ),
+          ),
+        ),
+        Text(
+          amount,
+          style: TextStyle(
+            color: color ?? AppColors.ink,
+            fontSize: emphasized ? 18 : 14,
+            fontWeight: emphasized ? FontWeight.w800 : FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _BookingSummary extends StatelessWidget {
   final Salon salon;
   final SalonService service;
@@ -1089,32 +2298,8 @@ class _InstantBookingCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (activeBooking != null) {
-      return Container(
-        key: const ValueKey('active-instant-booking-block'),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-        decoration: BoxDecoration(
-          color: AppColors.champagne.withAlpha(94),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: AppColors.gold),
-        ),
-        child: Row(
-          children: [
-            const Icon(
-              Icons.timer_outlined,
-              color: AppColors.primary,
-              size: 20,
-            ),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Text(
-                'Cancel or complete your current booking before making another.',
-                style: Theme.of(
-                  context,
-                ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
-              ),
-            ),
-          ],
-        ),
+      return const SizedBox.shrink(
+        key: ValueKey('active-instant-booking-block'),
       );
     }
 
@@ -1139,7 +2324,7 @@ class _InstantBookingCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Choose how soon you can reach after the salon accepts. The displayed remaining time refreshes every 3 minutes, with no continuous countdown.',
+                  'Choose how soon you can reach after the salon accepts.',
                   style: Theme.of(
                     context,
                   ).textTheme.bodyMedium?.copyWith(color: AppColors.ink),
@@ -1163,11 +2348,6 @@ class _InstantBookingCard extends StatelessWidget {
                         : (selection) =>
                               onArrivalMinutesChanged(selection.first),
                   ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'The salon and barber receive a ${selectedArrivalMinutes + 5}-minute preparation window.',
-                  style: Theme.of(context).textTheme.bodySmall,
                 ),
                 if (!enabled) ...[
                   const SizedBox(height: 8),

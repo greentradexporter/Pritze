@@ -8,9 +8,12 @@ import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/account_actions.dart';
+import '../../widgets/app_error_dialog.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/booking_status_timeline.dart';
+import '../../widgets/customer_arrival_control.dart';
 import '../../widgets/status_chip.dart';
+import 'customer_completion_receipt_screen.dart';
 import 'salon_booking_screen.dart';
 
 class MyBookingsScreen extends StatefulWidget {
@@ -390,8 +393,14 @@ class _BookingCard extends StatelessWidget {
           const SizedBox(height: 9),
           _DetailRow(
             icon: Icons.payments_outlined,
-            label:
+            label: switch (booking.status) {
+              BookingStatus.inProgress =>
+                'Your final payable amount will be shown after the salon ends the service.',
+              BookingStatus.completed =>
+                'Final payable amount ₹${booking.customerPayableAmount} · Pay at the salon counter',
+              _ =>
                 'Service ₹${booking.resolvedServicePrice(service)} · booking fee ₹${booking.bookingFee}',
+            },
           ),
           if (booking.cancellationReason.isNotEmpty) ...[
             const SizedBox(height: 9),
@@ -399,6 +408,11 @@ class _BookingCard extends StatelessWidget {
               icon: Icons.info_outline,
               label: 'Cancellation reason: ${booking.cancellationReason}',
             ),
+          ],
+          if (booking.status == BookingStatus.confirmed ||
+              booking.status == BookingStatus.inProgress) ...[
+            const SizedBox(height: 16),
+            CustomerArrivalControl(booking: booking),
           ],
           const SizedBox(height: 16),
           BookingStatusTimeline(
@@ -418,6 +432,17 @@ class _BookingCard extends StatelessWidget {
                     onPressed: () => _reschedule(context, booking),
                     icon: const Icon(Icons.event_repeat_outlined),
                     label: const Text('Reschedule'),
+                  ),
+                if (canLeaveFeedback)
+                  OutlinedButton.icon(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) =>
+                            CustomerCompletionReceiptScreen(booking: booking),
+                      ),
+                    ),
+                    icon: const Icon(Icons.receipt_long_outlined),
+                    label: const Text('Receipt'),
                   ),
                 if (canLeaveFeedback)
                   OutlinedButton.icon(
@@ -547,9 +572,16 @@ class _BookingCard extends StatelessWidget {
       if (!context.mounted) {
         return;
       }
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Cancel failed: $error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            friendlyErrorMessage(
+              error,
+              fallback: 'The booking could not be cancelled. Try again.',
+            ),
+          ),
+        ),
+      );
     }
   }
 
@@ -749,7 +781,11 @@ class _BookingCard extends StatelessWidget {
                                       ).showSnackBar(
                                         SnackBar(
                                           content: Text(
-                                            'Feedback failed: $error',
+                                            friendlyErrorMessage(
+                                              error,
+                                              fallback:
+                                                  'Feedback could not be sent. Please try again.',
+                                            ),
                                           ),
                                         ),
                                       );

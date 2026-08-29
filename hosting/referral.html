@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#D97706">
+    <title>Join Pritze</title>
+    <link rel="stylesheet" href="/styles.css">
+    <style>
+      .referral-card { max-width: 560px; margin: 72px auto; text-align: center; }
+      .referral-code { display: inline-block; margin: 18px 0; padding: 14px 22px; border-radius: 16px; background: #fff4d8; color: #8a4700; font-size: 28px; font-weight: 800; letter-spacing: 5px; }
+      .store-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; }
+      .store-actions a { display: inline-block; padding: 13px 18px; border-radius: 14px; background: #b85c00; color: white; text-decoration: none; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <main class="referral-card">
+      <img src="/pritze-icon.png" width="84" height="84" alt="Pritze">
+      <h1>You have been invited to Pritze</h1>
+      <p>Install or open Pritze. Your referral code will be ready during first-time registration.</p>
+      <div class="referral-code" id="referral-code">------</div>
+      <div class="store-actions">
+        <a href="https://play.google.com/store/apps/details?id=com.trimtime.app">Get it on Google Play</a>
+        <a href="https://apps.apple.com/app/id6792811282">Download on the App Store</a>
+      </div>
+    </main>
+    <script>
+      const parts = location.pathname.split('/').filter(Boolean);
+      const code = parts.length === 2 && parts[0] === 'r' ? parts[1].toUpperCase() : '';
+      document.getElementById('referral-code').textContent = /^[A-Z0-9]{6}$/.test(code) ? code : '------';
+    </script>
+  </body>
+</html>

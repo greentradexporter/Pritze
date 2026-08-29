@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
+import '../../state/app_state.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_ui.dart';
@@ -1255,10 +1256,5 @@ class _ServiceTile extends StatelessWidget {
 }
 
 String _compactTimeRange(Salon salon) {
-  if (salon.openTime.trim().isEmpty || salon.closeTime.trim().isEmpty) {
-    return 'Hours pending';
-  }
-  String compact(String value) =>
-      value.replaceAll(':00', '').replaceAll(' ', '');
-  return '${compact(salon.openTime)}-${compact(salon.closeTime)}';
+  return formatSalonHoursRange(salon);
 }
