@@ -4,6 +4,7 @@ import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../state/app_state.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/rating_utils.dart';
 import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/booking_status_timeline.dart';
@@ -52,7 +53,7 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
     final isBookable = appState.isSalonBookable(salon.id);
     final isSetupComplete = appState.isSalonSetupComplete(salon.id);
     final isCurrentlyOpen = appState.isSalonCurrentlyOpen(salon.id);
-    final canBookNow = isBookable && isCurrentlyOpen;
+    final canBookInstantly = isBookable && isCurrentlyOpen;
     final barbers = appState.barbersForSalon(salon.id);
     final instantServices = services
         .where(
@@ -138,7 +139,7 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
                     ),
                   ],
                 ),
-                if (!canBookNow) ...[
+                if (!canBookInstantly) ...[
                   const SizedBox(height: 10),
                   GlassCard(
                     color: AppColors.champagne.withAlpha(80),
@@ -152,7 +153,7 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
                         Expanded(
                           child: Text(
                             isSetupComplete
-                                ? 'This salon is currently closed. You can still view its services and team.'
+                                ? 'This salon is currently closed. You can still schedule an appointment during its opening hours.'
                                 : 'This salon is listed while its booking setup is being completed.',
                           ),
                         ),
@@ -346,7 +347,8 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
                               selected: selectedInstantIds.contains(service.id),
                               multiSelect: instantOnly,
                               onTap: () {
-                                if (!appState.isSalonCurrentlyOpen(salon.id)) {
+                                if (instantOnly &&
+                                    !appState.isSalonCurrentlyOpen(salon.id)) {
                                   _showBookingUnavailable(pageContext, salon);
                                   return;
                                 }
@@ -485,8 +487,7 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
                         return GlassCard(
                           onTap: () {
                             final appState = AppStateScope.read(pageContext);
-                            if (!appState.isSalonCurrentlyOpen(salon.id) ||
-                                !appState.isSalonBookable(salon.id)) {
+                            if (!appState.isSalonBookable(salon.id)) {
                               _showBookingUnavailable(pageContext, salon);
                               return;
                             }
@@ -621,8 +622,7 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
                     GlassCard(
                       onTap: () {
                         final appState = AppStateScope.read(context);
-                        if (!appState.isSalonCurrentlyOpen(salon.id) ||
-                            !appState.isSalonBookable(salon.id)) {
+                        if (!appState.isSalonBookable(salon.id)) {
                           _showBookingUnavailable(context, salon);
                           return;
                         }
@@ -694,7 +694,7 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
     final appState = AppStateScope.read(context);
     final setupComplete = appState.isSalonSetupComplete(salon.id);
     final message = setupComplete
-        ? '${salon.displayName} is currently closed. You can browse services and barbers, but appointments can only be placed while the salon is open.'
+        ? '${salon.displayName} is currently closed. Instant booking is unavailable, but you can schedule an appointment during its opening hours.'
         : '${salon.displayName} is still completing its booking setup. You can browse the listing, but appointments are not available yet.';
     showDialog<void>(
       context: context,
@@ -978,7 +978,7 @@ class _DetailHero extends StatelessWidget {
                                     ),
                                     const SizedBox(width: 3),
                                     Text(
-                                      '${salon.rating}',
+                                      formatRating(salon.rating),
                                       style: const TextStyle(
                                         color: AppColors.ink,
                                         fontSize: 14,

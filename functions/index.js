@@ -125,8 +125,8 @@ const LEGACY_OWNER_BOOKING_REQUEST_CHANNEL =
   "pritze_owner_booking_requests_v2";
 const OWNER_BOOKING_REQUEST_SOUND = "owner_booking_request";
 const IOS_OWNER_BOOKING_REQUEST_CATEGORY = "PRITZE_BOOKING_REQUEST_V2";
-const OWNER_ALERT_REPEAT_DELAY_MS = 25_000;
-const OWNER_ALERT_ATTEMPTS = 6;
+const OWNER_ALERT_REPEAT_DELAY_MS = 15_000;
+const OWNER_ALERT_ATTEMPTS = 10;
 const DISCOUNT_QUOTE_TTL_MS = 10 * 60 * 1000;
 const REFERRAL_ATTEMPT_WINDOW_MS = 60 * 60 * 1000;
 const REFERRAL_ATTEMPT_LIMIT = 10;
@@ -301,6 +301,7 @@ exports.getAdminPhaseOneData = onCall(
     const [
       bookingsSnapshot,
       salonsSnapshot,
+      salonPaymentProfilesSnapshot,
       barbersSnapshot,
       customersSnapshot,
       salonFeedbackSnapshot,
@@ -319,6 +320,7 @@ exports.getAdminPhaseOneData = onCall(
         .limit(1000)
         .get(),
       firestore.collection("salons").limit(500).get(),
+      firestore.collection("salonPaymentProfiles").limit(500).get(),
       firestore.collection("barbers").limit(1000).get(),
       firestore.collection("users")
         .where("role", "==", "customer")
@@ -351,10 +353,20 @@ exports.getAdminPhaseOneData = onCall(
       firestore.collection("bookingArrivalSessions").limit(500).get(),
     ]);
 
+    const paymentProfilesBySalonId = new Map(
+      salonPaymentProfilesSnapshot.docs.map((document) => [
+        document.id,
+        document.data() || {},
+      ]),
+    );
     return {
       generatedAtMillis: Date.now(),
       bookings: bookingsSnapshot.docs.map(adminBookingRecord),
-      salons: salonsSnapshot.docs.map(adminSalonRecord),
+      salons: salonsSnapshot.docs.map((document) =>
+        adminSalonRecord(
+          document,
+          paymentProfilesBySalonId.get(document.id),
+        )),
       barbers: barbersSnapshot.docs.map(adminBarberRecord),
       customers: customersSnapshot.docs.map(adminCustomerRecord),
       reviews: [
@@ -3028,7 +3040,7 @@ exports.createBooking = onCall({
     0,
   );
   const nowMillis = Date.now();
-  if (!isWithinSalonHours({
+  if (isInstant && !isWithinSalonHours({
     startMillis: nowMillis,
     durationMinutes: 1,
     openTime: salon.openTime,
@@ -7384,13 +7396,15 @@ function adminArrivalSessionRecord(document) {
   };
 }
 
-function adminSalonRecord(document) {
+function adminSalonRecord(document, paymentProfile = {}) {
   const data = document.data() || {};
   return {
     ...adminSalonProfileView(document.id, data),
     rating: Math.max(0, Number(data.rating) || 0),
     reviewCount: Math.max(0, Number(data.reviewCount) || 0),
     serviceCount: Array.isArray(data.services) ? data.services.length : 0,
+    paymentUpiId: adminString(paymentProfile.upiId),
+    paymentQrCodeUrl: adminString(paymentProfile.qrCodeUrl),
     services: (Array.isArray(data.services) ? data.services : [])
       .slice(0, 100)
       .map((service) => ({

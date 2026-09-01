@@ -87,7 +87,8 @@ void main() {
     expect(functions, contains('data.ownerNotificationsEnabled !== true'));
     expect(functions, contains('onDocumentCreated'));
     expect(functions, contains('createdBooking?.isInstant !== true'));
-    expect(functions, contains('OWNER_ALERT_ATTEMPTS = 6'));
+    expect(functions, contains('OWNER_ALERT_ATTEMPTS = 10'));
+    expect(functions, contains('OWNER_ALERT_REPEAT_DELAY_MS = 15_000'));
     expect(functions, contains('INSTANT_RESPONSE_TIMEOUT_MS'));
     expect(functions, contains('expirePendingInstantBooking'));
     expect(functions, contains('Oops, looks like the salon is busy'));

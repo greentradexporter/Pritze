@@ -73,7 +73,10 @@ class _MyBookingsScreenState extends State<MyBookingsScreen> {
         title: const Text('Bookings'),
         actions: [const CustomerNotificationButton(), const SizedBox(width: 8)],
       ),
-      bottomNavigationBar: const AppBottomNav(selectedIndex: 1),
+      bottomNavigationBar: const AppBottomNav(
+        selectedIndex: 1,
+        showActiveBooking: false,
+      ),
       body: RefreshIndicator(
         onRefresh: appState.refresh,
         child: allBookings.isEmpty

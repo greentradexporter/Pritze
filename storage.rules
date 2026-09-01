@@ -25,6 +25,16 @@ service firebase.storage {
       allow delete: if ownsSalon(salonId) || ownerSalonId(salonId);
     }
 
+    // Payment QR images are not public salon media. The owner uploads and
+    // manages them; authorized backend services use their private record.
+    match /salons/{salonId}/payments/{paymentFile} {
+      allow read: if ownsSalon(salonId);
+      allow create, update: if ownsSalon(salonId) &&
+        request.resource.size < 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+      allow delete: if ownsSalon(salonId);
+    }
+
     match /customers/{customerId}/profile/{photoName} {
       allow read: if signedIn();
       allow create, update: if signedIn() && request.auth.uid == customerId &&

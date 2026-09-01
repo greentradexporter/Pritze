@@ -49,7 +49,9 @@ class TrimtimeApp extends StatelessWidget {
       theme: AppTheme.build(),
       // Keep the update prompt inside the app Navigator so its mandatory
       // dialog can always be presented above the currently visible route.
-      home: const AppUpdatePrompt(child: AppEntryScreen()),
+      home: const AppUpdatePrompt(
+        child: CustomerBookingConfirmationGate(child: AppEntryScreen()),
+      ),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -70,9 +72,7 @@ class AppEntryScreen extends StatelessWidget {
     return switch (appState.activeRole) {
       UserRole.owner => const SalonDashboardScreen(),
       UserRole.barber => const CustomerHomeScreen(),
-      UserRole.customer || null => const CustomerBookingConfirmationGate(
-        child: CustomerHomeScreen(),
-      ),
+      UserRole.customer || null => const CustomerHomeScreen(),
     };
   }
 }

@@ -92,6 +92,25 @@ test("Firestore rules isolate referral, discount and Proin financial state", {
     await assertSucceeds(
         setDoc(doc(owner, "salons", "canonical-salon"), salonProfile),
     );
+    const privatePaymentProfile = {
+      salonId: "canonical-salon",
+      ownerUid: "owner-1",
+      upiId: "canonical@bank",
+      qrCodeUrl: "https://example.com/private-qr.png",
+    };
+    await assertSucceeds(setDoc(
+        doc(owner, "salonPaymentProfiles", "canonical-salon"),
+        privatePaymentProfile,
+    ));
+    await assertSucceeds(getDoc(
+        doc(owner, "salonPaymentProfiles", "canonical-salon"),
+    ));
+    await assertFails(getDoc(
+        doc(customer, "salonPaymentProfiles", "canonical-salon"),
+    ));
+    await assertFails(getDoc(
+        doc(publicClient, "salonPaymentProfiles", "canonical-salon"),
+    ));
     await assertFails(
         setDoc(doc(owner, "salons", "custom-salon"), {
           ...salonProfile,

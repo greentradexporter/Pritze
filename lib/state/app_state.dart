@@ -60,7 +60,7 @@ const _ownerBookingRequestChannel = AndroidNotificationChannel(
 );
 const _ownerBookingAlarmNotificationId = 790001;
 const _ownerBookingAlarmNotificationTag = 'pritze_owner_booking_request';
-const _ownerBookingAlarmInterval = Duration(seconds: 25);
+const _ownerBookingAlarmInterval = Duration(seconds: 15);
 const _androidInsistentNotificationFlag = 4;
 const _acceptInstantBookingNotificationAction = 'accept_instant_booking';
 const _rejectInstantBookingNotificationAction = 'reject_instant_booking';
@@ -425,6 +425,8 @@ class AppState extends ChangeNotifier {
   String? _currentBarberId;
   UserRole? _activeRole;
   String? _lastSyncError;
+  String _ownerPaymentUpiId = '';
+  String _ownerPaymentQrCodeUrl = '';
   bool _isSaving = false;
   bool _referralOnboardingRequired = false;
   int _referralCodeCounter = 1;
@@ -440,6 +442,7 @@ class AppState extends ChangeNotifier {
   AppNotificationNavigation? _pendingNotificationNavigation;
   Future<void> _rolePersistenceQueue = Future<void>.value();
   Timer? _customerInstantExpiryTimer;
+  final Set<String> _locallyExpiredInstantBookingIds = <String>{};
 
   AppState() {
     unawaited(_restoreActiveRole());
@@ -454,6 +457,10 @@ class AppState extends ChangeNotifier {
   String? get lastSyncError => _lastSyncError;
 
   bool get isSaving => _isSaving;
+
+  String get ownerPaymentUpiId => _ownerPaymentUpiId;
+
+  String get ownerPaymentQrCodeUrl => _ownerPaymentQrCodeUrl;
 
   bool get referralOnboardingRequired => _referralOnboardingRequired;
 
@@ -1239,6 +1246,7 @@ class AppState extends ChangeNotifier {
       return [];
     }
     final account = _customerAccount!;
+    final now = DateTime.now();
     return _bookings
         .where(
           (booking) =>
@@ -1248,13 +1256,32 @@ class AppState extends ChangeNotifier {
         )
         .map((booking) {
           final pendingReason = _pendingCustomerCancellations[booking.id];
-          if (pendingReason == null) {
+          if (pendingReason != null) {
+            return booking.copyWith(
+              status: BookingStatus.cancelled,
+              cancellationReason: pendingReason,
+              cancelledBy: 'customer',
+            );
+          }
+          final responseDeadline = booking.createdAt.add(
+            instantBookingResponseTimeout,
+          );
+          final responseExpired =
+              booking.isInstant &&
+              booking.status == BookingStatus.pending &&
+              (_locallyExpiredInstantBookingIds.contains(booking.id) ||
+                  !now.isBefore(responseDeadline));
+          if (!responseExpired) {
             return booking;
           }
+          // Project the timeout into customer-visible state as soon as the
+          // 150-second response window closes. Firestore remains authoritative
+          // and will reconcile this with the server-side cancellation.
           return booking.copyWith(
             status: BookingStatus.cancelled,
-            cancellationReason: pendingReason,
-            cancelledBy: 'customer',
+            cancellationReason: 'No response from salon within 150 seconds',
+            cancelledBy: 'system',
+            cancelledAt: responseDeadline,
           );
         })
         .toList()
@@ -1311,30 +1338,51 @@ class AppState extends ChangeNotifier {
     _customerInstantExpiryTimer?.cancel();
     _customerInstantExpiryTimer = null;
     if (_activeRole != UserRole.customer || _customerAccount == null) {
+      _locallyExpiredInstantBookingIds.clear();
       return;
     }
 
     final now = DateTime.now();
-    final deadlines =
-        customerBookings
+    final pendingInstantBookings = _bookings
+        .where(
+          (booking) =>
+              booking.isInstant && booking.status == BookingStatus.pending,
+        )
+        .toList();
+    final pendingIds = pendingInstantBookings
+        .map((booking) => booking.id)
+        .toSet();
+    _locallyExpiredInstantBookingIds.removeWhere(
+      (bookingId) => !pendingIds.contains(bookingId),
+    );
+    final expiries =
+        pendingInstantBookings
             .where(
               (booking) =>
-                  booking.isInstant && booking.status == BookingStatus.pending,
+                  !_locallyExpiredInstantBookingIds.contains(booking.id),
             )
             .map(
-              (booking) => booking.createdAt.add(instantBookingResponseTimeout),
+              (booking) => (
+                booking: booking,
+                deadline: booking.createdAt.add(instantBookingResponseTimeout),
+              ),
             )
-            .where((deadline) => deadline.isAfter(now))
+            .where((entry) => entry.deadline.isAfter(now))
             .toList()
-          ..sort();
-    if (deadlines.isEmpty) {
+          ..sort((a, b) => a.deadline.compareTo(b.deadline));
+    if (expiries.isEmpty) {
       return;
     }
 
-    _customerInstantExpiryTimer = Timer(
-      deadlines.first.difference(now),
-      notifyListeners,
-    );
+    final firstDeadline = expiries.first.deadline;
+    _customerInstantExpiryTimer = Timer(firstDeadline.difference(now), () {
+      for (final entry in expiries) {
+        if (!entry.deadline.isAfter(firstDeadline)) {
+          _locallyExpiredInstantBookingIds.add(entry.booking.id);
+        }
+      }
+      notifyListeners();
+    });
   }
 
   Salon? getSalon(String id) {
@@ -1998,6 +2046,8 @@ class AppState extends ChangeNotifier {
     _customerProinWallet = const ProinWalletSummary();
     _salonProinWallets.clear();
     _customerProinActivity.clear();
+    _ownerPaymentUpiId = '';
+    _ownerPaymentQrCodeUrl = '';
     await _persistActiveRole(null);
     notifyListeners();
   }
@@ -2083,9 +2133,6 @@ class AppState extends ChangeNotifier {
     }
     if (hasActiveCustomerBooking) {
       throw StateError('You already have an active booking.');
-    }
-    if (!isSalonCurrentlyOpen(slot.salonId)) {
-      throw StateError('The salon is currently closed.');
     }
     final service = getService(slot.salonId, slot.serviceId);
     final barber = getBarber(slot.barberId);
@@ -2933,6 +2980,35 @@ class AppState extends ChangeNotifier {
       _ownerDraftServices.clear();
     }
     _ownerProfileCompleted = true;
+    notifyListeners();
+  }
+
+  Future<void> refreshOwnerPaymentDetails() async {
+    if (!hasActiveOwnerSession) {
+      _ownerPaymentUpiId = '';
+      _ownerPaymentQrCodeUrl = '';
+      notifyListeners();
+    }
+  }
+
+  Future<void> saveOwnerPaymentUpiId(String upiId) async {
+    if (!hasActiveOwnerSession || ownerSalonOrNull == null) {
+      throw StateError('Save the salon profile before adding payment details.');
+    }
+    _ownerPaymentUpiId = _normalizeUpiId(upiId);
+    notifyListeners();
+  }
+
+  Future<String> uploadOwnerPaymentQrCode({
+    required Uint8List bytes,
+    required String fileName,
+    String? contentType,
+  }) {
+    throw UnsupportedError('Payment QR upload needs Firebase Storage.');
+  }
+
+  Future<void> removeOwnerPaymentQrCode() async {
+    _ownerPaymentQrCodeUrl = '';
     notifyListeners();
   }
 
@@ -4573,9 +4649,6 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     String quoteId = '',
     int requestedProin = 0,
   }) async {
-    if (!isSalonCurrentlyOpen(slot.salonId)) {
-      throw StateError('The salon is currently closed.');
-    }
     if (auth.currentUser != null) {
       return _createBookingWithFunction(
         slot,
@@ -6003,6 +6076,122 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         closeTime: closeTime,
       );
       await _setSalon(ownerSalon);
+    });
+  }
+
+  @override
+  Future<void> refreshOwnerPaymentDetails() async {
+    if (!hasActiveOwnerSession || ownerSalonId.isEmpty) {
+      await super.refreshOwnerPaymentDetails();
+      return;
+    }
+    final snapshot = await firestore
+        .collection('salonPaymentProfiles')
+        .doc(ownerSalonId)
+        .get();
+    final data = snapshot.data() ?? const <String, dynamic>{};
+    _ownerPaymentUpiId = _string(data['upiId'], '');
+    _ownerPaymentQrCodeUrl = _string(data['qrCodeUrl'], '');
+    notifyListeners();
+  }
+
+  @override
+  Future<void> saveOwnerPaymentUpiId(String upiId) async {
+    await _runFirebaseSave(() async {
+      await super.saveOwnerPaymentUpiId(upiId);
+      final uid = auth.currentUser?.uid;
+      if (uid == null) {
+        throw StateError(
+          'Log in as a salon owner before saving payment details.',
+        );
+      }
+      await firestore.collection('salonPaymentProfiles').doc(ownerSalonId).set({
+        'salonId': ownerSalonId,
+        'ownerUid': uid,
+        'upiId': _ownerPaymentUpiId,
+        'qrCodeUrl': _ownerPaymentQrCodeUrl,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    });
+  }
+
+  @override
+  Future<String> uploadOwnerPaymentQrCode({
+    required Uint8List bytes,
+    required String fileName,
+    String? contentType,
+  }) async {
+    if (bytes.isEmpty) {
+      throw ArgumentError('Choose a QR-code image before uploading.');
+    }
+    if (!hasActiveOwnerSession || ownerSalonOrNull == null) {
+      throw StateError('Save the salon profile before uploading a QR code.');
+    }
+    final salonId = ownerSalonId;
+    final previousUrl = _ownerPaymentQrCodeUrl;
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final ref = storage.ref(
+      'salons/$salonId/payments/$timestamp-${_safeUploadName(fileName)}',
+    );
+    final metadata = SettableMetadata(
+      contentType: contentType ?? _guessImageContentType(fileName),
+      customMetadata: {
+        'salonId': salonId,
+        if (auth.currentUser?.uid != null) 'ownerUid': auth.currentUser!.uid,
+        'purpose': 'upi-qr-code',
+      },
+    );
+    await _runFirebaseSave(() async {
+      await ref.putData(bytes, metadata);
+      final url = await ref.getDownloadURL();
+      _ownerPaymentQrCodeUrl = url;
+      final uid = auth.currentUser?.uid;
+      if (uid == null) {
+        throw StateError('Log in as a salon owner before uploading a QR code.');
+      }
+      await firestore.collection('salonPaymentProfiles').doc(salonId).set({
+        'salonId': salonId,
+        'ownerUid': uid,
+        'upiId': _ownerPaymentUpiId,
+        'qrCodeUrl': url,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      if (previousUrl.isNotEmpty && previousUrl != url) {
+        try {
+          await storage.refFromURL(previousUrl).delete();
+        } on FirebaseException catch (error) {
+          if (error.code != 'object-not-found') rethrow;
+        }
+      }
+      notifyListeners();
+    });
+    return _ownerPaymentQrCodeUrl;
+  }
+
+  @override
+  Future<void> removeOwnerPaymentQrCode() async {
+    final previousUrl = _ownerPaymentQrCodeUrl;
+    await _runFirebaseSave(() async {
+      await super.removeOwnerPaymentQrCode();
+      final uid = auth.currentUser?.uid;
+      if (uid == null || ownerSalonId.isEmpty) {
+        throw StateError(
+          'Log in as a salon owner before changing payment details.',
+        );
+      }
+      await firestore.collection('salonPaymentProfiles').doc(ownerSalonId).set({
+        'salonId': ownerSalonId,
+        'ownerUid': uid,
+        'qrCodeUrl': '',
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+      if (previousUrl.isNotEmpty) {
+        try {
+          await storage.refFromURL(previousUrl).delete();
+        } on FirebaseException catch (error) {
+          if (error.code != 'object-not-found') rethrow;
+        }
+      }
     });
   }
 
@@ -8022,6 +8211,20 @@ String _safeUploadName(String fileName) {
       .replaceAll(RegExp(r'[^A-Za-z0-9_.-]'), '-')
       .replaceAll(RegExp(r'-+'), '-');
   return safe.isEmpty ? 'photo.jpg' : safe;
+}
+
+String _normalizeUpiId(String value) {
+  final normalized = value.trim().toLowerCase();
+  if (normalized.isEmpty) {
+    return '';
+  }
+  if (normalized.length > 100 ||
+      !RegExp(
+        r'^[a-z0-9._-]{2,64}@[a-z][a-z0-9.-]{1,32}$',
+      ).hasMatch(normalized)) {
+    throw FormatException('Enter a valid UPI ID, for example salon@bank.');
+  }
+  return normalized;
 }
 
 int? _parseClockMinutes(String value) {

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/app_models.dart';
 import '../screens/customer/my_bookings_screen.dart';
 import '../screens/customer/customer_completion_receipt_screen.dart';
+import '../state/app_state.dart';
 import '../state/app_state_scope.dart';
 import '../theme/app_theme.dart';
 import 'booking_status_timeline.dart';
@@ -44,10 +45,7 @@ class _CustomerBookingConfirmationGateState
               _isCustomerVisibleOutcome(item) &&
               now.difference(_outcomeAt(item)).abs() <
                   const Duration(hours: 24) &&
-              !appState.hasSeenNotification(
-                UserRole.customer,
-                _outcomeKey(item),
-              ),
+              !_hasSeenOutcome(appState, item),
         )
         .firstOrNull;
     final booking = appState.customerBookings
@@ -78,9 +76,10 @@ class _CustomerBookingConfirmationGateState
       _isShowingConfirmation = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        appState.markNotificationsSeen(UserRole.customer, [
-          _outcomeKey(outcomeBooking),
-        ]);
+        appState.markNotificationsSeen(
+          UserRole.customer,
+          _outcomeKeys(outcomeBooking),
+        );
         _showOutcome(outcomeBooking);
       });
     } else if (booking != null && !_isShowingConfirmation) {
@@ -255,12 +254,12 @@ class _CustomerBookingConfirmationGateState
     final title = isNoResponse
         ? 'No response from salon'
         : isRejected
-        ? 'Booking rejected'
+        ? 'Salon is busy'
         : 'Booking cancelled';
     final message = isNoResponse
         ? 'Oops, looks like the salon is busy. Try again or see other nearby salons.'
         : isRejected
-        ? '${salon?.name ?? 'The salon'} could not accept your booking this time.'
+        ? '${salon?.name ?? 'The salon'} is busy right now. Try a different salon.'
         : '${salon?.name ?? 'The salon'} cancelled your booking.';
     final accent = isNoResponse ? AppColors.amber : AppColors.coral;
     final icon = isNoResponse
@@ -408,13 +407,26 @@ DateTime _outcomeAt(Booking booking) {
       : booking.cancelledAt!;
 }
 
-String _outcomeKey(Booking booking) {
+Iterable<String> _outcomeKeys(Booking booking) sync* {
+  if (booking.cancelledBy == 'system') {
+    // Keep timeout delivery stable while the client-side deadline projection
+    // is replaced by the server cancellation timestamp.
+    yield 'booking-unanswered:${booking.id}';
+    if (booking.cancelledAt != null) {
+      yield 'booking-unanswered:${booking.id}:${booking.cancelledAt!.millisecondsSinceEpoch}';
+    }
+    return;
+  }
   final outcome = booking.status == BookingStatus.rejected
       ? 'rejected'
-      : booking.cancelledBy == 'system'
-      ? 'unanswered'
       : 'cancelled';
-  return 'booking-$outcome:${booking.id}:${_outcomeAt(booking).millisecondsSinceEpoch}';
+  yield 'booking-$outcome:${booking.id}:${_outcomeAt(booking).millisecondsSinceEpoch}';
+}
+
+bool _hasSeenOutcome(AppState appState, Booking booking) {
+  return _outcomeKeys(
+    booking,
+  ).any((key) => appState.hasSeenNotification(UserRole.customer, key));
 }
 
 class _ConfirmationDetail extends StatelessWidget {

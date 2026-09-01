@@ -25,6 +25,7 @@ import 'package:nashik_salon_booking/screens/salon/salon_profile_setup_screen.da
 import 'package:nashik_salon_booking/services/android_phone_hint.dart';
 import 'package:nashik_salon_booking/state/app_state.dart';
 import 'package:nashik_salon_booking/state/app_state_scope.dart';
+import 'package:nashik_salon_booking/utils/rating_utils.dart';
 import 'package:nashik_salon_booking/widgets/account_actions.dart';
 import 'package:nashik_salon_booking/widgets/app_error_dialog.dart';
 import 'package:nashik_salon_booking/widgets/auth_login_panel.dart';
@@ -191,6 +192,40 @@ void main() {
       services: [],
     );
     expect(formatSalonHoursRange(salon), '9:00 AM – 6:30 PM');
+  });
+
+  test('salon ratings are truncated and ranked from highest to lowest', () {
+    expect(formatRating(4.89), '4.8');
+    expect(formatRating(3.23), '3.2');
+    expect(formatRating(5), '5.0');
+
+    const base = Salon(
+      id: 'base',
+      name: 'Base',
+      ownerName: 'Owner',
+      address: 'Address',
+      phone: '+919000000000',
+      logoUrl: '',
+      distanceLabel: 'Nearby',
+      rating: 0,
+      reviewCount: 0,
+      openTime: '9:00 AM',
+      closeTime: '8:00 PM',
+      isOpen: true,
+      services: [],
+    );
+    final salons = [
+      base.copyWith(id: 'low', name: 'Low', rating: 3.2, reviewCount: 10),
+      base.copyWith(id: 'high', name: 'High', rating: 4.8, reviewCount: 2),
+      base.copyWith(
+        id: 'high-reviewed',
+        name: 'High reviewed',
+        rating: 4.8,
+        reviewCount: 20,
+      ),
+    ]..sort(compareSalonsByRating);
+
+    expect(salons.map((salon) => salon.id), ['high-reviewed', 'high', 'low']);
   });
 
   test('unanswered instant booking stops being active after 150 seconds', () {
@@ -646,7 +681,12 @@ void main() {
       420,
       scrollable: find.byType(Scrollable).first,
     );
-    expect(find.text('Available discount'), findsOneWidget);
+    expect(find.text('View applicable offers'), findsOneWidget);
+    expect(find.text('Visible SAVE20'), findsNothing);
+    await tester.tap(
+      find.byKey(const ValueKey('checkout-visible-discount-offers-toggle')),
+    );
+    await tester.pumpAndSettle();
     expect(find.text('Visible SAVE20'), findsOneWidget);
     expect(find.text('Save ₹40 · Pay ₹160'), findsOneWidget);
 
@@ -657,6 +697,96 @@ void main() {
     expect(find.text('Visible SAVE20 discount'), findsOneWidget);
     expect(find.text('-₹40'), findsOneWidget);
     expect(find.text('₹160'), findsOneWidget);
+  });
+
+  testWidgets('discount and Proin stay selected when applied in either order', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(390, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    final service = state.ownerSalon.services.single;
+    state.configureMockVisibleCheckoutDiscountOffer(
+      campaignId: 'stacked-save20',
+      campaignName: 'Stacked SAVE20',
+      salonId: salonId,
+      discountPercent: 20,
+    );
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500299');
+    await state.claimProinCoupon('SAVE50');
+
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: MaterialApp(
+          home: SalonBookingScreen(salonId: salonId, serviceId: service.id),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('booking-use-proin-switch')));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<Checkbox>(
+            find.byKey(const ValueKey('booking-use-proin-switch')),
+          )
+          .value,
+      isTrue,
+    );
+
+    final offerToggle = find.byKey(
+      const ValueKey('checkout-visible-discount-offers-toggle'),
+    );
+    await tester.scrollUntilVisible(
+      offerToggle,
+      420,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(offerToggle);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Stacked SAVE20'));
+    await tester.pumpAndSettle();
+
+    expect(
+      tester
+          .widget<Checkbox>(
+            find.byKey(const ValueKey('booking-use-proin-switch')),
+          )
+          .value,
+      isTrue,
+    );
+    expect(find.text('Stacked SAVE20 discount'), findsOneWidget);
+    expect(find.text('Proin used'), findsOneWidget);
+    final discountAmount = (service.price * 0.2).floor();
+    final afterDiscount = service.price - discountAmount;
+    final proinAmount = (afterDiscount * 0.25).floor();
+    expect(
+      find.text('-₹$discountAmount'),
+      discountAmount == proinAmount ? findsNWidgets(2) : findsOneWidget,
+    );
+    if (discountAmount != proinAmount) {
+      expect(find.text('-₹$proinAmount'), findsOneWidget);
+    }
+    expect(find.text('₹${afterDiscount - proinAmount}'), findsOneWidget);
+
+    final proinSwitch = find.byKey(const ValueKey('booking-use-proin-switch'));
+    final ensureProinVisible = Scrollable.ensureVisible(
+      tester.element(proinSwitch),
+      alignment: 0.5,
+      duration: const Duration(milliseconds: 200),
+    );
+    await tester.pumpAndSettle();
+    await ensureProinVisible;
+    await tester.tap(proinSwitch);
+    await tester.pumpAndSettle();
+    await tester.tap(proinSwitch);
+    await tester.pumpAndSettle();
+    expect(find.text('Stacked SAVE20 discount'), findsOneWidget);
+    expect(find.text('Proin used'), findsOneWidget);
   });
 
   test(
@@ -701,6 +831,60 @@ void main() {
       expect(booking.salonTotalEarning, 240);
     },
   );
+
+  test('created booking stores total minus discount minus Proin', () async {
+    final state = await _stateWithSalonService(signOut: false);
+    final salonId = state.ownerSalon.id;
+    final service = state.ownerSalon.services.single;
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9888888876',
+      speciality: 'Haircut specialist',
+      experienceYears: 3,
+      resumeSummary: 'Haircut specialist.',
+      serviceIds: [service.id],
+    );
+    state.configureMockVisibleCheckoutDiscountOffer(
+      campaignId: 'stacked-booking-save20',
+      campaignName: 'Stacked booking SAVE20',
+      salonId: salonId,
+      discountPercent: 20,
+    );
+    await state.signOutActiveUser();
+    await _loginCustomer(state, phone: '9876500202');
+    await state.claimProinCoupon('SAVE50');
+
+    final applied = await state.applyVisibleCheckoutDiscount(
+      salonId: salonId,
+      serviceIds: [service.id],
+      campaignId: 'stacked-booking-save20',
+    );
+    final discountQuote = applied.discountQuote!;
+    final proinQuote = await state.getProinBookingQuote(
+      salonId: salonId,
+      serviceIds: [service.id],
+      discountQuote: discountQuote,
+    );
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
+      quoteId: discountQuote.quoteId,
+      requestedProin: proinQuote.maximumRedeemableProin,
+    );
+
+    expect(booking.servicePrice, service.price);
+    expect(booking.discountAmount, discountQuote.discountAmount);
+    expect(
+      booking.customerPayableBeforeProin,
+      service.price - discountQuote.discountAmount,
+    );
+    expect(booking.proinReservedAmount, proinQuote.maximumRedeemableProin);
+    expect(
+      booking.customerPayableAmount,
+      service.price -
+          discountQuote.discountAmount -
+          proinQuote.maximumRedeemableProin,
+    );
+  });
 
   test(
     'an eligible discount is not applied until the customer selects it',
@@ -1273,7 +1457,10 @@ void main() {
   testWidgets('only the dedicated instant action opens instant booking', (
     tester,
   ) async {
-    final state = await _stateWithSalonService(signOut: false);
+    final state = await _stateWithSalonService(
+      signOut: false,
+      appState: _AlwaysInstantAvailableAppState(),
+    );
     final service = state.ownerSalon.services.single;
     await state.updateOwnerSalon(
       name: state.ownerSalon.name,
@@ -1319,9 +1506,15 @@ void main() {
     expect(find.text('Available slots'), findsNothing);
     expect(find.textContaining('any available barber'), findsNothing);
     expect(find.widgetWithText(FilledButton, 'Book for ₹0'), findsNothing);
+
+    final requestAction = find.text('Request instant booking');
+    final actionY = tester.getCenter(requestAction).dy;
+    await tester.drag(find.byType(ListView).first, const Offset(0, -300));
+    await tester.pumpAndSettle();
+    expect(tester.getCenter(requestAction).dy, closeTo(actionY, 0.1));
   });
 
-  testWidgets('closed salons expose services but block appointment entry', (
+  testWidgets('closed salons allow scheduled slots but block instant booking', (
     tester,
   ) async {
     final state = await _stateWithSalonService(signOut: false);
@@ -1355,14 +1548,20 @@ void main() {
 
     expect(find.text('Pick service'), findsOneWidget);
     expect(find.text('Pick barber'), findsOneWidget);
+    expect(find.text('Book instantly'), findsNothing);
+    expect(
+      find.textContaining('You can still schedule an appointment'),
+      findsOneWidget,
+    );
     await tester.tap(find.text('Pick service'));
     await tester.pumpAndSettle();
     expect(find.text(service.name), findsOneWidget);
     await tester.tap(find.text(service.name));
     await tester.pumpAndSettle();
 
-    expect(find.text('Salon is closed'), findsOneWidget);
-    expect(find.byType(SalonBookingScreen), findsNothing);
+    expect(find.text('Salon is closed'), findsNothing);
+    expect(find.byType(SalonBookingScreen), findsOneWidget);
+    expect(find.text('Book slot'), findsOneWidget);
   });
 
   testWidgets('salon card body opens the complete action preview', (
@@ -2264,6 +2463,7 @@ void main() {
       find.byKey(const Key('current-booking-bottom-panel')),
       findsOneWidget,
     );
+
     expect(find.text('CURRENT BOOKING'), findsOneWidget);
     expect(find.text('Haircut'), findsWidgets);
     expect(
@@ -2284,6 +2484,11 @@ void main() {
       find.byKey(const Key('current-booking-bottom-panel')),
       findsOneWidget,
     );
+
+    await tester.tap(find.byKey(const Key('current-booking-bottom-panel')));
+    await tester.pumpAndSettle();
+    expect(find.byType(MyBookingsScreen), findsOneWidget);
+    expect(find.byKey(const Key('current-booking-bottom-panel')), findsNothing);
   });
 
   testWidgets('customer cancellation removes all active UI immediately', (
@@ -2367,17 +2572,12 @@ void main() {
         findsOneWidget,
       );
 
-      await state.updateBookingStatus(
-        state.activeCustomerBooking!.id,
-        BookingStatus.cancelled,
-        cancellationReason:
-            'Oops, looks like the salon is busy. Please try again or see other nearby salons.',
-        cancelledBy: 'system',
-      );
-      await tester.pump();
+      await tester.pump(instantBookingResponseTimeout);
       await tester.pump(const Duration(milliseconds: 300));
 
       expect(state.activeCustomerBooking, isNull);
+      expect(state.customerBookings.single.status, BookingStatus.cancelled);
+      expect(state.customerBookings.single.cancelledBy, 'system');
       expect(
         find.byKey(const Key('current-booking-bottom-panel')),
         findsNothing,
@@ -2526,6 +2726,49 @@ void main() {
 
     expect(state.ownerSalon.services.single.isAvailable, isFalse);
     expect(find.text('Hidden'), findsOneWidget);
+  });
+
+  testWidgets('salon edit page saves private UPI payout details', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: SalonProfileSetupScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final upiField = find.byKey(const ValueKey('salon-payment-upi-id-field'));
+    await tester.scrollUntilVisible(
+      upiField,
+      240,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.text('Private payment details'), findsOneWidget);
+    expect(find.textContaining('Customers cannot see them.'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('upload-salon-payment-qr')),
+      findsOneWidget,
+    );
+
+    await tester.enterText(upiField, 'Pritze.Salon@Bank');
+    await tester.tap(find.byKey(const ValueKey('save-salon-payment-upi-id')));
+    await tester.pumpAndSettle();
+
+    expect(state.ownerPaymentUpiId, 'pritze.salon@bank');
+    expect(find.text('Private payment details saved'), findsOneWidget);
+  });
+
+  test('invalid salon UPI IDs are rejected before storage', () async {
+    final state = await _stateWithSalonService(signOut: false);
+
+    await expectLater(
+      state.saveOwnerPaymentUpiId('not a upi id'),
+      throwsA(isA<FormatException>()),
+    );
+    expect(state.ownerPaymentUpiId, isEmpty);
   });
 
   testWidgets('owner can edit a displayed service price by tapping it', (
@@ -2823,7 +3066,7 @@ void main() {
     },
   );
 
-  testWidgets('instant reach-by time appears only after salon acceptance', (
+  testWidgets('booking screen updates after acceptance without bottom footer', (
     tester,
   ) async {
     final state = await _stateWithSalonService(signOut: false);
@@ -2861,18 +3104,15 @@ void main() {
     );
     await tester.pump();
 
-    expect(
-      find.textContaining('Waiting for the salon to accept'),
-      findsOneWidget,
-    );
-    expect(find.textContaining('Reach by'), findsNothing);
+    expect(find.byKey(const Key('current-booking-bottom-panel')), findsNothing);
+    expect(find.text('Pending'), findsWidgets);
+    expect(find.text('Arrival update'), findsNothing);
 
     await state.updateBookingStatus(booking.id, BookingStatus.confirmed);
     await tester.pump();
 
-    expect(find.textContaining('Reach by'), findsOneWidget);
-    expect(find.textContaining('about 15 min remaining'), findsOneWidget);
-    expect(find.textContaining('Starts in'), findsNothing);
+    expect(find.text('Arrival update'), findsOneWidget);
+    expect(find.byKey(const Key('current-booking-bottom-panel')), findsNothing);
   });
 
   testWidgets(
@@ -3043,11 +3283,57 @@ void main() {
       salonId: salonId,
       serviceId: service.id,
     );
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(
+          home: CustomerBookingConfirmationGate(child: Scaffold()),
+        ),
+      ),
+    );
+    await tester.pump();
+
     await state.updateBookingStatus(
       booking.id,
       BookingStatus.rejected,
       cancellationReason: 'Rejected by salon',
       cancelledBy: 'owner',
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Salon is busy'), findsOneWidget);
+    expect(find.textContaining('Try a different salon'), findsOneWidget);
+    expect(find.text('Find another salon'), findsOneWidget);
+  });
+
+  testWidgets('completed service opens the receipt as soon as status changes', (
+    tester,
+  ) async {
+    final state = await _stateWithSalonService(signOut: false);
+    final service = state.ownerSalon.services.single;
+    await state.updateOwnerSalon(
+      name: state.ownerSalon.name,
+      ownerName: state.ownerSalon.ownerName,
+      address: state.ownerSalon.address,
+      directionsUrl: state.ownerSalon.directionsUrl,
+      phone: state.ownerSalon.phone,
+      openTime: '12:00 AM',
+      closeTime: '11:59 PM',
+    );
+    await state.addOwnerBarber(
+      name: 'Ravi',
+      phone: '9333333344',
+      speciality: 'Haircut specialist',
+      experienceYears: 4,
+      resumeSummary: 'Customer bookings.',
+      serviceIds: [service.id],
+    );
+    final salonId = state.ownerSalon.id;
+    await state.signOutActiveUser();
+    await _loginCustomer(state);
+    final booking = await state.createBooking(
+      slot: state.slotsForService(salonId, service.id).first,
     );
 
     await tester.pumpWidget(
@@ -3059,11 +3345,15 @@ void main() {
       ),
     );
     await tester.pump();
+    expect(find.text('Service completed'), findsNothing);
+
+    await state.updateBookingStatus(booking.id, BookingStatus.inProgress);
+    await state.updateBookingStatus(booking.id, BookingStatus.completed);
+    await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
 
-    expect(find.text('Booking rejected'), findsOneWidget);
-    expect(find.textContaining('could not accept'), findsOneWidget);
-    expect(find.text('Find another salon'), findsOneWidget);
+    expect(find.text('Service completed'), findsOneWidget);
+    expect(find.text('Continue to feedback'), findsOneWidget);
   });
 
   testWidgets('salon cancellation opens a clear customer outcome popup', (
@@ -3305,6 +3595,52 @@ void main() {
       expect(endMinutes, lessThanOrEqualTo(12 * 60));
     }
   });
+
+  test(
+    'scheduled appointments can be booked while the salon is closed',
+    () async {
+      final state = await _stateWithSalonService(signOut: false);
+      final now = DateTime.now();
+      final openTime = now.hour < 12 ? '8:00 PM' : '6:00 AM';
+      final closeTime = now.hour < 12 ? '10:00 PM' : '8:00 AM';
+      await state.updateOwnerSalon(
+        name: state.ownerSalon.name,
+        ownerName: state.ownerSalon.ownerName,
+        address: state.ownerSalon.address,
+        phone: state.ownerSalon.phone,
+        openTime: openTime,
+        closeTime: closeTime,
+      );
+      final salonId = state.ownerSalon.id;
+      final service = state.ownerSalon.services.single;
+      await state.addOwnerBarber(
+        name: 'After-hours scheduler',
+        phone: '9444444499',
+        speciality: 'Scheduled services',
+        experienceYears: 4,
+        resumeSummary: 'Accepts future appointments.',
+        serviceIds: [service.id],
+      );
+      await state.signOutActiveUser();
+      await _loginCustomer(state, phone: '9876500299');
+
+      expect(state.isSalonCurrentlyOpen(salonId), isFalse);
+      final slots = state.slotsForService(salonId, service.id);
+      expect(slots, isNotEmpty);
+      final booking = await state.createBooking(slot: slots.first);
+
+      expect(booking.isInstant, isFalse);
+      expect(booking.start.isAfter(now), isTrue);
+      for (final slot in slots) {
+        final startMinutes = slot.start.hour * 60 + slot.start.minute;
+        final endMinutes = startMinutes + service.durationMinutes;
+        final expectedOpen = now.hour < 12 ? 20 * 60 : 6 * 60;
+        final expectedClose = now.hour < 12 ? 22 * 60 : 8 * 60;
+        expect(startMinutes, greaterThanOrEqualTo(expectedOpen));
+        expect(endMinutes, lessThanOrEqualTo(expectedClose));
+      }
+    },
+  );
 
   testWidgets('owner chooses opening and closing hours with time pickers', (
     tester,
@@ -4038,7 +4374,7 @@ void main() {
     );
 
     expect(find.text('Ratings from salons'), findsOneWidget);
-    expect(find.text('Feedback you shared'), findsOneWidget);
+    expect(find.text('Ratings you gave salons'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('edit-customer-profile')));
     await tester.pumpAndSettle();
 
@@ -4072,6 +4408,67 @@ void main() {
     expect(state.customerAccount?.name, 'Updated Customer');
     expect(state.customerAccount?.contact, '+919876500001');
     expect(state.customerAccount?.preferredStyles, contains('Fade'));
+  });
+
+  testWidgets('profile rating histories expand and collapse independently', (
+    tester,
+  ) async {
+    final state = AppState();
+    await _loginCustomer(state);
+    await tester.pumpWidget(
+      AppStateProvider(
+        createAppState: () => state,
+        child: const MaterialApp(home: CustomerProfileScreen()),
+      ),
+    );
+
+    expect(
+      find.text('No salon has rated a completed visit yet.'),
+      findsNothing,
+    );
+    expect(
+      find.text('Your completed-visit feedback will appear here.'),
+      findsNothing,
+    );
+
+    final ratingsFromSalonsToggle = find.byKey(
+      const ValueKey('ratings-from-salons-toggle'),
+    );
+    await tester.tap(ratingsFromSalonsToggle);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('No salon has rated a completed visit yet.'),
+      findsOneWidget,
+    );
+    await tester.tap(ratingsFromSalonsToggle);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('No salon has rated a completed visit yet.'),
+      findsNothing,
+    );
+
+    final ratingsGivenToggle = find.byKey(
+      const ValueKey('ratings-given-to-salons-toggle'),
+    );
+    final ensureRatingsGivenVisible = Scrollable.ensureVisible(
+      tester.element(ratingsGivenToggle),
+      alignment: 0.3,
+      duration: const Duration(milliseconds: 200),
+    );
+    await tester.pumpAndSettle();
+    await ensureRatingsGivenVisible;
+    await tester.tap(ratingsGivenToggle);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Your completed-visit feedback will appear here.'),
+      findsOneWidget,
+    );
+    await tester.tap(ratingsGivenToggle);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Your completed-visit feedback will appear here.'),
+      findsNothing,
+    );
   });
 
   test('completed visits support feedback in both directions', () async {
@@ -4354,7 +4751,20 @@ void main() {
     expect(find.text('Accept booking'), findsNothing);
     expect(
       find.byKey(const ValueKey('booking-arrival-bottom-panel-salon')),
+      findsNothing,
+    );
+
+    await tester.tap(find.widgetWithText(Tab, 'Overview'));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('booking-arrival-bottom-panel-salon')),
       findsOneWidget,
+    );
+    await tester.tap(find.widgetWithText(Tab, 'Bookings'));
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('booking-arrival-bottom-panel-salon')),
+      findsNothing,
     );
 
     await tester.pumpAndSettle();
@@ -5373,6 +5783,32 @@ class _CountingAppState extends AppState {
     slotQueryCount++;
     return super.slotsForService(salonId, serviceId, barberId: barberId);
   }
+}
+
+class _AlwaysInstantAvailableAppState extends AppState {
+  @override
+  bool isInstantBookingAvailable(
+    String salonId, {
+    String? serviceId,
+    DateTime? now,
+    int arrivalMinutes = 15,
+  }) => true;
+
+  @override
+  bool isInstantBookingAvailableForServices(
+    String salonId,
+    Iterable<String> serviceIds, {
+    DateTime? now,
+    int arrivalMinutes = 15,
+  }) => true;
+
+  @override
+  bool isInstantMultiServiceBookingAvailable(
+    String salonId,
+    Iterable<String> serviceIds, {
+    DateTime? now,
+    int arrivalMinutes = 15,
+  }) => true;
 }
 
 class _DelayedBookingStatusAppState extends AppState {

@@ -26,7 +26,8 @@ test("instant requests have a strict 150-second response window", () => {
     path.join(__dirname, "index.js"),
     "utf8",
   );
-  assert.match(functionSource, /OWNER_ALERT_ATTEMPTS = 6/);
+  assert.match(functionSource, /OWNER_ALERT_ATTEMPTS = 10/);
+  assert.match(functionSource, /OWNER_ALERT_REPEAT_DELAY_MS = 15_000/);
   assert.match(functionSource, /expirePendingInstantBooking/);
   assert.match(functionSource, /No response from salon within 150 seconds/);
   assert.match(functionSource, /Oops, looks like the salon is busy/);
@@ -278,6 +279,10 @@ test("instant bookings validate and preserve grouped services", () => {
   assert.match(functionSource, /serviceIds,\n\s+barberId:/);
   assert.match(functionSource, /services\.reduce\(/);
   assert.match(functionSource, /This salon is currently closed\./);
+  assert.match(
+    functionSource,
+    /if \(isInstant && !isWithinSalonHours\(\{[\s\S]*?startMillis: nowMillis/,
+  );
 });
 
 test("Android update lookup activates only a Play-published candidate", () => {

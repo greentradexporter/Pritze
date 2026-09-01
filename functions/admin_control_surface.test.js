@@ -5,6 +5,10 @@ const test = require("node:test");
 
 const source = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
 const rules = fs.readFileSync(path.join(__dirname, "..", "firestore.rules"), "utf8");
+const storageRules = fs.readFileSync(
+  path.join(__dirname, "..", "storage.rules"),
+  "utf8",
+);
 
 test("Phase 2 administrator controls stay behind privileged callable functions", () => {
   for (const callable of [
@@ -50,6 +54,22 @@ test("administrator writes create immutable audit records", () => {
   assert.match(source, /collection\("discountCampaignVersions"\)/);
   assert.match(source, /action: "discount\.vault_budget_changed"/);
   assert.match(source, /"referral\.code_replaced"/);
+});
+
+test("private salon payment details are exposed only through admin data", () => {
+  assert.match(source, /collection\("salonPaymentProfiles"\)/);
+  assert.match(source, /paymentUpiId: adminString\(paymentProfile\.upiId\)/);
+  assert.match(
+    source,
+    /paymentQrCodeUrl: adminString\(paymentProfile\.qrCodeUrl\)/,
+  );
+  assert.match(rules, /match \/salonPaymentProfiles\/\{salonId\}/);
+  assert.match(rules, /allow read: if ownsSalon\(salonId\)/);
+  assert.match(
+    storageRules,
+    /match \/salons\/\{salonId\}\/payments\/\{paymentFile\}/,
+  );
+  assert.match(storageRules, /allow read: if ownsSalon\(salonId\)/);
 });
 
 test("team password sign-in is server-verified, rate-limited and audited", () => {

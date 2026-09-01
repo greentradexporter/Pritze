@@ -4,6 +4,7 @@ import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../state/app_state.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/rating_utils.dart';
 import '../../utils/url_launcher_utils.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/account_actions.dart';
@@ -151,12 +152,16 @@ class _CustomerHomeScreenState extends State<CustomerHomeScreen> {
         .toList();
 
     salons.sort((a, b) {
+      final reviewOrder = compareSalonsByRating(a, b);
+      if (reviewOrder != 0) {
+        return reviewOrder;
+      }
       final aPriority = _salonSortPriority(appState, a);
       final bPriority = _salonSortPriority(appState, b);
       if (aPriority != bPriority) {
         return aPriority.compareTo(bPriority);
       }
-      return b.rating.compareTo(a.rating);
+      return a.displayName.compareTo(b.displayName);
     });
 
     return salons;
@@ -884,7 +889,7 @@ class _SalonRating extends StatelessWidget {
         const Icon(Icons.star_rounded, color: AppColors.amber, size: 18),
         const SizedBox(width: 3),
         Text(
-          '$rating',
+          formatRating(rating),
           style: const TextStyle(
             color: AppColors.ink,
             fontSize: 14,

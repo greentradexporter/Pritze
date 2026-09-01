@@ -340,6 +340,17 @@ service cloud.firestore {
         resource.data.ownerUid == request.auth.uid;
     }
 
+    // UPI handles and QR-code URLs are deliberately separated from the public
+    // salon listing. Only the authenticated owner can read or write this doc;
+    // platform administrators access it through trusted callable functions.
+    match /salonPaymentProfiles/{salonId} {
+      allow read: if ownsSalon(salonId);
+      allow create, update: if ownsSalon(salonId) &&
+        request.resource.data.salonId == salonId &&
+        request.resource.data.ownerUid == request.auth.uid;
+      allow delete: if ownsSalon(salonId);
+    }
+
     match /barbers/{barberId} {
       allow read: if true;
       allow create: if signedInAs('owner') &&

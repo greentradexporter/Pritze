@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../../models/app_models.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/rating_utils.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/app_bottom_nav.dart';
 import '../../widgets/app_error_dialog.dart';
@@ -1012,7 +1013,7 @@ class _ProfileHero extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        '${account.salonRating.toStringAsFixed(1)} from ${account.salonRatingCount} salon ${account.salonRatingCount == 1 ? 'visit' : 'visits'}',
+                        '${formatRating(account.salonRating)} from ${account.salonRatingCount} salon ${account.salonRatingCount == 1 ? 'visit' : 'visits'}',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ],
@@ -1171,44 +1172,43 @@ class _SalonRatingsSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const SectionHeader(title: 'Ratings from salons'),
-        const SizedBox(height: 10),
-        GlassCard(
-          child: ratings.isEmpty
-              ? const Text('No salon has rated a completed visit yet.')
-              : Column(
+    return _ExpandableRatingsCard(
+      toggleKey: const ValueKey('ratings-from-salons-toggle'),
+      title: 'Ratings from salons',
+      subtitle: ratings.isEmpty
+          ? 'No ratings yet'
+          : '${formatRating(account.salonRating)} average · ${ratings.length} ${ratings.length == 1 ? 'visit' : 'visits'}',
+      icon: Icons.reviews_outlined,
+      child: ratings.isEmpty
+          ? const Text('No salon has rated a completed visit yet.')
+          : Column(
+              children: [
+                Row(
                   children: [
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.star_rounded,
-                          color: AppColors.amber,
-                          size: 30,
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          account.salonRating.toStringAsFixed(1),
-                          style: Theme.of(context).textTheme.headlineMedium,
-                        ),
-                        const SizedBox(width: 6),
-                        Text('across ${ratings.length} visits'),
-                      ],
+                    const Icon(
+                      Icons.star_rounded,
+                      color: AppColors.amber,
+                      size: 30,
                     ),
-                    for (final rating in ratings) ...[
-                      const Divider(height: 22),
-                      _RatingEntry(
-                        salonName: rating.salonName,
-                        rating: rating.rating,
-                        note: rating.note,
-                      ),
-                    ],
+                    const SizedBox(width: 8),
+                    Text(
+                      formatRating(account.salonRating),
+                      style: Theme.of(context).textTheme.headlineMedium,
+                    ),
+                    const SizedBox(width: 6),
+                    Text('across ${ratings.length} visits'),
                   ],
                 ),
-        ),
-      ],
+                for (final rating in ratings) ...[
+                  const Divider(height: 22),
+                  _RatingEntry(
+                    salonName: rating.salonName,
+                    rating: rating.rating,
+                    note: rating.note,
+                  ),
+                ],
+              ],
+            ),
     );
   }
 }
@@ -1220,28 +1220,100 @@ class _FeedbackSharedSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const SectionHeader(title: 'Feedback you shared'),
-        const SizedBox(height: 10),
-        GlassCard(
-          child: feedback.isEmpty
-              ? const Text('Your completed-visit feedback will appear here.')
-              : Column(
-                  children: [
-                    for (var index = 0; index < feedback.length; index++) ...[
-                      if (index > 0) const Divider(height: 22),
-                      _RatingEntry(
-                        salonName: feedback[index].salonName,
-                        rating: feedback[index].rating,
-                        note: feedback[index].note,
+    return _ExpandableRatingsCard(
+      toggleKey: const ValueKey('ratings-given-to-salons-toggle'),
+      title: 'Ratings you gave salons',
+      subtitle: feedback.isEmpty
+          ? 'No ratings shared yet'
+          : '${feedback.length} ${feedback.length == 1 ? 'review' : 'reviews'} shared',
+      icon: Icons.rate_review_outlined,
+      child: feedback.isEmpty
+          ? const Text('Your completed-visit feedback will appear here.')
+          : Column(
+              children: [
+                for (var index = 0; index < feedback.length; index++) ...[
+                  if (index > 0) const Divider(height: 22),
+                  _RatingEntry(
+                    salonName: feedback[index].salonName,
+                    rating: feedback[index].rating,
+                    note: feedback[index].note,
+                  ),
+                ],
+              ],
+            ),
+    );
+  }
+}
+
+class _ExpandableRatingsCard extends StatefulWidget {
+  final Key toggleKey;
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final Widget child;
+
+  const _ExpandableRatingsCard({
+    required this.toggleKey,
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.child,
+  });
+
+  @override
+  State<_ExpandableRatingsCard> createState() => _ExpandableRatingsCardState();
+}
+
+class _ExpandableRatingsCardState extends State<_ExpandableRatingsCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      padding: EdgeInsets.zero,
+      child: Column(
+        children: [
+          ListTile(
+            key: widget.toggleKey,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 4,
+            ),
+            leading: SoftIconBox(
+              icon: widget.icon,
+              color: AppColors.primary,
+              size: 42,
+            ),
+            title: Text(
+              widget.title,
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+            subtitle: Text(widget.subtitle),
+            trailing: AnimatedRotation(
+              turns: _expanded ? 0.5 : 0,
+              duration: const Duration(milliseconds: 180),
+              child: const Icon(Icons.keyboard_arrow_down_rounded),
+            ),
+            onTap: () => setState(() => _expanded = !_expanded),
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.topCenter,
+            child: _expanded
+                ? Column(
+                    children: [
+                      const Divider(height: 1),
+                      Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: widget.child,
                       ),
                     ],
-                  ],
-                ),
-        ),
-      ],
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ],
+      ),
     );
   }
 }

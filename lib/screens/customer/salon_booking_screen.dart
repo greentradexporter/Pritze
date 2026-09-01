@@ -283,7 +283,20 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
           context,
         ).push(MaterialPageRoute(builder: (_) => const MyBookingsScreen())),
         action: isInstantOnly
-            ? null
+            ? SafeArea(
+                top: false,
+                minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
+                child: _InstantBookingCard(
+                  enabled: canRequestInstant && !_priceSelectionPending,
+                  isLoading: _isInstantBooking,
+                  selectedArrivalMinutes: _instantArrivalMinutes,
+                  activeBooking: activeCustomerBooking,
+                  onArrivalMinutesChanged: (minutes) {
+                    setState(() => _instantArrivalMinutes = minutes);
+                  },
+                  onRequest: () => _startInstantBookingLogin(context),
+                ),
+              )
             : SafeArea(
                 minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
                 child: FilledButton.icon(
@@ -442,18 +455,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
             ),
           ],
           const SizedBox(height: 14),
-          if (isInstantOnly) ...[
-            _InstantBookingCard(
-              enabled: canRequestInstant && !_priceSelectionPending,
-              isLoading: _isInstantBooking,
-              selectedArrivalMinutes: _instantArrivalMinutes,
-              activeBooking: activeCustomerBooking,
-              onArrivalMinutesChanged: (minutes) {
-                setState(() => _instantArrivalMinutes = minutes);
-              },
-              onRequest: () => _startInstantBookingLogin(context),
-            ),
-          ] else ...[
+          if (!isInstantOnly) ...[
             if (selectedBarber == null) ...[
               const SectionHeader(title: 'Choose barber'),
               const SizedBox(height: 10),
@@ -853,21 +855,25 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
       );
       if (!mounted) return;
       setState(() {
+        final keepUsingProin =
+            _useProin ||
+            (result.grantsProin &&
+                appState.customerProinWallet.availableProin > 0);
         if (result.discountQuote != null) {
           _discountQuoteKey = _discountKey(appState, salonId, serviceIds);
           _discountQuoteFuture = Future.value(result.discountQuote!);
         }
-        _appliedVisibleCampaignId = '';
+        if (result.appliesDiscount) {
+          _appliedVisibleCampaignId = '';
+        }
         _proinQuoteKey = '';
         _proinQuoteFuture = null;
         _proinWalletKey = '';
         _proinWalletFuture = result.grantsProin
             ? Future.value(appState.customerProinWallet)
             : null;
-        _useProin =
-            result.grantsProin &&
-            appState.customerProinWallet.availableProin > 0;
-        _couponMessage = result.grantsProin && _useProin
+        _useProin = keepUsingProin;
+        _couponMessage = result.grantsProin && keepUsingProin
             ? '${result.message} Proin is ready to use on this booking.'
             : result.message;
         _couponApplied = result.appliesDiscount || result.grantsProin;
@@ -915,7 +921,6 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
       _appliedVisibleCampaignId = offer.campaignId;
       _couponMessage = 'Applying ${offer.campaignName}...';
       _couponApplied = true;
-      _useProin = false;
       _proinQuoteKey = '';
       _proinQuoteFuture = null;
     });
@@ -942,7 +947,6 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
         _proinQuoteFuture = null;
         _proinWalletKey = '';
         _proinWalletFuture = null;
-        _useProin = false;
         _appliedVisibleCampaignId = offer.campaignId;
         _couponMessage = result.message;
         _couponApplied = result.appliesDiscount;
@@ -969,7 +973,6 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
     _proinQuoteKey = '';
     _proinWalletFuture = null;
     _proinWalletKey = '';
-    _useProin = false;
     _applyingVisibleCampaignId = '';
     _appliedVisibleCampaignId = '';
     _couponMessage = '';
@@ -1597,7 +1600,7 @@ class _CheckoutOffersLoadingCard extends StatelessWidget {
   }
 }
 
-class _CheckoutVisibleOffersCard extends StatelessWidget {
+class _CheckoutVisibleOffersCard extends StatefulWidget {
   final List<CheckoutDiscountOffer> offers;
   final String applyingCampaignId;
   final String appliedCampaignId;
@@ -1611,65 +1614,138 @@ class _CheckoutVisibleOffersCard extends StatelessWidget {
   });
 
   @override
+  State<_CheckoutVisibleOffersCard> createState() =>
+      _CheckoutVisibleOffersCardState();
+}
+
+class _CheckoutVisibleOffersCardState
+    extends State<_CheckoutVisibleOffersCard> {
+  bool _expanded = false;
+
+  @override
   Widget build(BuildContext context) {
-    final visibleOffers = offers.take(4).toList(growable: false);
+    final bestSaving = widget.offers.fold<int>(
+      0,
+      (best, offer) =>
+          offer.discountAmount > best ? offer.discountAmount : best,
+    );
+    final hasAppliedOffer = widget.appliedCampaignId.isNotEmpty;
     return Container(
       key: const ValueKey('checkout-visible-discount-offers'),
-      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         gradient: const LinearGradient(
-          colors: [Color(0xFFFFF4D8), Color(0xFFFFFBF2)],
+          colors: [Color(0xFFFFF1CD), Color(0xFFFFFCF5)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
         ),
         borderRadius: BorderRadius.circular(18),
         border: Border.all(color: AppColors.primary.withAlpha(64)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x10000000),
+            blurRadius: 16,
+            offset: Offset(0, 7),
+          ),
+        ],
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const SoftIconBox(
-                icon: Icons.sell_outlined,
-                color: AppColors.primary,
-                size: 38,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+          Material(
+            color: Colors.transparent,
+            child: InkWell(
+              key: const ValueKey('checkout-visible-discount-offers-toggle'),
+              onTap: () => setState(() => _expanded = !_expanded),
+              borderRadius: BorderRadius.circular(18),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 13,
+                ),
+                child: Row(
                   children: [
-                    Text(
-                      offers.length == 1
-                          ? 'Available discount'
-                          : 'Available discounts',
-                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w800,
+                    const SoftIconBox(
+                      icon: Icons.local_offer_outlined,
+                      color: AppColors.primary,
+                      size: 42,
+                    ),
+                    const SizedBox(width: 11),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'View applicable offers',
+                            style: Theme.of(context).textTheme.titleSmall
+                                ?.copyWith(fontWeight: FontWeight.w800),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            hasAppliedOffer
+                                ? 'Offer applied · tap to view or change it'
+                                : '${widget.offers.length} ${widget.offers.length == 1 ? 'offer' : 'offers'} available · save up to ₹$bestSaving',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: hasAppliedOffer
+                                      ? AppColors.success
+                                      : AppColors.muted,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                          ),
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      'Tap one before booking to update your final price.',
-                      style: Theme.of(context).textTheme.bodySmall,
+                    AnimatedRotation(
+                      turns: _expanded ? 0.5 : 0,
+                      duration: const Duration(milliseconds: 180),
+                      child: const Icon(Icons.keyboard_arrow_down_rounded),
                     ),
                   ],
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          for (var index = 0; index < visibleOffers.length; index++) ...[
-            _CheckoutVisibleOfferTile(
-              offer: visibleOffers[index],
-              applying: applyingCampaignId == visibleOffers[index].campaignId,
-              applied: appliedCampaignId == visibleOffers[index].campaignId,
-              disabled:
-                  applyingCampaignId.isNotEmpty ||
-                  (appliedCampaignId.isNotEmpty &&
-                      appliedCampaignId != visibleOffers[index].campaignId),
-              onApply: () => onApply(visibleOffers[index]),
             ),
-            if (index < visibleOffers.length - 1) const SizedBox(height: 8),
-          ],
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.topCenter,
+            child: _expanded
+                ? Column(
+                    children: [
+                      Divider(
+                        height: 1,
+                        color: AppColors.primary.withAlpha(38),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          children: [
+                            for (
+                              var index = 0;
+                              index < widget.offers.length;
+                              index++
+                            ) ...[
+                              _CheckoutVisibleOfferTile(
+                                offer: widget.offers[index],
+                                applying:
+                                    widget.applyingCampaignId ==
+                                    widget.offers[index].campaignId,
+                                applied:
+                                    widget.appliedCampaignId ==
+                                    widget.offers[index].campaignId,
+                                disabled: widget.applyingCampaignId.isNotEmpty,
+                                onApply: () =>
+                                    widget.onApply(widget.offers[index]),
+                              ),
+                              if (index < widget.offers.length - 1)
+                                const SizedBox(height: 8),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  )
+                : const SizedBox.shrink(),
+          ),
         ],
       ),
     );

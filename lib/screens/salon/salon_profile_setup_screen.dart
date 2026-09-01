@@ -30,11 +30,14 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
   final _emailController = TextEditingController();
   final _openTimeController = TextEditingController();
   final _closeTimeController = TextEditingController();
+  final _upiIdController = TextEditingController();
   List<String> _photoUrls = [];
   bool _loaded = false;
   bool _isSaving = false;
   bool _isImportingServices = false;
   bool _isUploadingPhotos = false;
+  bool _isSavingPaymentDetails = false;
+  bool _isUploadingPaymentQr = false;
 
   @override
   void didChangeDependencies() {
@@ -57,7 +60,23 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _photoUrls = [...salon.photoUrls];
     _openTimeController.text = formatSalonClockTime(salon.openTime);
     _closeTimeController.text = formatSalonClockTime(salon.closeTime);
+    _upiIdController.text = appState.ownerPaymentUpiId;
     _loaded = true;
+    if (appState.ownerSalonOrNull != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        try {
+          await appState.refreshOwnerPaymentDetails();
+          if (mounted && _upiIdController.text.trim().isEmpty) {
+            _upiIdController.text = appState.ownerPaymentUpiId;
+          }
+        } catch (error) {
+          if (mounted) {
+            await showAppErrorDialog(context, friendlyOnboardingError(error));
+          }
+        }
+      });
+    }
     if (appState.ownerSalonOrNull == null &&
         !hasCanonicalSalonServices(salon.services)) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -83,6 +102,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     _emailController.dispose();
     _openTimeController.dispose();
     _closeTimeController.dispose();
+    _upiIdController.dispose();
     super.dispose();
   }
 
@@ -242,6 +262,20 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   ),
                 ],
               ),
+            ),
+            const SizedBox(height: 24),
+            const SectionHeader(title: 'Private payment details'),
+            const SizedBox(height: 10),
+            _SalonPaymentDetailsCard(
+              upiIdController: _upiIdController,
+              qrCodeUrl: appState.ownerPaymentQrCodeUrl,
+              profileSaved: !isNewOnboarding,
+              isSaving: _isSavingPaymentDetails,
+              isUploadingQr: _isUploadingPaymentQr,
+              upiValidator: _upiId,
+              onSaveUpi: () => _savePaymentDetails(context),
+              onUploadQr: () => _pickAndUploadPaymentQr(context),
+              onRemoveQr: () => _removePaymentQr(context),
             ),
             const SizedBox(height: 24),
             SectionHeader(
@@ -631,6 +665,93 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
     }
   }
 
+  Future<void> _savePaymentDetails(BuildContext context) async {
+    final error = _upiId(_upiIdController.text);
+    if (error != null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error)));
+      return;
+    }
+    setState(() => _isSavingPaymentDetails = true);
+    try {
+      await AppStateScope.read(
+        context,
+      ).saveOwnerPaymentUpiId(_upiIdController.text);
+      if (!context.mounted) return;
+      _upiIdController.text = AppStateScope.read(context).ownerPaymentUpiId;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Private payment details saved')),
+      );
+    } catch (error) {
+      if (context.mounted) {
+        await showAppErrorDialog(context, friendlyOnboardingError(error));
+      }
+    } finally {
+      if (mounted) setState(() => _isSavingPaymentDetails = false);
+    }
+  }
+
+  Future<void> _pickAndUploadPaymentQr(BuildContext context) async {
+    final appState = AppStateScope.read(context);
+    if (appState.ownerSalonOrNull == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Save the shop registration first.')),
+      );
+      return;
+    }
+    final upiError = _upiId(_upiIdController.text);
+    if (upiError != null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(upiError)));
+      return;
+    }
+    setState(() => _isUploadingPaymentQr = true);
+    try {
+      final image = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 92,
+        maxWidth: 1600,
+        maxHeight: 1600,
+      );
+      if (image == null) return;
+      await appState.saveOwnerPaymentUpiId(_upiIdController.text);
+      await appState.uploadOwnerPaymentQrCode(
+        bytes: await image.readAsBytes(),
+        fileName: image.name,
+        contentType: image.mimeType,
+      );
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Private payment QR code uploaded')),
+      );
+    } catch (error) {
+      if (context.mounted) {
+        await showAppErrorDialog(context, friendlyOnboardingError(error));
+      }
+    } finally {
+      if (mounted) setState(() => _isUploadingPaymentQr = false);
+    }
+  }
+
+  Future<void> _removePaymentQr(BuildContext context) async {
+    setState(() => _isUploadingPaymentQr = true);
+    try {
+      await AppStateScope.read(context).removeOwnerPaymentQrCode();
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Payment QR code removed')));
+    } catch (error) {
+      if (context.mounted) {
+        await showAppErrorDialog(context, friendlyOnboardingError(error));
+      }
+    } finally {
+      if (mounted) setState(() => _isUploadingPaymentQr = false);
+    }
+  }
+
   Future<void> _removeSalonPhoto(BuildContext context, String photoUrl) async {
     setState(() => _isUploadingPhotos = true);
     try {
@@ -668,6 +789,211 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       return 'Paste a complete link beginning with https://';
     }
     return null;
+  }
+
+  String? _upiId(String? value) {
+    final normalized = value?.trim().toLowerCase() ?? '';
+    if (normalized.isEmpty) return null;
+    if (normalized.length > 100 ||
+        !RegExp(
+          r'^[a-z0-9._-]{2,64}@[a-z][a-z0-9.-]{1,32}$',
+        ).hasMatch(normalized)) {
+      return 'Enter a valid UPI ID, for example salon@bank.';
+    }
+    return null;
+  }
+}
+
+class _SalonPaymentDetailsCard extends StatelessWidget {
+  final TextEditingController upiIdController;
+  final String qrCodeUrl;
+  final bool profileSaved;
+  final bool isSaving;
+  final bool isUploadingQr;
+  final FormFieldValidator<String> upiValidator;
+  final VoidCallback onSaveUpi;
+  final VoidCallback onUploadQr;
+  final VoidCallback onRemoveQr;
+
+  const _SalonPaymentDetailsCard({
+    required this.upiIdController,
+    required this.qrCodeUrl,
+    required this.profileSaved,
+    required this.isSaving,
+    required this.isUploadingQr,
+    required this.upiValidator,
+    required this.onSaveUpi,
+    required this.onUploadQr,
+    required this.onRemoveQr,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GlassCard(
+      color: AppColors.mint.withAlpha(35),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SoftIconBox(
+                icon: Icons.account_balance_wallet_outlined,
+                color: AppColors.primary,
+                size: 46,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'UPI payout details',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Only your salon account and the Pritze backend team can access these details. Customers cannot see them.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+              const AppPill(
+                icon: Icons.lock_outline,
+                label: 'Private',
+                color: AppColors.primary,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          TextFormField(
+            key: const ValueKey('salon-payment-upi-id-field'),
+            controller: upiIdController,
+            enabled: profileSaved && !isSaving,
+            keyboardType: TextInputType.emailAddress,
+            autocorrect: false,
+            textCapitalization: TextCapitalization.none,
+            validator: upiValidator,
+            decoration: const InputDecoration(
+              labelText: 'UPI ID',
+              hintText: 'salonname@bank',
+              helperText: 'Used privately by Pritze for salon payouts.',
+              prefixIcon: Icon(Icons.alternate_email),
+            ),
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              key: const ValueKey('save-salon-payment-upi-id'),
+              onPressed: !profileSaved || isSaving ? null : onSaveUpi,
+              icon: isSaving
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.save_outlined),
+              label: Text(isSaving ? 'Saving...' : 'Save UPI ID'),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'Payment QR code',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+          const SizedBox(height: 8),
+          if (qrCodeUrl.isEmpty)
+            Container(
+              key: const ValueKey('salon-payment-qr-empty'),
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 22, horizontal: 16),
+              decoration: BoxDecoration(
+                color: Colors.white.withAlpha(190),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: AppColors.line),
+              ),
+              child: const Column(
+                children: [
+                  Icon(
+                    Icons.qr_code_2_rounded,
+                    size: 42,
+                    color: AppColors.muted,
+                  ),
+                  SizedBox(height: 7),
+                  Text('No payment QR code uploaded'),
+                ],
+              ),
+            )
+          else
+            Center(
+              child: Container(
+                key: const ValueKey('salon-payment-qr-preview'),
+                width: 220,
+                height: 220,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppColors.line),
+                ),
+                child: Image.network(
+                  qrCodeUrl,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, _, _) => const Center(
+                    child: Icon(Icons.broken_image_outlined, size: 42),
+                  ),
+                ),
+              ),
+            ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  key: const ValueKey('upload-salon-payment-qr'),
+                  onPressed: !profileSaved || isUploadingQr ? null : onUploadQr,
+                  icon: isUploadingQr
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.upload_file_outlined),
+                  label: Text(
+                    isUploadingQr
+                        ? 'Uploading...'
+                        : qrCodeUrl.isEmpty
+                        ? 'Upload QR image'
+                        : 'Replace QR image',
+                  ),
+                ),
+              ),
+              if (qrCodeUrl.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                IconButton.outlined(
+                  key: const ValueKey('remove-salon-payment-qr'),
+                  tooltip: 'Remove QR code',
+                  onPressed: isUploadingQr ? null : onRemoveQr,
+                  icon: const Icon(Icons.delete_outline),
+                ),
+              ],
+            ],
+          ),
+          if (!profileSaved) ...[
+            const SizedBox(height: 10),
+            Text(
+              'Save the shop registration first to add private payment details.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: AppColors.coral,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 }
 

@@ -132,10 +132,9 @@ class _SalonDashboardScreenState extends State<SalonDashboardScreen> {
             ),
             bottomNavigationBar: activeInstantBooking == null
                 ? null
-                : BookingArrivalBottomPanel(
+                : _SalonActiveBookingFooter(
                     booking: activeInstantBooking,
-                    audience: BookingTimerAudience.salon,
-                    onTap: () => _openNotificationDestination(
+                    onOpenBooking: () => _openNotificationDestination(
                       dashboardContext,
                       AppNotificationDestination.bookings,
                       bookingId: activeInstantBooking.id,
@@ -213,6 +212,34 @@ class _SalonDashboardScreenState extends State<SalonDashboardScreen> {
             .toList()
           ..sort((a, b) => a.start.compareTo(b.start));
     return active.firstOrNull;
+  }
+}
+
+class _SalonActiveBookingFooter extends StatelessWidget {
+  final Booking booking;
+  final VoidCallback onOpenBooking;
+
+  const _SalonActiveBookingFooter({
+    required this.booking,
+    required this.onOpenBooking,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final tabController = DefaultTabController.of(context);
+    return AnimatedBuilder(
+      animation: tabController,
+      builder: (context, child) {
+        if (tabController.index == 1) {
+          return const SizedBox.shrink();
+        }
+        return BookingArrivalBottomPanel(
+          booking: booking,
+          audience: BookingTimerAudience.salon,
+          onTap: onOpenBooking,
+        );
+      },
+    );
   }
 }
 

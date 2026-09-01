@@ -10,8 +10,13 @@ import 'booking_status_timeline.dart';
 
 class AppBottomNav extends StatelessWidget {
   final int selectedIndex;
+  final bool showActiveBooking;
 
-  const AppBottomNav({super.key, required this.selectedIndex});
+  const AppBottomNav({
+    super.key,
+    required this.selectedIndex,
+    this.showActiveBooking = true,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -19,7 +24,7 @@ class AppBottomNav extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (activeBooking != null)
+        if (showActiveBooking && activeBooking != null)
           CurrentBookingBottomPanel(
             booking: activeBooking,
             onTap: () => Navigator.of(

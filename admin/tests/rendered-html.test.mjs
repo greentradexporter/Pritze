@@ -122,6 +122,8 @@ test("customer and salon records have audited full-profile controls", () => {
   assert.match(source, /Manage all \{salon\.services\.length\} services/);
   assert.match(source, /Sign-in provider identities remain protected/);
   assert.match(source, /same number cannot belong to a customer and salon owner/);
+  assert.match(source, /Private payout details/);
+  assert.match(source, /View payment QR/);
 });
 
 test("the authenticated Control Center includes a practical operating guide", () => {
