@@ -57,9 +57,19 @@ test("ios_release.json stays in step with the build being shipped", () => {
       match[1],
       "ios_release.json versionName must match pubspec.yaml",
   );
-  assert.equal(
-      Number(iosRelease.candidateBuildNumber),
-      Number(match[2]),
-      "ios_release.json candidateBuildNumber must match pubspec.yaml",
+  // Not equality: pubspec's build number is shared by both platforms, and the
+  // two legitimately diverge when one store gets a build the other skips. What
+  // must hold is that iOS never advertises a build that was never built.
+  const built = Number(match[2]);
+  const advertised = Number(iosRelease.candidateBuildNumber);
+  assert.ok(
+      Number.isInteger(advertised) && advertised > 0,
+      "ios_release.json candidateBuildNumber must be a positive integer",
+  );
+  assert.ok(
+      advertised <= built,
+      `ios_release.json advertises build ${advertised} but pubspec.yaml is ` +
+      `at ${built}: iOS would prompt users to install a build that does ` +
+      `not exist`,
   );
 });
