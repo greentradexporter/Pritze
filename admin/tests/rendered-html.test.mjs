@@ -189,3 +189,15 @@ test("the authenticated Control Center includes a practical operating guide", ()
   assert.match(styles, /\.guide-setup-flow/);
   assert.match(styles, /\.field-help:hover::after/);
 });
+
+// The backend pins every callable to asia-south1 via setGlobalOptions. The
+// default us-central1 copies are pre-migration leftovers running stale code,
+// so a dashboard pointed there silently talks to the wrong backend.
+test("the Control Center calls functions in the backend's region", () => {
+  const source = fs.readFileSync(
+    path.join(testDirectory, "..", "app", "AdminDashboard.tsx"),
+    "utf8",
+  );
+  assert.match(source, /getFunctions\(app, "asia-south1"\)/);
+  assert.doesNotMatch(source, /getFunctions\(app, "us-central1"\)/);
+});

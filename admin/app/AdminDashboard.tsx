@@ -871,7 +871,10 @@ const navItems: { id: View; label: string; icon: string }[] = [
 
 function getFirebaseServices() {
   const app = getApps()[0] ?? initializeApp(firebaseConfig);
-  return { auth: getAuth(app), functions: getFunctions(app, "us-central1") };
+  // Must match the backend region. setGlobalOptions in functions/index.js
+  // pins every callable to asia-south1; the default us-central1 copies are
+  // leftovers from before that move and run stale code.
+  return { auth: getAuth(app), functions: getFunctions(app, "asia-south1") };
 }
 
 function initials(value: string) {
