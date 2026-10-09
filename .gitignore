@@ -60,5 +60,10 @@ android/key.properties
 android/app/*.jks
 android/app/*.keystore
 
+# Local tooling and generated delivery artifacts
+.claude/
+/output/
+/tmp/
+
 # Private legal/handover drafts - never ship or commit
 _private_legal/
