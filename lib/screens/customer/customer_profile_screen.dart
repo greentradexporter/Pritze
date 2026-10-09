@@ -111,7 +111,18 @@ class CustomerProfileScreen extends StatelessWidget {
                   title: const Text('Notifications'),
                   subtitle: const Text('Booking and appointment updates'),
                   trailing: const Icon(Icons.chevron_right),
-                  onTap: () => openCustomerNotifications(context),
+                  onTap: () => openCustomerNotifications(
+                    context,
+                    onNotificationOpened: (destination, {bookingId}) {
+                      if (destination == AppNotificationDestination.bookings) {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => const MyBookingsScreen(),
+                          ),
+                        );
+                      }
+                    },
+                  ),
                 ),
                 const Divider(height: 1),
                 ListTile(

@@ -11,6 +11,7 @@ import '../../widgets/account_actions.dart';
 import '../../widgets/app_error_dialog.dart';
 import '../../widgets/app_ui.dart';
 import '../../widgets/booking_status_timeline.dart';
+import '../../widgets/booking_extra_services.dart';
 import '../../widgets/customer_arrival_control.dart';
 import '../../widgets/status_chip.dart';
 import 'customer_completion_receipt_screen.dart';
@@ -398,9 +399,9 @@ class _BookingCard extends StatelessWidget {
             icon: Icons.payments_outlined,
             label: switch (booking.status) {
               BookingStatus.inProgress =>
-                'Your final payable amount will be shown after the salon ends the service.',
+                'Current payable amount ₹${booking.customerPayableAmount} · approved additions update this total',
               BookingStatus.completed =>
-                'Final payable amount ₹${booking.customerPayableAmount} · Pay at the salon counter',
+                'Final payable amount ₹${booking.customerPayableAmount} · Open receipt for payment options',
               _ =>
                 'Service ₹${booking.resolvedServicePrice(service)} · booking fee ₹${booking.bookingFee}',
             },
@@ -418,6 +419,7 @@ class _BookingCard extends StatelessWidget {
             CustomerArrivalControl(booking: booking),
           ],
           const SizedBox(height: 16),
+          BookingExtraServices(booking: booking),
           BookingStatusTimeline(
             key: ValueKey('booking-timeline-${booking.id}'),
             status: booking.status,

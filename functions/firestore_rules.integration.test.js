@@ -9,9 +9,11 @@ const {
   initializeTestEnvironment,
 } = require("@firebase/rules-unit-testing");
 const {
+  deleteField,
   doc,
   getDoc,
   setDoc,
+  updateDoc,
 } = require("firebase/firestore");
 const {SERVICE_CATALOG} = require("./service_catalog");
 
@@ -80,6 +82,8 @@ test("Firestore rules isolate referral, discount and Proin financial state", {
       openTime: "9:00 AM",
       closeTime: "8:00 PM",
       isOpen: true,
+      // A new salon starts pending review, exactly as the app writes it.
+      approvalStatus: "pending",
       services: SERVICE_CATALOG.map((service, index) => ({
         ...service,
         id: `catalog-${index}`,
@@ -175,6 +179,163 @@ test("Firestore rules isolate referral, discount and Proin financial state", {
       await assertFails(setDoc(doc(customer, target), {tampered: true}));
     }
     assert.ok(true);
+  } finally {
+    await environment.cleanup();
+  }
+});
+
+// The profile allowlist decides whether a phone can register for push and,
+// more importantly, de-register itself at sign-out. A field missing from it
+// rejects the entire write, so a signed-out phone keeps receiving booking
+// alerts. Nothing else exercises this: the app's own tests mock Firestore.
+test("a device can register and de-register its own push profile", {
+  skip: !process.env.FIRESTORE_EMULATOR_HOST,
+}, async () => {
+  const rules = fs.readFileSync(
+    path.join(__dirname, "..", "firestore.rules"),
+    "utf8",
+  );
+  const environment = await initializeTestEnvironment({
+    projectId: "demo-pritze-rules",
+    firestore: {rules},
+  });
+  try {
+    await environment.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), "users", "owner-1"), {
+        role: "owner",
+        activeRole: "owner",
+        name: "Owner",
+        fcmTokens: ["token-1"],
+        ownerAlertV4Tokens: ["token-1"],
+        notificationsEnabled: true,
+        ownerNotificationsEnabled: true,
+      });
+    });
+    const owner = environment.authenticatedContext("owner-1").firestore();
+    const profile = doc(owner, "users", "owner-1");
+
+    // Exactly what _saveMessagingToken writes.
+    await assertSucceeds(setDoc(profile, {
+      fcmTokens: ["token-1", "token-2"],
+      ownerAlertV4Tokens: ["token-2"],
+      ownerAlertV3Tokens: [],
+      lastFcmToken: "token-2",
+      notificationsEnabled: true,
+      ownerNotificationsEnabled: true,
+      fcmUpdatedAt: new Date(),
+    }, {merge: true}));
+
+    // Exactly what sign-out writes. activeRole is the field that used to be
+    // missing from the allowlist and silently failed the whole request.
+    await assertSucceeds(updateDoc(profile, {
+      fcmTokens: [],
+      ownerAlertV4Tokens: [],
+      ownerAlertV3Tokens: [],
+      lastFcmToken: deleteField(),
+      notificationsEnabled: false,
+      ownerNotificationsEnabled: false,
+      activeRole: deleteField(),
+      fcmUpdatedAt: new Date(),
+    }));
+    let after;
+    await environment.withSecurityRulesDisabled(async (context) => {
+      after = (
+        await getDoc(doc(context.firestore(), "users", "owner-1"))
+      ).data();
+    });
+    assert.equal(after.notificationsEnabled, false);
+    assert.equal(after.ownerNotificationsEnabled, false);
+    assert.equal(after.activeRole, undefined);
+
+    // The allowlist must still refuse anything that grants authority. Rules
+    // read the immutable 'role' field, never activeRole.
+    await assertFails(updateDoc(profile, {role: "admin"}));
+    await assertFails(updateDoc(profile, {roles: ["owner", "admin"]}));
+    await assertFails(updateDoc(profile, {profilePhone: "+919000000002"}));
+    await assertFails(updateDoc(profile, {referralOnboardingCompleted: true}));
+    // Another signed-in user may not touch this profile at all.
+    const other = environment.authenticatedContext("customer-1").firestore();
+    await assertFails(getDoc(doc(other, "users", "owner-1")));
+    await assertFails(updateDoc(doc(other, "users", "owner-1"), {
+      notificationsEnabled: true,
+    }));
+  } finally {
+    await environment.cleanup();
+  }
+});
+
+// Half the live salons predate the approval gate and have no approvalStatus.
+// Rules raise on a missing property, so reading it directly denied every edit
+// by exactly the owners the legacy branch is meant to admit.
+test("an owner can still edit a salon that predates the approval gate", {
+  skip: !process.env.FIRESTORE_EMULATOR_HOST,
+}, async () => {
+  const rules = fs.readFileSync(
+    path.join(__dirname, "..", "firestore.rules"),
+    "utf8",
+  );
+  const environment = await initializeTestEnvironment({
+    projectId: "demo-pritze-rules",
+    firestore: {rules},
+  });
+  const salon = (overrides = {}) => ({
+    ownerUid: "owner-1",
+    name: "Legacy salon",
+    ownerName: "Owner",
+    address: "Nashik",
+    openTime: "9:00 AM",
+    closeTime: "9:00 PM",
+    isOpen: true,
+    phone: "+919000000001",
+    email: "owner@example.com",
+    services: SERVICE_CATALOG.map((service, index) => ({
+      ...service,
+      id: `catalog-${index}`,
+      isAvailable: true,
+      instantBookingEnabled: true,
+      isCustom: false,
+    })),
+    ...overrides,
+  });
+  try {
+    await environment.withSecurityRulesDisabled(async (context) => {
+      const firestore = context.firestore();
+      await setDoc(doc(firestore, "users", "owner-1"), {
+        role: "owner",
+        name: "Owner",
+        profilePhone: "+919000000001",
+      });
+      // No approvalStatus: registered before the gate existed.
+      await setDoc(doc(firestore, "salons", "legacy-1"), salon());
+      await setDoc(doc(firestore, "salons", "approved-1"),
+        salon({approvalStatus: "approved"}));
+    });
+    const owner = environment.authenticatedContext("owner-1").firestore();
+
+    // Editing a legacy salon, leaving the field unset.
+    await assertSucceeds(setDoc(doc(owner, "salons", "legacy-1"),
+      salon({closeTime: "10:00 PM"})));
+    // Or adopting 'approved' on that first post-upgrade edit.
+    await assertSucceeds(setDoc(doc(owner, "salons", "legacy-1"),
+      salon({approvalStatus: "approved"})));
+    // An approved salon keeps its state.
+    await assertSucceeds(setDoc(doc(owner, "salons", "approved-1"),
+      salon({approvalStatus: "approved", isOpen: false})));
+
+    // Nobody self-approves out of pending, or self-rejects into visibility.
+    await environment.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), "salons", "pending-1"),
+        salon({approvalStatus: "pending"}));
+    });
+    await assertFails(setDoc(doc(owner, "salons", "pending-1"),
+      salon({approvalStatus: "approved"})));
+    await assertFails(setDoc(doc(owner, "salons", "pending-1"), salon()));
+    // A new salon must start pending.
+    await assertFails(setDoc(doc(owner, "salons", "new-1"),
+      salon({approvalStatus: "approved"})));
+    await assertFails(setDoc(doc(owner, "salons", "new-2"), salon()));
+    await assertSucceeds(setDoc(doc(owner, "salons", "new-3"),
+      salon({approvalStatus: "pending"})));
   } finally {
     await environment.cleanup();
   }

@@ -15,13 +15,33 @@ const {
   parseClockMinutes,
   serviceAutoCompleteAtMillis,
   shouldAutoCompleteService,
+  shouldAlertOwnerForBooking,
   slotSegmentMillis,
 } = require("./booking_workflow_logic");
 
 const start = Date.parse("2026-08-02T10:00:00.000Z");
 
-test("instant requests have a strict 150-second response window", () => {
-  assert.equal(INSTANT_RESPONSE_TIMEOUT_MS, 150 * 1000);
+test("only unanswered unexpired requests may ring", () => {
+  const booking = {isInstant: true, status: "pending", createdAt: start};
+  assert.equal(shouldAlertOwnerForBooking(booking, start + 119_999), true);
+  assert.equal(shouldAlertOwnerForBooking(booking, start + 120_000), false);
+  assert.equal(shouldAlertOwnerForBooking({...booking, createdAt: undefined}, start), false);
+  for (const status of ["confirmed", "rejected", "cancelled", "completed"]) {
+    assert.equal(shouldAlertOwnerForBooking({...booking, status}, start), false);
+  }
+});
+
+test("accept is idempotent and cannot revive an expired pending request", () => {
+  const booking = {isInstant: true, status: "pending", createdAt: start};
+  const transition = {booking, actorRole: "owner", nextStatus: "confirmed"};
+  assert.equal(bookingTransitionError({...transition, nowMillis: start + 119_999}), null);
+  assert.match(bookingTransitionError({...transition, nowMillis: start + 120_000}), /expired/);
+  assert.equal(bookingTransitionError({...transition,
+    booking: {...booking, status: "confirmed"}, nowMillis: start + 120_001}), null);
+});
+
+test("instant requests have a strict 120-second response window", () => {
+  assert.equal(INSTANT_RESPONSE_TIMEOUT_MS, 120 * 1000);
   const functionSource = fs.readFileSync(
     path.join(__dirname, "index.js"),
     "utf8",
@@ -29,7 +49,7 @@ test("instant requests have a strict 150-second response window", () => {
   assert.match(functionSource, /OWNER_ALERT_ATTEMPTS = 10/);
   assert.match(functionSource, /OWNER_ALERT_REPEAT_DELAY_MS = 15_000/);
   assert.match(functionSource, /expirePendingInstantBooking/);
-  assert.match(functionSource, /No response from salon within 150 seconds/);
+  assert.match(functionSource, /No response from salon within 120 seconds/);
   assert.match(functionSource, /Oops, looks like the salon is busy/);
   assert.match(functionSource, /see other nearby salons/);
   assert.match(functionSource, /resolvedStatus: "cancelled"/);
@@ -167,7 +187,7 @@ test("arrival reminders begin only after confirmation", () => {
   }), false);
 });
 
-test("active markers stop blocking after a confirmed booking has ended", () => {
+test("active markers stop blocking after their real booking window", () => {
   const booking = {
     status: "confirmed",
     isInstant: false,
@@ -176,7 +196,18 @@ test("active markers stop blocking after a confirmed booking has ended", () => {
   };
   assert.equal(isBlockingBooking(booking, start + 29 * 60 * 1000), true);
   assert.equal(isBlockingBooking(booking, start + 30 * 60 * 1000), false);
-  assert.equal(isBlockingBooking({...booking, status: "pending", isInstant: true}, start + 99_000_000), true);
+  const instant = {
+    ...booking,
+    status: "pending",
+    isInstant: true,
+    createdAt: start,
+  };
+  assert.equal(isBlockingBooking(instant, start + 119 * 1000), true);
+  assert.equal(isBlockingBooking(instant, start + 120 * 1000), false);
+  assert.equal(
+    isBlockingBooking({...instant, createdAt: undefined}, start),
+    false,
+  );
 });
 
 test("started services auto-complete after duration plus five minutes", () => {
@@ -227,6 +258,16 @@ test("booking writes are server-only and all authoritative callables exist", () 
     path.join(__dirname, "index.js"),
     "utf8",
   );
+  const bootstrapSource = fs.readFileSync(
+    path.join(__dirname, "..", "lib/services/firebase_bootstrap.dart"),
+    "utf8",
+  );
+  assert.match(
+    functionSource,
+    /MOBILE_CALLABLE_REGIONS = \["asia-south1"\]/,
+  );
+  assert.match(bootstrapSource, /firebaseFunctionsRegion = 'asia-south1'/);
+  assert.match(bootstrapSource, /FirebaseFunctions\.instanceFor/);
   for (const callable of [
     "getDiscountQuote",
     "listCheckoutDiscountOffers",
@@ -236,8 +277,20 @@ test("booking writes are server-only and all authoritative callables exist", () 
     "updateBookingStatus",
     "rescheduleBooking",
   ]) {
-    assert.match(functionSource, new RegExp(`exports\\.${callable} = onCall`));
+    assert.match(
+      functionSource,
+      new RegExp(`exports\\.${callable} = onMobileCall`),
+    );
   }
+  assert.match(
+    functionSource,
+    /return \{bookingId: bookingRef\.id, booking: callableBooking\};/,
+  );
+  assert.match(
+    functionSource,
+    /exports\.expireStaleInstantBookings = onSchedule/,
+  );
+  assert.match(functionSource, /where\("status", "==", "pending"\)/);
   const ruleSource = fs.readFileSync(
     path.join(__dirname, "..", "firestore.rules"),
     "utf8",
@@ -290,7 +343,7 @@ test("Android update lookup activates only a Play-published candidate", () => {
     path.join(__dirname, "index.js"),
     "utf8",
   );
-  assert.match(functionSource, /exports\.getAndroidAppUpdate = onCall/);
+  assert.match(functionSource, /exports\.getAndroidAppUpdate = onMobileCall/);
   assert.match(
     functionSource,
     /ANDROID_LAST_CONFIRMED_PUBLIC_VERSION_CODE = 31/,
@@ -307,7 +360,7 @@ test("iOS update lookup has a safe App Store fallback", () => {
     path.join(__dirname, "index.js"),
     "utf8",
   );
-  assert.match(functionSource, /exports\.getIosAppUpdate = onCall/);
+  assert.match(functionSource, /exports\.getIosAppUpdate = onMobileCall/);
   assert.match(functionSource, /IOS_CURRENT_BUILD_NUMBER = 28/);
   assert.match(functionSource, /IOS_NEXT_VERSION = "1\.0\.16"/);
   assert.match(functionSource, /IOS_NEXT_BUILD_NUMBER = 29/);

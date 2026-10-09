@@ -17,6 +17,10 @@ const {
   proinCouponClaimAllowed,
   proinCouponHash,
 } = require("./proin_coupon_logic");
+const {
+  SalonFinanceValidationError,
+  settlementPaymentReference,
+} = require("./salon_finance_logic");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RECONCILIATION_WALLET_LIMIT = 500;
@@ -306,6 +310,7 @@ function createProinBackend({admin, HttpsError}) {
         program,
         usage: programUsage,
         nowMillis: systemContext?.eligibilityAtMillis || nowMillis,
+        rewardAmountProin: systemContext?.rewardAmountProin,
       });
       if (!grantDecision.allowed) {
         throw new HttpsError("failed-precondition", grantDecision.reason);
@@ -318,9 +323,28 @@ function createProinBackend({admin, HttpsError}) {
           "This account reached the program reward limit.",
         );
       }
-      const amountProin = storedPositiveInteger(program.rewardAmountProin, 0);
+      const configuredReward = storedPositiveInteger(
+        program.rewardAmountProin,
+        0,
+      );
+      const manualAmountProin = !systemContext &&
+        Object.prototype.hasOwnProperty.call(data || {}, "amountProin") ?
+        storedPositiveInteger(data.amountProin, 0) : 0;
+      const amountProin = systemContext?.rewardAmountProin ?
+        storedPositiveInteger(systemContext.rewardAmountProin, 0) :
+        (manualAmountProin || configuredReward);
       if (amountProin <= 0) {
         throw new HttpsError("data-loss", "Program reward is invalid.");
+      }
+      const maximumReward = storedPositiveInteger(
+        program.maximumProinPerBooking,
+        configuredReward,
+      );
+      if (amountProin > maximumReward) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This qualified reward exceeds the program limit.",
+        );
       }
       const finance = proinFinanceState(financeSnapshot.data());
       if (!financeSnapshot.exists || !proinFinanceInvariant(finance)) {
@@ -342,12 +366,21 @@ function createProinBackend({admin, HttpsError}) {
           "This Proin wallet is not balanced. Reconcile it before granting.",
         );
       }
-      const validityDays = storedPositiveInteger(
+      const configuredValidityDays = storedPositiveInteger(
         program.rewardValidityDays,
         0,
       );
+      const validityDays = systemContext?.rewardValidityDays ?
+        storedPositiveInteger(systemContext.rewardValidityDays, 0) :
+        configuredValidityDays;
       if (validityDays <= 0 || validityDays > 730) {
         throw new HttpsError("data-loss", "Program reward validity is invalid.");
+      }
+      if (validityDays > configuredValidityDays) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This qualified reward exceeds the program validity limit.",
+        );
       }
       const expiresAtMillis = nowMillis + validityDays * DAY_MS;
       const nextExpiryAtMillis = wallet.nextExpiryAtMillis > 0 ?
@@ -511,6 +544,14 @@ function createProinBackend({admin, HttpsError}) {
         qualificationEvent,
         eligibilityAtMillis: timestampMillis(data.eligibilityAtMillis) ||
           Date.now(),
+        rewardAmountProin: storedPositiveInteger(
+          data.rewardAmountProin,
+          0,
+        ) || null,
+        rewardValidityDays: storedPositiveInteger(
+          data.rewardValidityDays,
+          0,
+        ) || null,
       },
     });
   }
@@ -1763,17 +1804,19 @@ function createProinBackend({admin, HttpsError}) {
 
   async function settleSalonReimbursementAsAdmin({adminUid, data, reason}) {
     const bookingId = requiredText(data.bookingId, "booking id", 160);
-    const paymentReference = requiredText(
-      data.paymentReference,
-      "external payment reference",
-      120,
-    );
-    if (paymentReference.length < 4) {
-      throw new HttpsError(
-        "invalid-argument",
-        "External payment reference must contain at least 4 characters.",
+    let payment;
+    try {
+      payment = settlementPaymentReference(
+        data.paymentReference,
+        data.paymentMethod,
       );
+    } catch (error) {
+      if (error instanceof SalonFinanceValidationError) {
+        throw new HttpsError("invalid-argument", error.message);
+      }
+      throw error;
     }
+    const {paymentMethod, paymentReference} = payment;
     const paidAtMillis = Number(data.paidAtMillis) || Date.now();
     if (!Number.isSafeInteger(paidAtMillis) || paidAtMillis <= 0 ||
         paidAtMillis > Date.now() + 5 * 60 * 1000) {
@@ -1857,6 +1900,7 @@ function createProinBackend({admin, HttpsError}) {
       transaction.update(reimbursementRef, {
         status: "settled",
         paymentReference,
+        paymentMethod,
         paymentReferenceHash: referenceHash,
         paidAt: Timestamp.fromMillis(paidAtMillis),
         paidByAdminUid: adminUid,
@@ -1868,6 +1912,7 @@ function createProinBackend({admin, HttpsError}) {
         lifetimeProinReimbursementPaid: fieldValue.increment(amountInr),
         lastProinPaidBookingId: bookingId,
         lastProinPaymentReference: paymentReference,
+        lastProinPaymentMethod: paymentMethod,
         updatedAt: timestamp,
       }, {merge: true});
       transaction.set(financeRef, {...financeAfter, updatedAt: timestamp}, {
@@ -1878,6 +1923,7 @@ function createProinBackend({admin, HttpsError}) {
         salonId,
         amountInr,
         paymentReference,
+        paymentMethod,
         paymentReferenceHash: referenceHash,
         paidAt: Timestamp.fromMillis(paidAtMillis),
         createdAt: timestamp,
@@ -1904,7 +1950,7 @@ function createProinBackend({admin, HttpsError}) {
         targetId: bookingId,
         reason,
         before: {status: reimbursement.status, paymentReference: ""},
-        after: {status: "settled", paymentReference, amountInr},
+        after: {status: "settled", paymentMethod, paymentReference, amountInr},
         fieldValue,
       }));
       response = {
@@ -2593,6 +2639,7 @@ function createProinBackend({admin, HttpsError}) {
         amountInr: storedProin(document.data()?.amountInr),
         status: String(document.data()?.status || ""),
         paymentReference: String(document.data()?.paymentReference || ""),
+        paymentMethod: String(document.data()?.paymentMethod || ""),
         paidAtMillis: timestampMillis(document.data()?.paidAt),
         createdAtMillis: timestampMillis(document.data()?.createdAt),
       })),

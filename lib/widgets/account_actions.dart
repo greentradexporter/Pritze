@@ -7,10 +7,12 @@ import '../theme/app_theme.dart';
 import '../utils/url_launcher_utils.dart';
 import '../screens/referrals/referral_screen.dart';
 import 'app_ui.dart';
+import 'owner_phone_login_dialog.dart';
 import 'status_chip.dart';
 
 enum _AccountAction {
   notifications,
+  phoneLogin,
   revenueDetails,
   promotionalCredits,
   referrals,
@@ -20,6 +22,10 @@ enum _AccountAction {
 
 typedef NotificationOpenCallback =
     void Function(AppNotificationDestination destination, {String? bookingId});
+
+// The notification centre retains recent history, but an old booking update
+// must not keep a red badge on the home screen indefinitely.
+const _unreadNotificationBadgeLifetime = Duration(hours: 24);
 
 String _joinNotificationKey(JoinRequest request) =>
     'join:${request.id}:${request.status.name}';
@@ -108,6 +114,14 @@ class AccountOverflowMenu extends StatelessWidget {
         ? account!.name.trim()
         : fallbackName;
     final accountContact = account?.contact.trim() ?? '';
+    // An owner who registered with Google or email has the salon number on
+    // their listing but not as a login credential, so phone OTP signs them
+    // in as a different account. Verifying it once here makes both work.
+    final ownerPhone = role == UserRole.owner
+        ? (appState.ownerSalonOrNull?.phone.trim() ?? '')
+        : '';
+    final phoneLoginEnabled =
+        ownerPhone.isNotEmpty && appState.isOwnerPhoneLoginEnabled(ownerPhone);
     return PopupMenuButton<_AccountAction>(
       tooltip: 'Account menu',
       icon: Badge(
@@ -127,6 +141,8 @@ class AccountOverflowMenu extends StatelessWidget {
               role,
               onNotificationOpened: onNotificationOpened,
             );
+          case _AccountAction.phoneLogin:
+            await showOwnerPhoneLoginDialog(context, ownerPhone);
           case _AccountAction.revenueDetails:
             await onRevenueDetailsOpened?.call();
           case _AccountAction.promotionalCredits:
@@ -175,6 +191,25 @@ class AccountOverflowMenu extends StatelessWidget {
             title: Text('Notifications'),
           ),
         ),
+        if (role == UserRole.owner && ownerPhone.isNotEmpty)
+          PopupMenuItem(
+            value: _AccountAction.phoneLogin,
+            enabled: !phoneLoginEnabled,
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(
+                phoneLoginEnabled
+                    ? Icons.smartphone_outlined
+                    : Icons.phonelink_lock_outlined,
+              ),
+              title: const Text('Phone login'),
+              subtitle: Text(
+                phoneLoginEnabled
+                    ? 'On · $ownerPhone'
+                    : 'Off · verify $ownerPhone to sign in with OTP',
+              ),
+            ),
+          ),
         if (role == UserRole.owner && onRevenueDetailsOpened != null)
           const PopupMenuItem(
             value: _AccountAction.revenueDetails,
@@ -359,10 +394,76 @@ int unreadNotificationCount(AppState state, UserRole role) {
   if (!state.notificationPreferencesReady(role)) {
     return 0;
   }
-  return notificationKeys(
-    state,
-    role,
-  ).where((key) => !state.hasSeenNotification(role, key)).length;
+  final readAt = state.notificationReadAt(role);
+  final now = DateTime.now();
+  var count = 0;
+  for (final event in _bookingNotificationEvents(state, role)) {
+    if (state.hasDismissedNotification(role, event.key) ||
+        state.hasSeenNotification(role, event.key) ||
+        (readAt != null && !event.occurredAt.isAfter(readAt)) ||
+        !_isCurrentUnreadBookingNotification(event, role, now)) {
+      continue;
+    }
+    count += 1;
+  }
+  if (role == UserRole.barber) {
+    final request = state.currentJoinRequest;
+    if (request != null &&
+        request.status != JoinRequestStatus.withdrawn &&
+        _isUnreadJoinRequest(state, role, request, readAt)) {
+      count += 1;
+    }
+  } else if (role == UserRole.owner) {
+    for (final request in state.pendingJoinRequests) {
+      if (_isUnreadJoinRequest(state, role, request, readAt)) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+bool _isCurrentUnreadBookingNotification(
+  _BookingNotificationEvent event,
+  UserRole role,
+  DateTime now,
+) {
+  if (event.occurredAt.isAfter(now.add(const Duration(minutes: 2))) ||
+      now.difference(event.occurredAt) > _unreadNotificationBadgeLifetime) {
+    return false;
+  }
+  final booking = event.booking;
+  return switch (event.kind) {
+    _BookingNotificationKind.created =>
+      booking.isInstant
+          ? booking.status == BookingStatus.pending
+          : booking.status == BookingStatus.confirmed,
+    // Owners made this decision themselves; only the customer needs an
+    // unread "accepted" update.
+    _BookingNotificationKind.accepted =>
+      role == UserRole.customer && booking.status == BookingStatus.confirmed,
+    _BookingNotificationKind.arrivalReminder =>
+      booking.status == BookingStatus.confirmed ||
+          booking.status == BookingStatus.inProgress,
+    _BookingNotificationKind.completed =>
+      booking.status == BookingStatus.completed,
+    _BookingNotificationKind.cancelled =>
+      booking.status == BookingStatus.cancelled,
+    _BookingNotificationKind.rejected =>
+      booking.status == BookingStatus.rejected,
+  };
+}
+
+bool _isUnreadJoinRequest(
+  AppState state,
+  UserRole role,
+  JoinRequest request,
+  DateTime? readAt,
+) {
+  final key = _joinNotificationKey(request);
+  return !state.hasDismissedNotification(role, key) &&
+      !state.hasSeenNotification(role, key) &&
+      (readAt == null || request.requestedAt.isAfter(readAt));
 }
 
 List<String> notificationKeys(AppState state, UserRole role) {

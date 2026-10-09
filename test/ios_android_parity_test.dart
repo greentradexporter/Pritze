@@ -42,6 +42,22 @@ void main() {
     expect(updatePrompt, contains("'trackViewUrl'"));
   });
 
+  test('iOS exposes the Android UPI payment handoff', () {
+    final manifest = File(
+      'android/app/src/main/AndroidManifest.xml',
+    ).readAsStringSync();
+    expect(manifest, contains('<data android:scheme="upi"/>'));
+
+    final infoPlist = File('ios/Runner/Info.plist').readAsStringSync();
+    expect(infoPlist, contains('<string>upi</string>'));
+
+    final receipt = File(
+      'lib/screens/customer/customer_completion_receipt_screen.dart',
+    ).readAsStringSync();
+    expect(receipt, contains("uri.scheme != 'upi'"));
+    expect(receipt, contains('LaunchMode.externalNonBrowserApplication'));
+  });
+
   test('iOS owner notifications expose the Android booking decisions', () {
     final appState = File('lib/state/app_state.dart').readAsStringSync();
     expect(appState, contains('DarwinNotificationCategory('));

@@ -29,10 +29,10 @@ service firebase.storage {
     // manages them; authorized backend services use their private record.
     match /salons/{salonId}/payments/{paymentFile} {
       allow read: if ownsSalon(salonId);
-      allow create, update: if ownsSalon(salonId) &&
+      allow create, update: if (ownsSalon(salonId) || ownerSalonId(salonId)) &&
         request.resource.size < 8 * 1024 * 1024 &&
         request.resource.contentType.matches('image/.*');
-      allow delete: if ownsSalon(salonId);
+      allow delete: if ownsSalon(salonId) || ownerSalonId(salonId);
     }
 
     match /customers/{customerId}/profile/{photoName} {

@@ -16,21 +16,29 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_models.dart';
 import '../models/service_catalog.dart';
+import '../services/firebase_bootstrap.dart';
+import '../services/owner_booking_alert_state.dart';
+import '../services/push_deregistration.dart';
 
 const _activeRolePreferenceKey = 'pritze.activeRole';
+const _activeRoleAccountIdPreferenceKey = 'pritze.activeRole.accountId';
 const _seenNotificationsPreferencePrefix = 'pritze.notifications.seen.';
 const _dismissedNotificationsPreferencePrefix =
     'pritze.notifications.dismissed.';
+const _notificationsReadAtPreferencePrefix = 'pritze.notifications.readAt.';
+const _upiHandoffOpenedPreferencePrefix = 'pritze.upiHandoff.opened.';
 const _pushPermissionRequestedPreferenceKey =
     'pritze.notifications.permissionRequested';
-const _ownerAlertsEnabledPreferenceKey =
-    'pritze.notifications.ownerAlertsEnabled';
-const _suppressedOwnerAlertsPreferenceKey =
-    'pritze.notifications.suppressedOwnerAlerts';
-const _ownerAlertSuppressionDuration = Duration(minutes: 10);
+const _ownerAlertSuppressionDuration = ownerBookingSuppressionDuration;
+const _backgroundBookingActionAuthTimeout = Duration(seconds: 4);
 const instantArrivalMinuteOptions = <int>[15, 20, 25];
-const instantBookingResponseTimeout = Duration(seconds: 150);
+const instantBookingResponseTimeout = ownerBookingResponseTimeout;
 const scheduledBookingHorizonDays = 30;
+
+/// How far ahead the first bookable slot sits. A customer turned away by one
+/// salon is offered the next slot from here, so this is also the shortest
+/// notice a salon can be given.
+const scheduledBookingLeadTime = Duration(minutes: 30);
 const customerCancellationReasons = <String>[
   'Plans changed',
   'Booked by mistake',
@@ -41,25 +49,37 @@ const customerCancellationReasons = <String>[
 ];
 const _zeroBookingFee = 0;
 const _zeroBookingFeeStatus = 'not_required';
-const _defaultSupportPhone = '+91 89996 08278';
+const _defaultSupportPhone = '+91 73101 91586';
 const _pushNotificationChannel = AndroidNotificationChannel(
   'pritze_booking_updates',
   'Booking updates',
   description: 'Booking, request, and account updates from Pritze.',
   importance: Importance.high,
 );
+// Android channels are immutable once created, so changing how the alert
+// sounds needs a new id. `_legacyOwnerBookingRequestChannelIds` keeps the
+// retired ones cancellable, and the server addresses each generation by its
+// own token field so a device never rings twice.
 const _ownerBookingRequestChannel = AndroidNotificationChannel(
-  'pritze_owner_booking_requests_v3',
+  'pritze_owner_booking_requests_v4',
   'Owner booking requests',
   description:
-      'Continuous urgent booking request alerts for salon owners until opened.',
+      'Continuous booking request alerts until accepted, rejected or timed out.',
   importance: Importance.max,
   playSound: true,
   enableVibration: true,
   sound: RawResourceAndroidNotificationSound('owner_booking_request'),
+  // The alarm stream, so a salon phone left on silent still rings. The
+  // notification stream obeys the ringer switch, which made the alert
+  // inaudible on exactly the phones that sit face-down on a counter.
+  audioAttributesUsage: AudioAttributesUsage.alarm,
 );
 const _ownerBookingAlarmNotificationId = 790001;
 const _ownerBookingAlarmNotificationTag = 'pritze_owner_booking_request';
+const _legacyOwnerBookingRequestChannelIds = <String>{
+  'pritze_owner_booking_requests_v2',
+  'pritze_owner_booking_requests_v3',
+};
 const _ownerBookingAlarmInterval = Duration(seconds: 15);
 const _androidInsistentNotificationFlag = 4;
 const _acceptInstantBookingNotificationAction = 'accept_instant_booking';
@@ -70,13 +90,13 @@ const _ownerInstantBookingNotificationActions = <AndroidNotificationAction>[
   AndroidNotificationAction(
     _acceptInstantBookingNotificationAction,
     'Accept',
-    showsUserInterface: false,
+    showsUserInterface: true,
     cancelNotification: true,
   ),
   AndroidNotificationAction(
     _rejectInstantBookingNotificationAction,
     'Reject',
-    showsUserInterface: false,
+    showsUserInterface: true,
     cancelNotification: true,
   ),
 ];
@@ -130,6 +150,21 @@ String _notificationPayload(Map<String, dynamic> data) {
     'destination': data['destination'] ?? 'bookings',
     'bookingId': data['bookingId'] ?? '',
     'isInstant': data['isInstant'] ?? 'false',
+    'channel': data['channel'] ?? '',
+    'createdAtMillis': data['createdAtMillis'] ?? 0,
+    'responseDeadlineMillis': data['responseDeadlineMillis'] ?? 0,
+    'event': data['event'] ?? '',
+    'status': data['status'] ?? '',
+    'statusOccurredAtMillis': data['statusOccurredAtMillis'] ?? 0,
+    'acceptedAtMillis': data['acceptedAtMillis'] ?? 0,
+    'cancelledAtMillis': data['cancelledAtMillis'] ?? 0,
+    'rejectedAtMillis': data['rejectedAtMillis'] ?? 0,
+    'completedAtMillis': data['completedAtMillis'] ?? 0,
+    'startMillis': data['startMillis'] ?? 0,
+    'arrivalMinutes': data['arrivalMinutes'] ?? 0,
+    'customerPayableAmount': data['customerPayableAmount'] ?? 0,
+    'cancelledBy': data['cancelledBy'] ?? '',
+    'cancellationReason': data['cancellationReason'] ?? '',
   });
 }
 
@@ -145,54 +180,195 @@ Map<String, dynamic> _decodeNotificationPayloadValue(String? payload) {
   }
 }
 
-Future<Set<String>> _activeSuppressedOwnerAlerts() async {
-  final preferences = await SharedPreferences.getInstance();
-  final now = DateTime.now().millisecondsSinceEpoch;
-  final activeEntries = <String>[];
-  final activeIds = <String>{};
-  for (final entry
-      in preferences.getStringList(_suppressedOwnerAlertsPreferenceKey) ??
-          const <String>[]) {
-    final separator = entry.lastIndexOf('|');
-    if (separator <= 0) {
-      continue;
+Future<void> _persistOwnerAlertSuppression(String bookingId) =>
+    OwnerBookingAlertState().stop(bookingId);
+
+String _ownerBookingTag(String bookingId) =>
+    '$_ownerBookingAlarmNotificationTag:$bookingId';
+
+bool _isOwnerBookingRequestChannel(Object? channelId) {
+  final id = channelId?.toString() ?? '';
+  return id == _ownerBookingRequestChannel.id ||
+      _legacyOwnerBookingRequestChannelIds.contains(id);
+}
+
+bool _isOwnerBookingResolution(Map<String, dynamic> data) =>
+    data['action'] == 'stop_owner_booking_alarm' ||
+    (data['isInstant']?.toString() == 'true' &&
+        <String>{
+          'confirmed',
+          'rejected',
+          'cancelled',
+          'inProgress',
+          'completed',
+        }.contains(data['status']?.toString()));
+
+DateTime? _ownerAlertMessageDeadline(RemoteMessage message) {
+  final explicit = ownerBookingAlertDeadline(message.data);
+  if (explicit != null) return explicit;
+  // Compatibility with the previous server payload. A repeated push does not
+  // start a fresh two-minute window, and a delayed push uses its send time.
+  final sentAt = message.sentTime;
+  if (sentAt == null) return null;
+  final attempt =
+      int.tryParse(message.data['alertAttempt']?.toString() ?? '') ?? 1;
+  return sentAt
+      .add(instantBookingResponseTimeout)
+      .subtract(Duration(seconds: (attempt.clamp(1, 10) - 1) * 15));
+}
+
+Future<void> _persistPendingOwnerBookingAction(
+  String bookingId,
+  String status,
+) => OwnerBookingDecisionStore().save(bookingId, status);
+
+Future<void> _clearPendingOwnerBookingAction(String bookingId) =>
+    OwnerBookingDecisionStore().clear(bookingId);
+
+Future<void> _clearOwnerDecisionFeedback(String bookingId) async {
+  try {
+    await FlutterLocalNotificationsPlugin().cancel(
+      id: ownerBookingNotificationId('decision:$bookingId'),
+      tag: 'pritze_owner_decision:$bookingId',
+    );
+  } catch (_) {
+    // The acknowledged backend decision must not depend on OS cleanup.
+  }
+}
+
+Future<void> _showOwnerDecisionFailure(
+  String bookingId,
+  Object error, {
+  FlutterLocalNotificationsPlugin? initializedNotifications,
+}) async {
+  final terminal =
+      error is FirebaseFunctionsException &&
+      <String>{
+        'failed-precondition',
+        'not-found',
+        'permission-denied',
+        'invalid-argument',
+      }.contains(error.code);
+  if (terminal) await _clearPendingOwnerBookingAction(bookingId);
+  try {
+    final notifications =
+        initializedNotifications ?? FlutterLocalNotificationsPlugin();
+    if (initializedNotifications == null) {
+      await _initializeBackgroundNotifications(notifications);
     }
-    final bookingId = entry.substring(0, separator);
-    final expiresAt = int.tryParse(entry.substring(separator + 1)) ?? 0;
-    if (bookingId.isNotEmpty && expiresAt > now) {
-      activeEntries.add(entry);
-      activeIds.add(bookingId);
+    await notifications.show(
+      id: ownerBookingNotificationId('decision:$bookingId'),
+      title: terminal
+          ? 'Booking response not completed'
+          : 'Booking response waiting to sync',
+      body: terminal
+          ? 'Open bookings to review this request. Your response could not be completed.'
+          : 'Your response is saved. We will retry while this request is active.',
+      notificationDetails: NotificationDetails(
+        android: AndroidNotificationDetails(
+          _pushNotificationChannel.id,
+          _pushNotificationChannel.name,
+          tag: 'pritze_owner_decision:$bookingId',
+          silent: true,
+          playSound: false,
+          enableVibration: false,
+        ),
+        iOS: const DarwinNotificationDetails(presentSound: false),
+      ),
+      payload: _notificationPayload({'bookingId': bookingId}),
+    );
+  } catch (_) {
+    // Keep the saved decision even if the OS cannot display feedback.
+  }
+}
+
+Future<void> _cancelOwnerBookingNotifications(
+  FlutterLocalNotificationsPlugin notifications, {
+  String? bookingId,
+}) async {
+  if (bookingId != null) {
+    await notifications.cancel(
+      id: ownerBookingNotificationId(bookingId),
+      tag: _ownerBookingTag(bookingId),
+    );
+  }
+  // Also remove the unscoped notification left by the previous app build.
+  await notifications.cancel(
+    id: _ownerBookingAlarmNotificationId,
+    tag: _ownerBookingAlarmNotificationTag,
+  );
+  if (kIsWeb) {
+    return;
+  }
+  try {
+    final activeNotifications = await notifications.getActiveNotifications();
+    for (final notification in activeNotifications) {
+      final payload = _decodeNotificationPayloadValue(notification.payload);
+      final isOwnerAlert =
+          notification.tag == _ownerBookingAlarmNotificationTag ||
+          (bookingId == null
+              ? notification.channelId == _ownerBookingRequestChannel.id
+              : notification.tag == _ownerBookingTag(bookingId)) ||
+          _legacyOwnerBookingRequestChannelIds.contains(
+            notification.channelId,
+          ) ||
+          (_isOwnerBookingRequestChannel(payload['channel']) &&
+              (bookingId == null || payload['bookingId'] == bookingId));
+      if (isOwnerAlert && notification.id != null) {
+        await notifications.cancel(id: notification.id!, tag: notification.tag);
+      }
+    }
+  } catch (_) {
+    // The known tagged alarm was already cancelled above. Enumeration is a
+    // best-effort cleanup for alerts posted by an older app build.
+  }
+}
+
+/// Makes the notification action isolate safe for an App-Check-protected
+/// callable. The foreground app already goes through FirebaseBootstrap; a
+/// notification action runs in a separate isolate and must prepare Firebase
+/// for itself before changing a booking.
+Future<bool> _prepareBackgroundBookingActionFirebase() async {
+  if (Firebase.apps.isEmpty) {
+    await Firebase.initializeApp();
+  }
+  try {
+    await FirebaseAppCheck.instance.activate(
+      providerAndroid: kReleaseMode
+          ? const AndroidPlayIntegrityProvider()
+          : const AndroidDebugProvider(),
+      providerApple: kReleaseMode
+          ? const AppleAppAttestWithDeviceCheckFallbackProvider()
+          : const AppleDebugProvider(),
+    );
+  } catch (error) {
+    if (kDebugMode) {
+      debugPrint('Background App Check activation skipped: $error');
     }
   }
-  await preferences.setStringList(
-    _suppressedOwnerAlertsPreferenceKey,
-    activeEntries,
-  );
-  return activeIds;
-}
+  try {
+    await FirebaseAppCheck.instance.getToken().timeout(
+      const Duration(seconds: 8),
+    );
+  } catch (error) {
+    if (kDebugMode) {
+      debugPrint('Background App Check token failed: $error');
+    }
+    return false;
+  }
 
-Future<void> _persistOwnerAlertSuppression(String bookingId) async {
-  final activeIds = await _activeSuppressedOwnerAlerts();
-  activeIds.add(bookingId);
-  final preferences = await SharedPreferences.getInstance();
-  final expiresAt = DateTime.now()
-      .add(_ownerAlertSuppressionDuration)
-      .millisecondsSinceEpoch;
-  await preferences.setStringList(_suppressedOwnerAlertsPreferenceKey, [
-    for (final id in activeIds) '$id|$expiresAt',
-  ]);
-}
-
-Future<void> _clearOwnerAlertSuppression(String bookingId) async {
-  final activeIds = await _activeSuppressedOwnerAlerts();
-  activeIds.remove(bookingId);
-  final preferences = await SharedPreferences.getInstance();
-  final expiresAt = DateTime.now()
-      .add(_ownerAlertSuppressionDuration)
-      .millisecondsSinceEpoch;
-  await preferences.setStringList(_suppressedOwnerAlertsPreferenceKey, [
-    for (final id in activeIds) '$id|$expiresAt',
-  ]);
+  if (FirebaseAuth.instance.currentUser != null) {
+    return true;
+  }
+  try {
+    final restoredUser = await FirebaseAuth.instance
+        .authStateChanges()
+        .firstWhere((user) => user != null)
+        .timeout(_backgroundBookingActionAuthTimeout);
+    return restoredUser != null;
+  } on TimeoutException {
+    return false;
+  }
 }
 
 @pragma('vm:entry-point')
@@ -211,108 +387,106 @@ void notificationActionBackgroundHandler(NotificationResponse response) async {
   WidgetsFlutterBinding.ensureInitialized();
   final notifications = FlutterLocalNotificationsPlugin();
   try {
-    await notifications.initialize(
-      settings: InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-        iOS: DarwinInitializationSettings(
-          requestAlertPermission: false,
-          requestBadgePermission: false,
-          requestSoundPermission: false,
-          notificationCategories:
-              _ownerBookingRequestDarwinNotificationCategories,
-        ),
-      ),
-      onDidReceiveBackgroundNotificationResponse:
-          notificationActionBackgroundHandler,
-    );
-    await notifications.cancel(
-      id: _ownerBookingAlarmNotificationId,
-      tag: _ownerBookingAlarmNotificationTag,
-    );
-    await _persistOwnerAlertSuppression(bookingId);
-    if (Firebase.apps.isEmpty) {
-      await Firebase.initializeApp();
-    }
-    if (FirebaseAuth.instance.currentUser == null) {
-      return;
-    }
-    await FirebaseFunctions.instance.httpsCallable('updateBookingStatus').call({
-      'bookingId': bookingId,
-      'status': actionId == _acceptInstantBookingNotificationAction
+    await performOwnerBookingDecision(
+      bookingId: bookingId,
+      status: actionId == _acceptInstantBookingNotificationAction
           ? BookingStatus.confirmed.name
           : BookingStatus.rejected.name,
-      'cancellationReason': '',
-    });
+      cancel: () async {
+        await _initializeBackgroundNotifications(notifications);
+        await _cancelOwnerBookingNotifications(
+          notifications,
+          bookingId: bookingId,
+        );
+      },
+      submit: () => _submitBackgroundOwnerBookingDecision(
+        bookingId,
+        actionId == _acceptInstantBookingNotificationAction
+            ? BookingStatus.confirmed.name
+            : BookingStatus.rejected.name,
+      ),
+    );
   } catch (error) {
-    await _clearOwnerAlertSuppression(bookingId);
+    // The owner already made a decision. Never restart the continuous alarm
+    // merely because the background request failed. Retain retryable decisions
+    // and display a quiet status instead of pretending they were accepted.
+    await _showOwnerDecisionFailure(bookingId, error);
     if (kDebugMode) {
       debugPrint('Instant booking notification action failed: $error');
     }
   }
 }
 
-@pragma('vm:entry-point')
-Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  if (kIsWeb) {
-    return;
+Future<void> _submitBackgroundOwnerBookingDecision(
+  String bookingId,
+  String status,
+) async {
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (!await _prepareBackgroundBookingActionFirebase()) {
+        throw StateError('Could not restore the owner session.');
+      }
+      await FirebaseFunctions.instanceFor(region: firebaseFunctionsRegion)
+          .httpsCallable(
+            'updateBookingStatus',
+            options: HttpsCallableOptions(timeout: const Duration(seconds: 8)),
+          )
+          .call<void>({
+            'bookingId': bookingId,
+            'status': status,
+            'cancellationReason': '',
+            'actionSource': 'notification_action',
+          });
+      await _clearOwnerDecisionFeedback(bookingId);
+      return;
+    } on FirebaseFunctionsException catch (error) {
+      if (!isRetryableOwnerDecisionErrorCode(error.code) || attempt == 1) {
+        rethrow;
+      }
+    } catch (_) {
+      if (attempt == 1) rethrow;
+    }
+    await Future<void>.delayed(const Duration(seconds: 1));
   }
-  final notifications = FlutterLocalNotificationsPlugin();
-  final initializationSettings = InitializationSettings(
-    android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-    iOS: DarwinInitializationSettings(
-      requestAlertPermission: false,
-      requestBadgePermission: false,
-      requestSoundPermission: false,
-      notificationCategories: _ownerBookingRequestDarwinNotificationCategories,
-    ),
-  );
+}
+
+Future<void> _initializeBackgroundNotifications(
+  FlutterLocalNotificationsPlugin notifications,
+) async {
   await notifications.initialize(
-    settings: initializationSettings,
+    settings: InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      iOS: DarwinInitializationSettings(
+        requestAlertPermission: false,
+        requestBadgePermission: false,
+        requestSoundPermission: false,
+        notificationCategories:
+            _ownerBookingRequestDarwinNotificationCategories,
+      ),
+    ),
     onDidReceiveBackgroundNotificationResponse:
         notificationActionBackgroundHandler,
   );
-  if (message.data['action'] == 'stop_owner_booking_alarm') {
-    await notifications.cancel(
-      id: _ownerBookingAlarmNotificationId,
-      tag: _ownerBookingAlarmNotificationTag,
-    );
-    return;
-  }
-  if (defaultTargetPlatform != TargetPlatform.android) {
-    // APNs displays the remote alert and its registered category actions.
-    return;
-  }
-  if (message.data['channel'] != _ownerBookingRequestChannel.id) {
-    return;
-  }
-  final bookingId = message.data['bookingId']?.toString().trim() ?? '';
-  if (bookingId.isNotEmpty &&
-      (await _activeSuppressedOwnerAlerts()).contains(bookingId)) {
-    await notifications.cancel(
-      id: _ownerBookingAlarmNotificationId,
-      tag: _ownerBookingAlarmNotificationTag,
-    );
-    return;
-  }
-  final preferences = await SharedPreferences.getInstance();
-  if (preferences.getBool(_ownerAlertsEnabledPreferenceKey) != true) {
-    return;
-  }
+}
 
-  await notifications
-      .resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin
-      >()
-      ?.createNotificationChannel(_ownerBookingRequestChannel);
-
-  final title = message.data['notificationTitle']?.trim();
-  final body = message.data['notificationBody']?.trim();
-  await notifications.show(
-    id: _ownerBookingAlarmNotificationId,
-    title: title?.isNotEmpty == true ? title : 'New booking request',
-    body: body?.isNotEmpty == true
-        ? body
-        : 'A customer is waiting for accept or reject.',
+Future<bool> _showUnansweredOwnerBookingAlert({
+  required FlutterLocalNotificationsPlugin notifications,
+  required String bookingId,
+  required DateTime deadline,
+  required String title,
+  required String body,
+  required Map<String, dynamic> data,
+  bool Function()? isStillPending,
+}) => OwnerBookingAlertState().showIfUnanswered(
+  bookingId: bookingId,
+  deadline: deadline,
+  isStillPending: isStillPending,
+  cancel: () =>
+      _cancelOwnerBookingNotifications(notifications, bookingId: bookingId),
+  show: (remainingMillis) => notifications.show(
+    id: ownerBookingNotificationId(bookingId),
+    title: title,
+    body: body,
     notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
         _ownerBookingRequestChannel.id,
@@ -326,17 +500,105 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
         autoCancel: false,
         enableVibration: true,
         visibility: NotificationVisibility.public,
-        tag: _ownerBookingAlarmNotificationTag,
+        // Without this the alert is only a heads-up banner, which a locked or
+        // pocketed phone never surfaces. A full-screen intent wakes the screen
+        // and shows the request the way an incoming call does. Android 14 and
+        // later ignore it unless the owner has granted the permission, which
+        // `ownerAlertReadiness` reports and `openFullScreenIntentSettings`
+        // sends them to.
+        fullScreenIntent: true,
+        tag: _ownerBookingTag(bookingId),
+        timeoutAfter: remainingMillis,
         sound: const RawResourceAndroidNotificationSound(
           'owner_booking_request',
         ),
+        // Pre-Oreo devices take the audio stream from the notification
+        // rather than the channel.
+        audioAttributesUsage: AudioAttributesUsage.alarm,
         additionalFlags: Int32List.fromList([
           _androidInsistentNotificationFlag,
         ]),
         actions: _ownerInstantBookingNotificationActions,
       ),
+      iOS: const DarwinNotificationDetails(
+        sound: 'owner_booking_request.wav',
+        categoryIdentifier: _ownerBookingRequestDarwinCategory,
+        interruptionLevel: InterruptionLevel.active,
+      ),
+      macOS: const DarwinNotificationDetails(
+        sound: 'owner_booking_request.wav',
+        categoryIdentifier: _ownerBookingRequestDarwinCategory,
+      ),
     ),
-    payload: _notificationPayload(message.data),
+    payload: _notificationPayload({
+      ...data,
+      'channel': _ownerBookingRequestChannel.id,
+    }),
+  ),
+);
+
+@pragma('vm:entry-point')
+Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  if (kIsWeb) return;
+  final bookingId = message.data['bookingId']?.toString().trim() ?? '';
+  final notifications = FlutterLocalNotificationsPlugin();
+  if (_isOwnerBookingResolution(message.data)) {
+    if (bookingId.isEmpty) return;
+    await _persistOwnerAlertSuppression(bookingId);
+    await _clearPendingOwnerBookingAction(bookingId);
+    await _initializeBackgroundNotifications(notifications);
+    await _cancelOwnerBookingNotifications(notifications, bookingId: bookingId);
+    await _clearOwnerDecisionFeedback(bookingId);
+    return;
+  }
+  if (defaultTargetPlatform != TargetPlatform.android ||
+      !_isOwnerBookingRequestChannel(message.data['channel']) ||
+      bookingId.isEmpty) {
+    return;
+  }
+  final deadline = _ownerAlertMessageDeadline(message);
+  if (deadline == null) return;
+  if (!await OwnerAlertPreferences().isEnabled()) {
+    return;
+  }
+  await _initializeBackgroundNotifications(notifications);
+  await notifications
+      .resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin
+      >()
+      ?.createNotificationChannel(_ownerBookingRequestChannel);
+  if (await OwnerBookingAlertState().isStopped(bookingId)) {
+    await _cancelOwnerBookingNotifications(notifications, bookingId: bookingId);
+    final decisions = OwnerBookingDecisionStore();
+    for (final entry in await decisions.pending()) {
+      final parts = entry.split('|');
+      if (parts.length != 3 || parts[0] != bookingId) continue;
+      if (!DateTime.now().isBefore(deadline)) {
+        await decisions.clear(bookingId);
+        break;
+      }
+      try {
+        await _submitBackgroundOwnerBookingDecision(bookingId, parts[1]);
+        await decisions.clear(bookingId);
+      } catch (error) {
+        if (kDebugMode) {
+          debugPrint('Background booking decision retry failed: $error');
+        }
+      }
+      break;
+    }
+    return;
+  }
+  await _showUnansweredOwnerBookingAlert(
+    notifications: notifications,
+    bookingId: bookingId,
+    deadline: deadline,
+    title:
+        message.data['notificationTitle']?.toString() ?? 'New booking request',
+    body:
+        message.data['notificationBody']?.toString() ??
+        'A customer is waiting for accept or reject.',
+    data: message.data,
   );
 }
 
@@ -387,6 +649,42 @@ UserRole resolveLaunchRole({
   return publicRoles.firstOrNull ?? UserRole.customer;
 }
 
+@visibleForTesting
+UserRole? cachedRoleForAccount({
+  required UserRole? role,
+  required String? cachedAccountId,
+  required String currentAccountId,
+}) {
+  return cachedAccountId == currentAccountId ? role : null;
+}
+
+@visibleForTesting
+bool isRetryableCallableErrorCode(String code) {
+  return const <String>{
+    'aborted',
+    'cancelled',
+    'deadline-exceeded',
+    'internal',
+    'resource-exhausted',
+    'unavailable',
+    'unknown',
+  }.contains(code.trim().toLowerCase());
+}
+
+@visibleForTesting
+bool isRetryableDiscountOfferErrorCode(String code) {
+  return const <String>{
+    'deadline-exceeded',
+    'internal',
+    'unavailable',
+    'unknown',
+  }.contains(code.trim().toLowerCase());
+}
+
+@visibleForTesting
+bool isRetryableOwnerDecisionErrorCode(String code) =>
+    isRetryableCallableErrorCode(code);
+
 class AppState extends ChangeNotifier {
   final List<Salon> _salons = [];
   final List<SalonService> _ownerDraftServices = [];
@@ -399,9 +697,11 @@ class AppState extends ChangeNotifier {
   final Map<String, List<TimeSlot>> _slotCache = {};
   final Map<String, Set<String>> _seenNotificationKeys = {};
   final Map<String, Set<String>> _dismissedNotificationKeys = {};
+  final Map<String, DateTime> _notificationsReadAt = {};
   final Set<String> _notificationPreferencesReadyViewers = {};
   final Map<String, UserRole> _mockPhoneRoles = {};
   final Map<String, String> _mockPhoneAccountIds = {};
+  final Map<String, String> _verifiedOwnerPhones = {};
   final Map<String, String> _mockCustomerNames = {};
   final Set<String> _mockRegisteredAccountIds = {};
   final Map<String, ReferralCodes> _mockReferralCodes = {};
@@ -428,7 +728,9 @@ class AppState extends ChangeNotifier {
   String _ownerPaymentUpiId = '';
   String _ownerPaymentQrCodeUrl = '';
   bool _isSaving = false;
+  bool _isInstantBookingSaving = false;
   bool _referralOnboardingRequired = false;
+  int _discountOfferRefreshVersion = 0;
   int _referralCodeCounter = 1;
   int _mockDiscountPercent = 0;
   int _mockMaximumDiscountAmount = 0;
@@ -436,19 +738,26 @@ class AppState extends ChangeNotifier {
   final List<_MockVisibleCheckoutDiscountCampaign>
   _mockVisibleDiscountCampaigns = [];
   final Map<String, DiscountQuote> _mockLockedDiscountQuotes = {};
+  final Map<String, CompletedBookingUpiPaymentDetails>
+  _completedBookingUpiPaymentDetails = {};
   ProinWalletSummary _customerProinWallet = const ProinWalletSummary();
   final Map<String, ProinWalletSummary> _salonProinWallets = {};
   final List<ProinActivityEntry> _customerProinActivity = [];
   AppNotificationNavigation? _pendingNotificationNavigation;
+  String _pendingCompletionReceiptBookingId = '';
   Future<void> _rolePersistenceQueue = Future<void>.value();
   Timer? _customerInstantExpiryTimer;
   final Set<String> _locallyExpiredInstantBookingIds = <String>{};
 
-  AppState() {
-    unawaited(_restoreActiveRole());
+  AppState({bool restoreActiveRole = true}) {
+    if (restoreActiveRole) {
+      unawaited(_restoreActiveRole());
+    }
   }
 
   bool get usesFirebase => false;
+
+  int get discountOfferRefreshVersion => _discountOfferRefreshVersion;
 
   bool get isRestoringSession => false;
 
@@ -457,6 +766,7 @@ class AppState extends ChangeNotifier {
   String? get lastSyncError => _lastSyncError;
 
   bool get isSaving => _isSaving;
+  bool get isInstantBookingSaving => _isInstantBookingSaving;
 
   String get ownerPaymentUpiId => _ownerPaymentUpiId;
 
@@ -467,6 +777,33 @@ class AppState extends ChangeNotifier {
   Stream<String> get autoVerifiedPhoneNumbers => const Stream.empty();
 
   bool isPhoneAutoVerified(String phone) => false;
+
+  bool isOwnerPhoneLoginEnabled(String phone) =>
+      _ownerAccount != null &&
+      (_verifiedOwnerPhones[_ownerAccount!.id] == normalizePhone(phone) ||
+          (_ownerAccount!.provider == LoginProvider.phone &&
+              normalizePhone(_ownerAccount!.contact) == normalizePhone(phone)));
+
+  Future<void> linkOwnerPhoneLogin({
+    required String phone,
+    required String verificationId,
+    required String smsCode,
+  }) async {
+    final owner = _ownerAccount;
+    if (owner == null || _activeRole != UserRole.owner) {
+      throw StateError('Sign in as the salon owner first.');
+    }
+    if (!RegExp(r'^\d{6}$').hasMatch(smsCode)) {
+      throw StateError('Enter the 6-digit OTP.');
+    }
+    _claimMockPhoneRole(
+      normalizePhone(phone),
+      UserRole.owner,
+      accountId: owner.id,
+    );
+    _verifiedOwnerPhones[owner.id] = normalizePhone(phone);
+    notifyListeners();
+  }
 
   bool notificationPreferencesReady(UserRole role) =>
       !usesFirebase ||
@@ -482,6 +819,21 @@ class AppState extends ChangeNotifier {
     final navigation = _pendingNotificationNavigation;
     _pendingNotificationNavigation = null;
     return navigation;
+  }
+
+  String get pendingCompletionReceiptBookingId =>
+      _pendingCompletionReceiptBookingId;
+
+  void queueCompletionReceipt(String bookingId) {
+    final normalizedBookingId = bookingId.trim();
+    if (normalizedBookingId.isEmpty) return;
+    _pendingCompletionReceiptBookingId = normalizedBookingId;
+    notifyListeners();
+  }
+
+  void clearPendingCompletionReceipt(String bookingId) {
+    if (_pendingCompletionReceiptBookingId != bookingId.trim()) return;
+    _pendingCompletionReceiptBookingId = '';
   }
 
   void queueNotificationNavigation(
@@ -529,6 +881,12 @@ class AppState extends ChangeNotifier {
   UserAccount? get barberAccount => _barberAccount;
 
   bool get ownerProfileCompleted => _ownerProfileCompleted;
+
+  /// Whether the salon list has arrived at least once. Until it has, an empty
+  /// list means "not loaded yet", not "this owner has no salon" — the two
+  /// look identical and acting on the wrong one strands the owner on the
+  /// registration screen.
+  bool get salonsLoaded => true;
 
   List<String> _normalizedDiscountServiceIds(Iterable<String> serviceIds) {
     final ids =
@@ -622,6 +980,8 @@ class AppState extends ChangeNotifier {
       discountAmount: discountAmount,
       customerPayableAmount: originalAmount - discountAmount,
       pritzePayoutAmount: pritzePayout,
+      cashbackProinAmount: 0,
+      cashbackValidityDays: 0,
       salonTotalEarning: originalAmount - discountAmount + pritzePayout,
     );
     if (lockQuote && quote.quoteId.isNotEmpty) {
@@ -655,6 +1015,47 @@ class AppState extends ChangeNotifier {
       discountPercent: _mockDiscountPercent.toDouble(),
       maximumDiscountAmount: _mockMaximumDiscountAmount,
       lockQuote: lockQuote,
+    );
+  }
+
+  Future<CompletedBookingUpiPaymentDetails>
+  getCompletedBookingUpiPaymentDetails(String bookingId) async {
+    final normalizedBookingId = bookingId.trim();
+    final cached = _completedBookingUpiPaymentDetails[normalizedBookingId];
+    if (cached != null) return cached;
+    final booking = _bookings
+        .where((item) => item.id == normalizedBookingId)
+        .firstOrNull;
+    if (booking == null || booking.status != BookingStatus.completed) {
+      throw StateError('This completed booking could not be found.');
+    }
+    final details = CompletedBookingUpiPaymentDetails(
+      bookingId: booking.id,
+      salonId: booking.salonId,
+      salonName: getSalon(booking.salonId)?.name ?? 'Salon',
+      amountInr: booking.customerPayableAmount,
+    );
+    _completedBookingUpiPaymentDetails[normalizedBookingId] = details;
+    return details;
+  }
+
+  Future<bool> hasOpenedUpiPayment(String bookingId) async {
+    final normalizedBookingId = bookingId.trim();
+    if (normalizedBookingId.isEmpty) return false;
+    final preferences = await SharedPreferences.getInstance();
+    return preferences.getBool(
+          '$_upiHandoffOpenedPreferencePrefix$normalizedBookingId',
+        ) ??
+        false;
+  }
+
+  Future<void> markUpiPaymentOpened(String bookingId) async {
+    final normalizedBookingId = bookingId.trim();
+    if (normalizedBookingId.isEmpty) return;
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(
+      '$_upiHandoffOpenedPreferencePrefix$normalizedBookingId',
+      true,
     );
   }
 
@@ -699,6 +1100,8 @@ class AppState extends ChangeNotifier {
             originalAmount: quote.originalAmount,
             discountAmount: quote.discountAmount,
             customerPayableAmount: quote.customerPayableAmount,
+            cashbackProinAmount: quote.cashbackProinAmount,
+            cashbackValidityDays: quote.cashbackValidityDays,
             campaignEndsAt: quote.campaignEndsAt,
           );
         })
@@ -728,6 +1131,8 @@ class AppState extends ChangeNotifier {
             originalAmount: quote.originalAmount,
             discountAmount: quote.discountAmount,
             customerPayableAmount: quote.customerPayableAmount,
+            cashbackProinAmount: quote.cashbackProinAmount,
+            cashbackValidityDays: quote.cashbackValidityDays,
           ),
         );
       }
@@ -767,7 +1172,7 @@ class AppState extends ChangeNotifier {
       );
       return CheckoutCouponResult(
         benefitType: 'discount',
-        message: 'Pritze offer applied. You save ₹${quote.discountAmount}.',
+        message: _discountAppliedMessage(quote),
         discountQuote: quote,
       );
     }
@@ -800,8 +1205,7 @@ class AppState extends ChangeNotifier {
     }
     return CheckoutCouponResult(
       benefitType: 'discount',
-      message:
-          '${quote.campaignName} applied. You save ₹${quote.discountAmount}.',
+      message: _discountAppliedMessage(quote),
       discountQuote: quote,
     );
   }
@@ -951,9 +1355,18 @@ class AppState extends ChangeNotifier {
     );
     return CheckoutCouponResult(
       benefitType: 'discount',
-      message: 'Voucher applied. You save ₹${quote.discountAmount}.',
+      message: _discountAppliedMessage(quote, label: 'Voucher'),
       discountQuote: quote,
     );
+  }
+
+  String _discountAppliedMessage(DiscountQuote quote, {String? label}) {
+    final cashback = quote.cashbackProinAmount;
+    final displayLabel = label ?? quote.campaignName;
+    if (cashback > 0) {
+      return '$displayLabel applied. You save ₹${quote.discountAmount} now and earn $cashback Proin after the service.';
+    }
+    return '$displayLabel applied. You save ₹${quote.discountAmount}.';
   }
 
   @visibleForTesting
@@ -1121,17 +1534,27 @@ class AppState extends ChangeNotifier {
         true;
   }
 
+  DateTime? notificationReadAt(UserRole role) {
+    return _notificationsReadAt[_notificationViewerKey(role)];
+  }
+
   void markNotificationsSeen(UserRole role, Iterable<String> notificationKeys) {
-    final seen = _seenNotificationKeys.putIfAbsent(
-      _notificationViewerKey(role),
-      () => <String>{},
-    );
+    final viewerKey = _notificationViewerKey(role);
+    final seen = _seenNotificationKeys.putIfAbsent(viewerKey, () => <String>{});
     final previousLength = seen.length;
     seen.addAll(notificationKeys);
-    if (seen.length != previousLength) {
+    final readAt = DateTime.now();
+    final previousReadAt = _notificationsReadAt[viewerKey];
+    _notificationsReadAt[viewerKey] = readAt;
+    if (seen.length != previousLength || previousReadAt != readAt) {
       unawaited(
-        _persistNotificationSet(_seenNotificationsPreferencePrefix, role, seen),
+        _persistNotificationSet(
+          _seenNotificationsPreferencePrefix,
+          viewerKey,
+          seen,
+        ),
       );
+      unawaited(_persistNotificationReadAt(viewerKey, readAt));
       notifyListeners();
     }
   }
@@ -1144,14 +1567,15 @@ class AppState extends ChangeNotifier {
   }
 
   void dismissNotification(UserRole role, String notificationKey) {
+    final viewerKey = _notificationViewerKey(role);
     final dismissed = _dismissedNotificationKeys.putIfAbsent(
-      _notificationViewerKey(role),
+      viewerKey,
       () => <String>{},
     )..add(notificationKey);
     unawaited(
       _persistNotificationSet(
         _dismissedNotificationsPreferencePrefix,
-        role,
+        viewerKey,
         dismissed,
       ),
     );
@@ -1275,11 +1699,11 @@ class AppState extends ChangeNotifier {
             return booking;
           }
           // Project the timeout into customer-visible state as soon as the
-          // 150-second response window closes. Firestore remains authoritative
+          // 120-second response window closes. Firestore remains authoritative
           // and will reconcile this with the server-side cancellation.
           return booking.copyWith(
             status: BookingStatus.cancelled,
-            cancellationReason: 'No response from salon within 150 seconds',
+            cancellationReason: 'No response from salon within 120 seconds',
             cancelledBy: 'system',
             cancelledAt: responseDeadline,
           );
@@ -1530,13 +1954,7 @@ class AppState extends ChangeNotifier {
   }
 
   bool isInstantBookingEnabledForSalon(Salon salon, {DateTime? now}) {
-    if (salon.instantBookingsEnabled) {
-      return true;
-    }
-    final pausedDate = salon.instantBookingsPausedDate?.trim();
-    return pausedDate == null ||
-        pausedDate.isEmpty ||
-        pausedDate != _dateKey(now ?? DateTime.now());
+    return salon.instantBookingsEnabled;
   }
 
   bool isInstantBookingAvailable(
@@ -1679,7 +2097,7 @@ class AppState extends ChangeNotifier {
   Future<void> setOwnerInstantBookingEnabled(bool enabled) async {
     final salon = ownerSalon.copyWith(
       instantBookingsEnabled: enabled,
-      instantBookingsPausedDate: enabled ? '' : _dateKey(DateTime.now()),
+      instantBookingsPausedDate: '',
     );
     _replaceSalon(salon);
     notifyListeners();
@@ -1894,7 +2312,7 @@ class AppState extends ChangeNotifier {
           minuteOfDay ~/ 60,
           minuteOfDay % 60,
         );
-        if (start.isBefore(now.add(const Duration(minutes: 45)))) {
+        if (start.isBefore(now.add(scheduledBookingLeadTime))) {
           continue;
         }
         for (final barber in eligibleBarbers) {
@@ -1961,7 +2379,7 @@ class AppState extends ChangeNotifier {
             minuteOfDay ~/ 60,
             minuteOfDay % 60,
           );
-          if (start.isBefore(now.add(const Duration(minutes: 45)))) {
+          if (start.isBefore(now.add(scheduledBookingLeadTime))) {
             continue;
           }
           if (_isBarberFree(barber.id, start, shortestDuration)) {
@@ -2012,6 +2430,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> refresh() async {
+    _discountOfferRefreshVersion += 1;
     notifyListeners();
   }
 
@@ -2027,7 +2446,12 @@ class AppState extends ChangeNotifier {
     _activeRole = role;
     _clearInactiveRoleState(role);
     await _persistOwnerAlertsEnabled(role == UserRole.owner);
-    await _persistActiveRole(role);
+    final accountId = switch (role) {
+      UserRole.customer => _customerAccount?.id,
+      UserRole.owner => _ownerAccount?.id,
+      UserRole.barber => _barberAccount?.id,
+    };
+    await _persistActiveRole(role, accountId: accountId);
     notifyListeners();
   }
 
@@ -2169,6 +2593,7 @@ class AppState extends ChangeNotifier {
       durationMinutes: service.durationMinutes,
       serviceName: service.name,
       servicePrice: service.price,
+      serviceNameBreakdown: {service.id: service.name},
       servicePriceBreakdown: {service.id: service.price},
       bookingFee: _zeroBookingFee,
       paymentRequired: false,
@@ -2288,6 +2713,9 @@ class AppState extends ChangeNotifier {
       durationMinutes: totalDuration,
       serviceName: services.map((service) => service.name).join(', '),
       servicePrice: totalPrice,
+      serviceNameBreakdown: {
+        for (final service in services) service.id: service.name,
+      },
       servicePriceBreakdown: {
         for (final service in services) service.id: service.price,
       },
@@ -2485,7 +2913,12 @@ class AppState extends ChangeNotifier {
     required String smsCode,
   }) async {
     final contact = normalizePhone(phone);
-    final accountId = _stableAccountId(UserRole.owner, contact);
+    final linkedOwnerId = _verifiedOwnerPhones.entries
+        .where((entry) => entry.value == contact)
+        .firstOrNull
+        ?.key;
+    final accountId =
+        linkedOwnerId ?? _stableAccountId(UserRole.owner, contact);
     _claimMockPhoneRole(contact, UserRole.owner, accountId: accountId);
     final account = UserAccount(
       id: accountId,
@@ -2519,6 +2952,94 @@ class AppState extends ChangeNotifier {
     required String smsCode,
   }) async {
     throw StateError('Barbers do not have login accounts.');
+  }
+
+  Future<void> updateBookingExtraServices({
+    required String bookingId,
+    required String requestId,
+    required String action,
+    Map<String, int> expectedPrices = const {},
+  }) async {
+    final index = _bookings.indexWhere((booking) => booking.id == bookingId);
+    if (index < 0) throw StateError('Booking not found.');
+    final booking = _bookings[index];
+    final role = activeRole?.name;
+    if ((role == 'owner' && ownerSalonId != booking.salonId) ||
+        (role == 'customer' && customerAccount?.id != booking.customerUid) ||
+        (role != 'owner' && role != 'customer')) {
+      throw StateError('This booking belongs to another account.');
+    }
+    if (booking.status != BookingStatus.inProgress) {
+      throw StateError('Extra services can only be added during your visit.');
+    }
+    final pending = booking.extraServiceRequest;
+    if (action == 'propose') {
+      if (pending != null || expectedPrices.isEmpty) {
+        throw StateError('Resolve the current request first.');
+      }
+      final services = expectedPrices.keys
+          .map((id) => getService(booking.salonId, id))
+          .toList();
+      if (services.any(
+        (service) =>
+            service == null ||
+            !service.isAvailable ||
+            booking.resolvedServiceIds.contains(service.id) ||
+            expectedPrices[service.id] != service.price,
+      )) {
+        throw StateError('Service details changed. Choose the services again.');
+      }
+      _bookings[index] = booking.copyWith(
+        extraServiceRequest: BookingExtraServiceRequest(
+          id: requestId,
+          proposedByRole: role!,
+          names: {for (final service in services) service!.id: service.name},
+          prices: expectedPrices,
+          durationMinutes: services.fold(
+            0,
+            (total, service) => total + service!.durationMinutes,
+          ),
+        ),
+      );
+    } else {
+      if (pending == null || pending.id != requestId) {
+        throw StateError('This request is no longer pending.');
+      }
+      if ((action == 'cancel') != (pending.proposedByRole == role)) {
+        throw StateError(
+          'The other person must approve or decline this request.',
+        );
+      }
+      if (action == 'approve') {
+        _bookings[index] = booking.copyWith(
+          serviceIds: [...booking.resolvedServiceIds, ...pending.prices.keys],
+          serviceName: [
+            booking.resolvedServiceName(),
+            ...pending.names.values,
+          ].join(', '),
+          servicePrice: booking.servicePrice + pending.amount,
+          servicePriceBreakdown: {
+            ...booking.servicePriceBreakdown,
+            ...pending.prices,
+          },
+          serviceNameBreakdown: {
+            ...booking.serviceNameBreakdown,
+            ...pending.names,
+          },
+          durationMinutes: booking.durationMinutes + pending.durationMinutes,
+          customerPayableAmount: booking.customerPayableAmount + pending.amount,
+          customerPayableBeforeProin:
+              booking.customerPayableBeforeProin + pending.amount,
+          salonTotalEarning: booking.salonTotalEarning + pending.amount,
+          clearExtraServiceRequest: true,
+        );
+      } else if (action == 'reject' || action == 'cancel') {
+        _bookings[index] = booking.copyWith(clearExtraServiceRequest: true);
+      } else {
+        throw StateError('Invalid action.');
+      }
+    }
+    notifyListeners();
   }
 
   Future<void> updateBookingStatus(
@@ -3150,6 +3671,26 @@ class AppState extends ChangeNotifier {
     required String resumeSummary,
     required List<String> serviceIds,
   }) async {
+    final barber = _newOwnerBarber(
+      name: name,
+      phone: phone,
+      speciality: speciality,
+      experienceYears: experienceYears,
+      resumeSummary: resumeSummary,
+      serviceIds: serviceIds,
+    );
+    _barbers.add(barber);
+    notifyListeners();
+  }
+
+  Barber _newOwnerBarber({
+    required String name,
+    required String phone,
+    required String speciality,
+    required int experienceYears,
+    required String resumeSummary,
+    required List<String> serviceIds,
+  }) {
     final normalizedPhone = normalizePhone(phone);
     if (_barbers.any(
       (barber) =>
@@ -3162,7 +3703,7 @@ class AppState extends ChangeNotifier {
     final assignedServiceIds = serviceIds.isEmpty
         ? ownerSalon.services.map((service) => service.id).toList()
         : serviceIds;
-    final barber = Barber(
+    return Barber(
       id: _newEntityId('barber', _barberCounter++),
       salonId: ownerSalonId,
       name: name.trim(),
@@ -3175,8 +3716,6 @@ class AppState extends ChangeNotifier {
           : resumeSummary.trim(),
       serviceIds: assignedServiceIds,
     );
-    _barbers.add(barber);
-    notifyListeners();
   }
 
   Future<void> updateOwnerBarber({
@@ -3569,7 +4108,10 @@ class AppState extends ChangeNotifier {
     _barberAccount = role == UserRole.barber ? account : null;
     _clearInactiveRoleState(role);
     unawaited(_persistOwnerAlertsEnabled(role == UserRole.owner));
-    unawaited(_persistActiveRole(role));
+    // A role is only safe to restore when it belongs to the same Firebase
+    // account. Keeping the uid beside it prevents a customer from inheriting
+    // an owner's locally cached dashboard (and vice versa).
+    unawaited(_persistActiveRole(role, accountId: account.id));
     unawaited(_restoreNotificationPreferences(role));
     notifyListeners();
   }
@@ -3608,6 +4150,23 @@ class AppState extends ChangeNotifier {
               )
               ?.toSet() ??
           <String>{};
+      final storedReadAt = preferences.getInt(
+        '$_notificationsReadAtPreferencePrefix$viewerKey',
+      );
+      if (storedReadAt == null) {
+        // Existing booking history must not become unread merely because the
+        // app was installed, updated, or its Firestore stream reconnected.
+        final baseline = DateTime.now();
+        _notificationsReadAt[viewerKey] = baseline;
+        await preferences.setInt(
+          '$_notificationsReadAtPreferencePrefix$viewerKey',
+          baseline.millisecondsSinceEpoch,
+        );
+      } else {
+        _notificationsReadAt[viewerKey] = DateTime.fromMillisecondsSinceEpoch(
+          storedReadAt,
+        );
+      }
     } catch (_) {
       // Notification history can safely remain in memory if storage is unavailable.
     } finally {
@@ -3618,14 +4177,26 @@ class AppState extends ChangeNotifier {
 
   Future<void> _persistNotificationSet(
     String prefix,
-    UserRole role,
+    String viewerKey,
     Set<String> keys,
   ) async {
     try {
       final preferences = await SharedPreferences.getInstance();
-      await preferences.setStringList(
-        '$prefix${_notificationViewerKey(role)}',
-        keys.toList(),
+      await preferences.setStringList('$prefix$viewerKey', keys.toList());
+    } catch (_) {
+      // Keep the in-memory behavior if local persistence is unavailable.
+    }
+  }
+
+  Future<void> _persistNotificationReadAt(
+    String viewerKey,
+    DateTime readAt,
+  ) async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setInt(
+        '$_notificationsReadAtPreferencePrefix$viewerKey',
+        readAt.millisecondsSinceEpoch,
       );
     } catch (_) {
       // Keep the in-memory behavior if local persistence is unavailable.
@@ -3642,12 +4213,25 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> _restoreActiveRole() async {
+  Future<void> _restoreActiveRole({String? accountId}) async {
     try {
       await _rolePersistenceQueue;
       final preferences = await SharedPreferences.getInstance();
       final roleName = preferences.getString(_activeRolePreferenceKey);
       final role = _roleFromName(roleName);
+      if (accountId != null) {
+        _activeRole = cachedRoleForAccount(
+          role: role,
+          cachedAccountId: preferences.getString(
+            _activeRoleAccountIdPreferenceKey,
+          ),
+          currentAccountId: accountId,
+        );
+        if (_activeRole != null) {
+          notifyListeners();
+        }
+        return;
+      }
       if (role != null && role != UserRole.barber) {
         _activeRole = role;
         notifyListeners();
@@ -3657,14 +4241,23 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> _persistActiveRole(UserRole? role) {
+  Future<void> _persistActiveRole(UserRole? role, {String? accountId}) {
     final operation = _rolePersistenceQueue.then((_) async {
       try {
         final preferences = await SharedPreferences.getInstance();
         if (role == null) {
           await preferences.remove(_activeRolePreferenceKey);
+          await preferences.remove(_activeRoleAccountIdPreferenceKey);
         } else {
           await preferences.setString(_activeRolePreferenceKey, role.name);
+          if (accountId == null || accountId.trim().isEmpty) {
+            await preferences.remove(_activeRoleAccountIdPreferenceKey);
+          } else {
+            await preferences.setString(
+              _activeRoleAccountIdPreferenceKey,
+              accountId,
+            );
+          }
         }
       } catch (_) {
         // Ignore local persistence failures; Firebase remains the source of truth.
@@ -3676,8 +4269,9 @@ class AppState extends ChangeNotifier {
 
   Future<void> _persistOwnerAlertsEnabled(bool enabled) async {
     try {
-      final preferences = await SharedPreferences.getInstance();
-      await preferences.setBool(_ownerAlertsEnabledPreferenceKey, enabled);
+      // Must be the store the FCM isolate reads. Writing it through the
+      // default preferences file leaves the background alert permanently off.
+      await OwnerAlertPreferences().setEnabled(enabled);
     } catch (_) {
       // Firebase and the foreground role check remain the primary safeguards.
     }
@@ -3692,6 +4286,14 @@ class AppState extends ChangeNotifier {
       return;
     }
     _isSaving = value;
+    notifyListeners();
+  }
+
+  void _setInstantBookingSaving(bool value) {
+    if (_isInstantBookingSaving == value) {
+      return;
+    }
+    _isInstantBookingSaving = value;
     notifyListeners();
   }
 
@@ -3824,6 +4426,7 @@ class AppState extends ChangeNotifier {
       return booking.copyWith(
         status: status,
         completedAt: now,
+        clearExtraServiceRequest: true,
         discountStatus: booking.hasDiscount ? 'redeemed' : 'none',
         cancellationReason: cancellationReason,
         cancelledBy: cancelledBy,
@@ -3833,6 +4436,7 @@ class AppState extends ChangeNotifier {
       return booking.copyWith(
         status: status,
         cancelledAt: now,
+        clearExtraServiceRequest: true,
         discountStatus: booking.hasDiscount ? 'released' : 'none',
         cancellationReason: cancellationReason,
         cancelledBy: cancelledBy,
@@ -3842,6 +4446,7 @@ class AppState extends ChangeNotifier {
       return booking.copyWith(
         status: status,
         rejectedAt: now,
+        clearExtraServiceRequest: true,
         discountStatus: booking.hasDiscount ? 'released' : 'none',
         cancellationReason: cancellationReason,
         cancelledBy: cancelledBy,
@@ -3907,6 +4512,7 @@ class AppState extends ChangeNotifier {
       isOpen: true,
       instantBookingsEnabled: true,
       instantBookingsPausedDate: '',
+      approvalStatus: 'pending',
       services: List.unmodifiable(_ownerDraftServices),
     );
   }
@@ -3944,6 +4550,46 @@ class _MockVisibleCheckoutDiscountCampaign {
   });
 }
 
+/// An optimistic booking only covers the round trip to the server. Once the
+/// window passes the server is authoritative even when the two disagree.
+/// Holding a stale copy indefinitely hid every later change to that booking —
+/// an accepted request never became startable — and the only way to clear it
+/// was to kill the app, because this map lives in memory.
+const optimisticBookingLifetime = Duration(seconds: 30);
+
+class OptimisticBooking {
+  OptimisticBooking(this.booking, {DateTime? now})
+    : expiresAt = (now ?? DateTime.now()).add(optimisticBookingLifetime);
+
+  final Booking booking;
+  final DateTime expiresAt;
+
+  bool hasExpired(DateTime now) => !now.isBefore(expiresAt);
+}
+
+/// Server bookings win unless an optimistic copy is still inside its window.
+/// Entries the server has caught up with, and entries that have outlived the
+/// window, are dropped from [optimistic] so a booking can never be pinned to
+/// a stale status for the rest of the session.
+Map<String, Booking> reconcileOptimisticBookings({
+  required Map<String, Booking> serverBookings,
+  required Map<String, OptimisticBooking> optimistic,
+  DateTime? now,
+}) {
+  final at = now ?? DateTime.now();
+  final merged = Map<String, Booking>.from(serverBookings);
+  for (final entry in optimistic.entries.toList()) {
+    final serverBooking = merged[entry.key];
+    if (entry.value.hasExpired(at) ||
+        serverBooking?.status == entry.value.booking.status) {
+      optimistic.remove(entry.key);
+    } else if (serverBooking != null) {
+      merged[entry.key] = entry.value.booking;
+    }
+  }
+  return merged;
+}
+
 class FirebaseAppState extends AppState with WidgetsBindingObserver {
   final FirebaseFirestore firestore;
   final FirebaseFunctions functions;
@@ -3967,7 +4613,11 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   final Map<String, String> _currentPhoneVerificationIds = <String, String>{};
   final StreamController<String> _autoVerifiedPhoneController =
       StreamController<String>.broadcast();
-  final Map<String, Booking> _optimisticBookingUpdates = <String, Booking>{};
+  final Map<String, OptimisticBooking> _optimisticBookingUpdates =
+      <String, OptimisticBooking>{};
+  final Set<String> _bookingStatusRequests = {};
+  Future<ProinWalletSummary>? _customerWalletRefresh;
+  String? _customerWalletRefreshUid;
   final Map<String, DateTime> _suppressedOwnerBookingAlerts =
       <String, DateTime>{};
   UserRole? _pendingFirebaseLoginRole;
@@ -3976,11 +4626,19 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   UserAccount? _pendingGoogleCustomerAccount;
   String? _pendingGoogleCustomerUid;
   bool _suppressTokenRegistration = false;
+  String? _registeredMessagingToken;
   Timer? _messagingTokenRetryTimer;
   int _messagingTokenRetryAttempt = 0;
   Timer? _ownerBookingAlarmTimer;
+  int _ownerBookingAlarmGeneration = 0;
+  bool _ownerBookingAlarmRefreshRunning = false;
+  Timer? _ownerBookingDecisionRetryTimer;
+  bool _retryingOwnerBookingDecisions = false;
+  final Set<String> _notificationDecisionsInFlight = {};
   bool _isRestoringSession = true;
+  bool _disposed = false;
   int _accountRestoreGeneration = 0;
+  String? _startupRestoreUid;
   DateTime? _lastCallableCredentialRefreshAt;
 
   FirebaseAppState({
@@ -3989,15 +4647,43 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     required this.auth,
     required this.messaging,
     FirebaseStorage? storage,
-  }) : storage = storage ?? FirebaseStorage.instance {
+  }) : storage = storage ?? FirebaseStorage.instance,
+       super(restoreActiveRole: false) {
     WidgetsBinding.instance.addObserver(this);
-    _connectFirestore();
-    _configurePushNotifications();
+    // Capture an Accept/Reject launch before loading account or booking data.
+    unawaited(
+      _initializeLocalNotifications().catchError((Object error) {
+        _setSyncError(error);
+      }),
+    );
     unawaited(restoreSignedInUser());
+    // Attaching every Firestore and notification listener can synchronously
+    // hydrate large local caches. Do it after Flutter has painted the launch
+    // frame so neither Android nor iOS waits on that work to become visible.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_disposed) return;
+      _connectFirestore();
+      _configurePushNotifications();
+    });
   }
+
+  bool _salonsLoaded = false;
+
+  @override
+  bool get salonsLoaded => _salonsLoaded;
 
   @override
   bool get usesFirebase => true;
+
+  @override
+  List<Salon> get discoverableSalons => List.unmodifiable(
+    super.discoverableSalons.where((salon) => salon.isApproved),
+  );
+
+  @override
+  List<Salon> get bookableSalons => super.bookableSalons
+      .where((salon) => salon.isApproved)
+      .toList(growable: false);
 
   @override
   bool get hasActiveCustomerSession =>
@@ -4081,6 +4767,43 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   @override
+  Future<CompletedBookingUpiPaymentDetails>
+  getCompletedBookingUpiPaymentDetails(String bookingId) async {
+    final normalizedBookingId = bookingId.trim();
+    final cached = _completedBookingUpiPaymentDetails[normalizedBookingId];
+    if (cached != null) return cached;
+    if (!hasActiveCustomerSession) {
+      throw StateError('Sign in as the customer who made this booking.');
+    }
+    final response = await _callProtectedFunction(
+      () => functions
+          .httpsCallable('getCompletedBookingUpiPaymentDetails')
+          .call<Map<String, dynamic>>({'bookingId': normalizedBookingId}),
+    );
+    final data = response.data;
+    final details = CompletedBookingUpiPaymentDetails(
+      bookingId: _string(data['bookingId'], normalizedBookingId),
+      salonId: _string(data['salonId'], ''),
+      salonName: _string(data['salonName'], 'Salon'),
+      amountInr: _int(data['amountInr'], 0),
+      currency: _string(data['currency'], 'INR'),
+      upiId: _string(data['upiId'], ''),
+      upiUri: _string(data['upiUri'], ''),
+      qrCodeUrl: _string(data['qrCodeUrl'], ''),
+      transactionReference: _string(data['transactionReference'], ''),
+      paymentAvailable: data['paymentAvailable'] == true,
+    );
+    if (details.bookingId != normalizedBookingId ||
+        details.amountInr < 0 ||
+        (details.paymentAvailable &&
+            (details.upiId.isEmpty || details.upiUri.isEmpty))) {
+      throw StateError('The salon payment details could not be verified.');
+    }
+    _completedBookingUpiPaymentDetails[normalizedBookingId] = details;
+    return details;
+  }
+
+  @override
   Future<DiscountQuote> getDiscountQuote({
     required String salonId,
     required Iterable<String> serviceIds,
@@ -4125,15 +4848,24 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         prefetchOnly: prefetchOnly,
       );
     }
-    final response = await _callProtectedFunction(
-      () => functions
-          .httpsCallable('listCheckoutDiscountOffers')
-          .call<Map<String, dynamic>>({
-            'salonId': salonId,
-            'serviceIds': ids,
-            if (prefetchOnly) 'prefetchOnly': true,
-          }),
-    );
+    Future<HttpsCallableResult<Map<String, dynamic>>> loadOffers() =>
+        _callProtectedFunction(
+          () => functions
+              .httpsCallable('listCheckoutDiscountOffers')
+              .call<Map<String, dynamic>>({
+                'salonId': salonId,
+                'serviceIds': ids,
+                if (prefetchOnly) 'prefetchOnly': true,
+              }),
+        );
+    late final HttpsCallableResult<Map<String, dynamic>> response;
+    try {
+      response = await loadOffers();
+    } on FirebaseFunctionsException catch (error) {
+      if (!isRetryableDiscountOfferErrorCode(error.code)) rethrow;
+      await Future<void>.delayed(const Duration(milliseconds: 350));
+      response = await loadOffers();
+    }
     final offers = response.data['offers'];
     if (offers is! List) return const [];
     return offers
@@ -4202,8 +4934,36 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         quote = _discountQuoteFromData(value);
       }
       if (_string(data['benefitType'], '') == 'proin') {
-        await refreshCustomerProinWallet();
-        await refreshCustomerProinActivity();
+        final availableProin = _int(
+          data['availableProin'],
+          _customerProinWallet.availableProin + _int(data['amountProin'], 0),
+        );
+        _customerProinWallet = ProinWalletSummary(
+          availableProin: availableProin,
+          reservedProin: _customerProinWallet.reservedProin,
+          creditLimitProin: _customerProinWallet.creditLimitProin,
+          spendableProin:
+              availableProin + _customerProinWallet.creditLimitProin,
+          lifetimeGrantedProin:
+              _customerProinWallet.lifetimeGrantedProin +
+              (data['alreadyClaimed'] == true
+                  ? 0
+                  : _int(data['amountProin'], 0)),
+          lifetimeRedeemedProin: _customerProinWallet.lifetimeRedeemedProin,
+          lifetimeExpiredProin: _customerProinWallet.lifetimeExpiredProin,
+          nextExpiryAt: _customerProinWallet.nextExpiryAt,
+          expiringLots: _customerProinWallet.expiringLots,
+        );
+        notifyListeners();
+        unawaited(
+          Future.wait([
+            refreshCustomerProinWallet(),
+            refreshCustomerProinActivity(),
+          ]).catchError((Object error) {
+            _setSyncError(error);
+            return <Object>[];
+          }),
+        );
       }
       return CheckoutCouponResult(
         benefitType: _string(data['benefitType'], ''),
@@ -4231,6 +4991,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       customerPayableAmount: _int(data['customerPayableAmount'], 0),
       pritzePayoutAmount: _int(data['pritzePayoutAmount'], 0),
       salonTotalEarning: _int(data['salonTotalEarning'], 0),
+      cashbackProinAmount: _int(data['cashbackProinAmount'], 0),
+      cashbackValidityDays: _int(data['cashbackValidityDays'], 0),
       expiresAt: _int(data['expiresAtMillis'], 0) <= 0
           ? null
           : DateTime.fromMillisecondsSinceEpoch(
@@ -4255,6 +5017,8 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       originalAmount: _int(data['originalAmount'], 0),
       discountAmount: _int(data['discountAmount'], 0),
       customerPayableAmount: _int(data['customerPayableAmount'], 0),
+      cashbackProinAmount: _int(data['cashbackProinAmount'], 0),
+      cashbackValidityDays: _int(data['cashbackValidityDays'], 0),
       campaignEndsAt: _int(data['campaignEndsAtMillis'], 0) <= 0
           ? null
           : DateTime.fromMillisecondsSinceEpoch(
@@ -4264,7 +5028,23 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   @override
-  Future<ProinWalletSummary> refreshCustomerProinWallet() async {
+  Future<ProinWalletSummary> refreshCustomerProinWallet() {
+    final uid = auth.currentUser?.uid;
+    if (_customerWalletRefresh != null && _customerWalletRefreshUid == uid) {
+      return _customerWalletRefresh!;
+    }
+    _customerWalletRefreshUid = uid;
+    late final Future<ProinWalletSummary> pending;
+    pending = _loadCustomerProinWallet(uid).whenComplete(() {
+      if (identical(_customerWalletRefresh, pending)) {
+        _customerWalletRefresh = null;
+      }
+    });
+    _customerWalletRefresh = pending;
+    return pending;
+  }
+
+  Future<ProinWalletSummary> _loadCustomerProinWallet(String? uid) async {
     if (!hasActiveCustomerSession) {
       _customerProinWallet = const ProinWalletSummary();
       notifyListeners();
@@ -4276,6 +5056,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
           .call<Map<String, dynamic>>(),
     );
     final data = response.data;
+    if (auth.currentUser?.uid != uid || !hasActiveCustomerSession) {
+      return const ProinWalletSummary();
+    }
     _customerProinWallet = ProinWalletSummary(
       availableProin: _int(data['availableProin'], 0),
       reservedProin: _int(data['reservedProin'], 0),
@@ -4510,7 +5293,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
   @override
   bool isBookingStatusUpdatePending(String bookingId) =>
-      _optimisticBookingUpdates.containsKey(bookingId);
+      _bookingStatusRequests.contains(bookingId) ||
+      _optimisticBookingUpdates[bookingId]?.hasExpired(DateTime.now()) ==
+          false;
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -4523,17 +5308,45 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     }
     _messagingTokenRetryAttempt = 0;
     unawaited(_saveMessagingToken(uid));
+    if (_activeRole == UserRole.owner) {
+      unawaited(_retryPendingOwnerBookingActions());
+    }
   }
 
   @override
   Future<void> restoreSignedInUser() async {
+    var user = auth.currentUser;
+    // On a cold process start the native Auth SDK can finish restoring its
+    // persisted user just after Firebase Core becomes available. Waiting for
+    // the stream's initial event avoids briefly treating that user as logged
+    // out and routing them to the wrong home.
+    user ??= await auth.authStateChanges().first.timeout(
+      const Duration(seconds: 3),
+      onTimeout: () => auth.currentUser,
+    );
+    _startupRestoreUid = user?.uid;
     try {
-      await super.restoreSignedInUser();
-      final user = auth.currentUser;
-      if (user != null) {
+      if (user == null) {
+        _activeRole = null;
+        return;
+      }
+
+      await _restoreActiveRole(accountId: user.uid);
+      if (_activeRole != null) {
+        // The cached role belongs to this exact Firebase uid, so it is safe to
+        // render immediately while Firestore reconciles the profile.
+        final localRole = _activeRole == UserRole.barber
+            ? UserRole.customer
+            : _activeRole!;
+        _activateRole(localRole, _accountFromFirebaseUser(user, const {}));
+      } else {
+        // Existing installs have an unscoped legacy role. Do not guess from
+        // it: wait for this user's authoritative profile once, otherwise an
+        // owner who previously used the phone can leak into a customer login.
         await _restoreAccountForUser(user);
       }
     } finally {
+      _startupRestoreUid = null;
       _isRestoringSession = false;
       notifyListeners();
     }
@@ -4588,6 +5401,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
         _joinRequests.clear();
       }
+      _discountOfferRefreshVersion += 1;
       notifyListeners();
     } catch (error) {
       _setSyncError(error);
@@ -4615,21 +5429,53 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     _pendingGoogleCustomerUid = null;
     _stopOwnerBookingAlarm();
     final uid = auth.currentUser?.uid;
-    if (uid != null) {
-      await _removeMessagingToken(uid);
-    }
+    final tokenCleanup = uid == null ? null : _removeMessagingToken(uid);
+
+    // Clear the visible session and its uid-scoped role before any network
+    // cleanup. A slow FCM/Firestore request must never leave the user staring
+    // at an account they already asked to leave.
+    await super.signOutActiveUser();
     try {
+      if (tokenCleanup != null) {
+        try {
+          // The de-registration write needs the session that is about to end,
+          // so it has to finish first. Long enough for a slow connection to
+          // land it, short enough that nobody force-quits mid-way and comes
+          // back still signed in.
+          await tokenCleanup.timeout(const Duration(seconds: 3));
+        } on TimeoutException {
+          if (kDebugMode) {
+            debugPrint('Sign-out notification cleanup timed out.');
+          }
+        } catch (error) {
+          // Notification cleanup must never be what keeps someone signed in.
+          if (kDebugMode) {
+            debugPrint('Sign-out notification cleanup failed: $error');
+          }
+        }
+      }
       await auth.signOut();
       if (_googleInitialized) {
-        await GoogleSignIn.instance.signOut();
+        try {
+          await GoogleSignIn.instance.signOut().timeout(
+            const Duration(seconds: 2),
+          );
+        } catch (error) {
+          if (kDebugMode) {
+            debugPrint('Google account cleanup after sign-out failed: $error');
+          }
+        }
       }
-    } finally {
-      await super.signOutActiveUser();
+    } catch (error) {
+      _setSyncError(error);
+      rethrow;
     }
   }
 
   @override
   void dispose() {
+    _disposed = true;
+    _ownerBookingDecisionRetryTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _messagingTokenRetryTimer?.cancel();
     for (final subscription in _subscriptions) {
@@ -4725,6 +5571,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         durationMinutes: service.durationMinutes,
         serviceName: service.name,
         servicePrice: service.price,
+        serviceNameBreakdown: {service.id: service.name},
         servicePriceBreakdown: {service.id: service.price},
         bookingFee: _zeroBookingFee,
         paymentRequired: false,
@@ -4987,7 +5834,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
             if (quoteId.isNotEmpty) 'quoteId': quoteId,
             if (requestedProin > 0) 'requestedProin': requestedProin,
           });
-      return _loadServerBooking(_string(result.data['bookingId'], ''));
+      return _bookingFromCreateResponse(result.data);
     });
   }
 
@@ -5015,8 +5862,38 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
             if (quoteId.isNotEmpty) 'quoteId': quoteId,
             if (requestedProin > 0) 'requestedProin': requestedProin,
           });
-      return _loadServerBooking(_string(result.data['bookingId'], ''));
+      return _bookingFromCreateResponse(result.data);
     });
+  }
+
+  Future<Booking> _bookingFromCreateResponse(
+    Map<String, dynamic> response,
+  ) async {
+    final bookingId = _string(response['bookingId'], '');
+    if (bookingId.isEmpty) {
+      throw StateError('The server did not return a booking.');
+    }
+    final rawBooking = response['booking'];
+    if (rawBooking is! Map) {
+      // Compatibility with an older deployed function during a rolling
+      // release. New servers return the record inline and skip this read.
+      return _loadServerBooking(bookingId);
+    }
+    final booking = _bookingFromData(
+      bookingId,
+      Map<String, dynamic>.from(rawBooking),
+    );
+    final index = _bookings.indexWhere((item) => item.id == booking.id);
+    if (index == -1) {
+      _bookings.add(booking);
+    } else {
+      _bookings[index] = booking;
+    }
+    if (_activeRole == UserRole.customer && booking.hasProin) {
+      unawaited(_refreshCustomerProinWalletInBackground());
+    }
+    notifyListeners();
+    return booking;
   }
 
   Future<Booking> _loadServerBooking(String bookingId) async {
@@ -5059,6 +5936,79 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   @override
   Future<String> sendPhoneOtp({required String phone}) {
     return _requestPhoneOtp(phone: phone);
+  }
+
+  @override
+  bool isOwnerPhoneLoginEnabled(String phone) =>
+      hasActiveOwnerSession &&
+      auth.currentUser?.phoneNumber == normalizePhone(phone);
+
+  @override
+  Future<void> linkOwnerPhoneLogin({
+    required String phone,
+    required String verificationId,
+    required String smsCode,
+  }) async {
+    final user = auth.currentUser;
+    final normalizedPhone = normalizePhone(phone);
+    if (user == null || !hasActiveOwnerSession) {
+      throw StateError('Sign in as the salon owner first.');
+    }
+    if (ownerSalonOrNull?.phone != normalizedPhone) {
+      throw StateError('Save this phone number in your salon profile first.');
+    }
+    PhoneAuthCredential credential;
+    if (verificationId.isEmpty) {
+      final saved = _autoVerifiedPhoneCredentials[normalizedPhone];
+      if (saved == null ||
+          _autoVerifiedPhoneGenerations[normalizedPhone] !=
+              _phoneOtpGenerations[normalizedPhone]) {
+        throw StateError('Request a new phone OTP.');
+      }
+      credential = saved;
+    } else {
+      if (_currentPhoneVerificationIds[normalizedPhone] != verificationId ||
+          !RegExp(r'^\d{6}$').hasMatch(smsCode.trim())) {
+        throw StateError('Enter the latest 6-digit OTP sent to your phone.');
+      }
+      credential = PhoneAuthProvider.credential(
+        verificationId: verificationId,
+        smsCode: smsCode.trim(),
+      );
+    }
+    try {
+      if (user.phoneNumber == null) {
+        await user.linkWithCredential(credential);
+      } else {
+        await user.updatePhoneNumber(credential);
+      }
+    } on FirebaseAuthException catch (error) {
+      if (error.code != 'credential-already-in-use') rethrow;
+      // Keep the email owner signed in. Prove the phone on a secondary auth
+      // session; the server only links an unused identity, never another owner.
+      final secondary = await Firebase.initializeApp(
+        name: 'owner-phone-link-${DateTime.now().microsecondsSinceEpoch}',
+        options: Firebase.app().options,
+      );
+      final phoneAuth = FirebaseAuth.instanceFor(app: secondary);
+      try {
+        final result = await phoneAuth.signInWithCredential(credential);
+        final token = await result.user?.getIdToken(true);
+        if (token == null) throw StateError('Phone verification failed.');
+        await _callProtectedFunction(
+          () => functions.httpsCallable('linkOwnerPhoneLogin').call<void>({
+            'phoneIdToken': token,
+          }),
+        );
+      } finally {
+        await phoneAuth.signOut();
+        await secondary.delete();
+      }
+    }
+    await user.reload();
+    await auth.currentUser?.getIdToken(true);
+    _invalidatePhoneOtp(normalizedPhone);
+    notifyListeners();
   }
 
   @override
@@ -5502,6 +6452,31 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   @override
+  Future<void> updateBookingExtraServices({
+    required String bookingId,
+    required String requestId,
+    required String action,
+    Map<String, int> expectedPrices = const {},
+  }) async {
+    await _callProtectedFunction(
+      () => functions.httpsCallable('updateBookingExtraServices').call({
+        'bookingId': bookingId,
+        'requestId': requestId,
+        'action': action,
+        'serviceIds': expectedPrices.keys.toList(),
+        'expectedPrices': expectedPrices,
+      }),
+    );
+    // Firestore streams also publish the result to the other participant.
+    // A refresh failure must not report an already committed charge as failed.
+    try {
+      await _loadServerBooking(bookingId).timeout(const Duration(seconds: 8));
+    } catch (error) {
+      _setSyncError(error);
+    }
+  }
+
+  @override
   Future<void> updateBookingStatus(
     String bookingId,
     BookingStatus status, {
@@ -5513,7 +6488,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       if (index == -1) {
         throw StateError('Booking not found.');
       }
-      if (_optimisticBookingUpdates.containsKey(bookingId)) {
+      if (isBookingStatusUpdatePending(bookingId)) {
         return;
       }
       final originalBooking = _bookings[index];
@@ -5565,14 +6540,21 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
           originalBooking.isInstant &&
           originalBooking.status == BookingStatus.pending &&
           status != BookingStatus.pending;
-      _optimisticBookingUpdates[bookingId] = optimisticBooking;
+      final queueOwnerDecision =
+          suppressOwnerAlert &&
+          (status == BookingStatus.confirmed ||
+              status == BookingStatus.rejected);
+      _bookingStatusRequests.add(bookingId);
+      _optimisticBookingUpdates[bookingId] =
+          OptimisticBooking(optimisticBooking);
       _bookings[index] = optimisticBooking;
       if (suppressOwnerAlert) {
         _suppressOwnerBookingAlertLocally(bookingId);
-        _stopOwnerBookingAlarm();
+        _stopOwnerBookingAlarm(bookingId: bookingId);
       }
       notifyListeners();
       _syncOwnerBookingAlarm();
+      var ownerDecisionPersisted = false;
       try {
         if (suppressOwnerAlert) {
           try {
@@ -5581,13 +6563,26 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
             _setSyncError(error);
           }
         }
+        if (queueOwnerDecision) {
+          try {
+            await _persistPendingOwnerBookingAction(bookingId, status.name);
+            ownerDecisionPersisted = true;
+          } catch (error) {
+            _setSyncError(error);
+          }
+        }
         await _runFirebaseSave(() async {
-          await functions.httpsCallable('updateBookingStatus').call<void>({
-            'bookingId': bookingId,
-            'status': status.name,
-            'cancellationReason': cancellationReason?.trim() ?? '',
-          });
+          await _callProtectedFunction(
+            () => functions.httpsCallable('updateBookingStatus').call<void>({
+              'bookingId': bookingId,
+              'status': status.name,
+              'cancellationReason': cancellationReason?.trim() ?? '',
+            }),
+          );
         });
+        if (ownerDecisionPersisted) {
+          await _clearPendingOwnerBookingAction(bookingId);
+        }
         var serverBookingReloaded = false;
         try {
           await _loadServerBooking(bookingId);
@@ -5603,7 +6598,46 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         }
         notifyListeners();
         _syncOwnerBookingAlarm();
-      } catch (_) {
+      } catch (error) {
+        // The callable may have committed before its response was lost.
+        // Reconcile with the server before rolling back Start/Complete.
+        try {
+          final saved = await _loadServerBooking(
+            bookingId,
+          ).timeout(const Duration(seconds: 8));
+          if (saved.status == status) {
+            _optimisticBookingUpdates.remove(bookingId);
+            if (ownerDecisionPersisted) {
+              await _clearPendingOwnerBookingAction(bookingId);
+            }
+            _syncOwnerBookingAlarm();
+            return;
+          }
+        } catch (_) {
+          // Preserve the original failure and the durable decision below.
+        }
+        final keepQueuedOwnerDecision =
+            queueOwnerDecision &&
+            ownerDecisionPersisted &&
+            (error is! FirebaseFunctionsException ||
+                isRetryableOwnerDecisionErrorCode(error.code));
+        if (keepQueuedOwnerDecision) {
+          // The owner has already acted on this phone. Keep the optimistic
+          // decision and booking-specific alert suppression while the cloud
+          // request is retried on the next foreground resume. Repeated pushes
+          // for this booking are therefore received but remain silent.
+          _setSyncError(error);
+          notifyListeners();
+          unawaited(_retryPendingOwnerBookingActions());
+          return;
+        }
+        if (ownerDecisionPersisted) {
+          try {
+            await _clearPendingOwnerBookingAction(bookingId);
+          } catch (cleanupError) {
+            _setSyncError(cleanupError);
+          }
+        }
         _optimisticBookingUpdates.remove(bookingId);
         final currentIndex = _bookings.indexWhere(
           (item) => item.id == bookingId,
@@ -5613,17 +6647,12 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         } else if (_bookings[currentIndex].status == status) {
           _bookings[currentIndex] = originalBooking;
         }
-        if (suppressOwnerAlert) {
-          _suppressedOwnerBookingAlerts.remove(bookingId);
-          try {
-            await _clearOwnerAlertSuppression(bookingId);
-          } catch (error) {
-            _setSyncError(error);
-          }
-        }
         notifyListeners();
         _syncOwnerBookingAlarm();
         rethrow;
+      } finally {
+        _bookingStatusRequests.remove(bookingId);
+        notifyListeners();
       }
       return;
     }
@@ -6062,20 +7091,33 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       if (closingMinutes <= openingMinutes) {
         throw ArgumentError('Closing time must be after opening time.');
       }
-      await _claimOwnerProfilePhone(normalizedPhone);
+      final currentSalon = ownerSalon;
+      await _callOwnerMutation('saveOwnerSalonProfile', {
+        'salonId': ownerSalonId,
+        'name': name.trim(),
+        'ownerName': ownerName.trim(),
+        'address': address.trim(),
+        'directionsUrl': directionsUrl?.trim() ?? '',
+        'phone': normalizedPhone,
+        'email': normalizedEmail,
+        'logoUrl': logoUrl?.trim() ?? currentSalon.logoUrl,
+        'photoUrls': photoUrls ?? currentSalon.photoUrls,
+        'openTime': formatSalonClockTime(openTime),
+        'closeTime': formatSalonClockTime(closeTime),
+        'services': currentSalon.services.map(_serviceToMap).toList(),
+      });
       await super.updateOwnerSalon(
         name: name,
         ownerName: ownerName,
         address: address,
         directionsUrl: directionsUrl,
         phone: phone,
-        email: email,
+        email: normalizedEmail,
         logoUrl: logoUrl,
         photoUrls: photoUrls,
         openTime: openTime,
         closeTime: closeTime,
       );
-      await _setSalon(ownerSalon);
     });
   }
 
@@ -6197,10 +7239,25 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
   @override
   Future<void> setOwnerInstantBookingEnabled(bool enabled) async {
-    await _runFirebaseSave(() async {
+    if (_isInstantBookingSaving) {
+      return;
+    }
+    final previous = ownerSalon;
+    _lastSyncError = null;
+    _setInstantBookingSaving(true);
+    try {
       await super.setOwnerInstantBookingEnabled(enabled);
-      await _setSalon(ownerSalon);
-    });
+      await _callOwnerMutation('setOwnerInstantBookingEnabled', {
+        'salonId': ownerSalonId,
+        'enabled': enabled,
+      });
+    } catch (error) {
+      _replaceSalon(previous);
+      _setSyncError(error);
+      rethrow;
+    } finally {
+      _setInstantBookingSaving(false);
+    }
   }
 
   @override
@@ -6247,7 +7304,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
         openTime: ownerSalon.openTime,
         closeTime: ownerSalon.closeTime,
       );
-      await _setSalon(ownerSalon);
+      await _saveOwnerSalonProfileToCloud(ownerSalon);
     });
     return ownerSalon.photoUrls.last;
   }
@@ -6257,7 +7314,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     final trimmed = photoUrl.trim();
     await _runFirebaseSave(() async {
       await super.removeOwnerSalonPhoto(trimmed);
-      await _setSalon(ownerSalon);
+      await _saveOwnerSalonProfileToCloud(ownerSalon);
       try {
         await storage.refFromURL(trimmed).delete();
       } on FirebaseException catch (error) {
@@ -6284,17 +7341,24 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     }
     final template = serviceTemplateForName(name)!;
     final shouldPersist = ownerSalonOrNull != null;
+    final previous = ownerSalon;
     await _runFirebaseSave(() async {
-      await super.addOwnerService(
-        name: template.name,
-        category: template.category,
-        price: price,
-        durationMinutes: durationMinutes,
-        isAvailable: isAvailable,
-        instantBookingEnabled: instantBookingEnabled,
-      );
-      if (shouldPersist) {
-        await _setSalon(ownerSalon);
+      try {
+        await super.addOwnerService(
+          name: template.name,
+          category: template.category,
+          price: price,
+          durationMinutes: durationMinutes,
+          isAvailable: isAvailable,
+          instantBookingEnabled: instantBookingEnabled,
+        );
+        if (shouldPersist) {
+          await _saveOwnerSalonServices();
+        }
+      } catch (_) {
+        _replaceSalon(previous);
+        notifyListeners();
+        rethrow;
       }
     });
   }
@@ -6319,18 +7383,25 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       throw StateError('This service is not in the standard service menu.');
     }
     final shouldPersist = ownerSalonOrNull != null;
+    final previous = ownerSalon;
     await _runFirebaseSave(() async {
-      await super.updateOwnerService(
-        serviceId: serviceId,
-        name: template.name,
-        category: template.category,
-        price: price,
-        durationMinutes: durationMinutes,
-        isAvailable: isAvailable,
-        instantBookingEnabled: instantBookingEnabled,
-      );
-      if (shouldPersist) {
-        await _setSalon(ownerSalon);
+      try {
+        await super.updateOwnerService(
+          serviceId: serviceId,
+          name: template.name,
+          category: template.category,
+          price: price,
+          durationMinutes: durationMinutes,
+          isAvailable: isAvailable,
+          instantBookingEnabled: instantBookingEnabled,
+        );
+        if (shouldPersist) {
+          await _saveOwnerSalonServices();
+        }
+      } catch (_) {
+        _replaceSalon(previous);
+        notifyListeners();
+        rethrow;
       }
     });
   }
@@ -6340,14 +7411,21 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     Iterable<String>? serviceNames,
   }) async {
     final shouldPersist = ownerSalonOrNull != null;
+    final previous = ownerSalon;
     return _runFirebaseSave(() async {
-      final added = await super.addOwnerServicesFromCatalog(
-        serviceNames: serviceCatalog.map((service) => service.name),
-      );
-      if (added > 0 && shouldPersist) {
-        await _setSalon(ownerSalon);
+      try {
+        final added = await super.addOwnerServicesFromCatalog(
+          serviceNames: serviceCatalog.map((service) => service.name),
+        );
+        if (added > 0 && shouldPersist) {
+          await _saveOwnerSalonServices();
+        }
+        return added;
+      } catch (_) {
+        _replaceSalon(previous);
+        notifyListeners();
+        rethrow;
       }
-      return added;
     });
   }
 
@@ -6367,19 +7445,25 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     required String resumeSummary,
     required List<String> serviceIds,
   }) async {
-    final before = _barbers.length;
+    final barber = _newOwnerBarber(
+      name: name,
+      phone: phone,
+      speciality: speciality,
+      experienceYears: experienceYears,
+      resumeSummary: resumeSummary,
+      serviceIds: serviceIds,
+    );
     await _runFirebaseSave(() async {
-      await super.addOwnerBarber(
-        name: name,
-        phone: phone,
-        speciality: speciality,
-        experienceYears: experienceYears,
-        resumeSummary: resumeSummary,
-        serviceIds: serviceIds,
-      );
-      if (_barbers.length > before) {
-        await _setBarber(_barbers.last);
+      // Capture the new record independently of the live Firestore list.
+      // A snapshot arriving during an await must not skip or redirect this save.
+      await _saveOwnerBarber(barber);
+      final index = _barbers.indexWhere((item) => item.id == barber.id);
+      if (index == -1) {
+        _barbers.add(barber);
+      } else {
+        _barbers[index] = barber;
       }
+      notifyListeners();
     });
   }
 
@@ -6393,19 +7477,30 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     required String resumeSummary,
     required List<String> serviceIds,
   }) async {
+    final previous = List<Barber>.of(_barbers);
     await _runFirebaseSave(() async {
-      await super.updateOwnerBarber(
-        barberId: barberId,
-        name: name,
-        phone: phone,
-        speciality: speciality,
-        experienceYears: experienceYears,
-        resumeSummary: resumeSummary,
-        serviceIds: serviceIds,
-      );
-      final barber = _barbers.where((item) => item.id == barberId).firstOrNull;
-      if (barber != null) {
-        await _setBarber(barber);
+      try {
+        await super.updateOwnerBarber(
+          barberId: barberId,
+          name: name,
+          phone: phone,
+          speciality: speciality,
+          experienceYears: experienceYears,
+          resumeSummary: resumeSummary,
+          serviceIds: serviceIds,
+        );
+        final barber = _barbers
+            .where((item) => item.id == barberId)
+            .firstOrNull;
+        if (barber != null) {
+          await _saveOwnerBarber(barber);
+        }
+      } catch (_) {
+        _barbers
+          ..clear()
+          ..addAll(previous);
+        notifyListeners();
+        rethrow;
       }
     });
   }
@@ -6489,24 +7584,52 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
 
   @override
   Future<void> removeBarber(String barberId) async {
+    final previous = List<Barber>.of(_barbers);
     await _runFirebaseSave(() async {
-      await super.removeBarber(barberId);
-      final barber = _barbers.where((item) => item.id == barberId).firstOrNull;
-      if (barber != null) {
-        await _setBarber(barber);
+      try {
+        await super.removeBarber(barberId);
+        final barber = _barbers
+            .where((item) => item.id == barberId)
+            .firstOrNull;
+        if (barber != null) {
+          await _saveOwnerBarber(barber);
+        }
+      } catch (_) {
+        _barbers
+          ..clear()
+          ..addAll(previous);
+        notifyListeners();
+        rethrow;
       }
     });
   }
 
   void _connectFirestore() {
     _subscriptions.add(
-      firestore.collection('salons').snapshots().listen((snapshot) {
-        _salons
-          ..clear()
-          ..addAll(snapshot.docs.map(_salonFromFirestore));
-        _ownerProfileCompleted = ownerSalonOrNull != null;
-        notifyListeners();
-      }),
+      firestore.collection('salons').snapshots().listen(
+        (snapshot) {
+          // Parse before clearing, and keep one bad document from taking the
+          // rest with it. This list reads the whole collection, so a single
+          // malformed salon used to empty it for everyone — and an owner with
+          // no salon in the list is sent to the registration screen, which
+          // replaces the dashboard and cannot be dismissed.
+          final parsed = parseDocuments(
+            snapshot.docs,
+            _salonFromFirestore,
+            onSkipped: _setSyncError,
+          );
+          _salons
+            ..clear()
+            ..addAll(parsed);
+          _ownerProfileCompleted = ownerSalonOrNull != null;
+          _salonsLoaded = true;
+          notifyListeners();
+        },
+        onError: (Object error) {
+          // Leave the last good list in place rather than stranding the owner.
+          _setSyncError(error);
+        },
+      ),
     );
     _subscriptions.add(
       firestore.collection('appConfig').doc('public').snapshots().listen((
@@ -6520,12 +7643,22 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       }),
     );
     _subscriptions.add(
-      firestore.collection('barbers').snapshots().listen((snapshot) {
-        _barbers
-          ..clear()
-          ..addAll(snapshot.docs.map(_barberFromFirestore));
-        notifyListeners();
-      }),
+      firestore.collection('barbers').snapshots().listen(
+        (snapshot) {
+          final parsed = parseDocuments(
+            snapshot.docs,
+            _barberFromFirestore,
+            onSkipped: _setSyncError,
+          );
+          _barbers
+            ..clear()
+            ..addAll(parsed);
+          notifyListeners();
+        },
+        onError: (Object error) {
+          _setSyncError(error);
+        },
+      ),
     );
     _subscriptions.add(
       firestore
@@ -6542,9 +7675,6 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     _subscriptions.add(
       auth.authStateChanges().listen((user) {
         _connectPrivateFirestore(user);
-        if (user != null) {
-          unawaited(_saveMessagingToken(user.uid));
-        }
       }),
     );
   }
@@ -6683,11 +7813,13 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   void _handleRemoteNotificationOpened(RemoteMessage message) {
+    final bookingId = message.data['bookingId']?.toString().trim() ?? '';
+    _applyRemoteCustomerBookingHint(message.data);
+    if (message.data['status']?.toString() == BookingStatus.completed.name) {
+      queueCompletionReceipt(bookingId);
+    }
     final destination = _notificationDestination(message.data['destination']);
-    queueNotificationNavigation(
-      destination,
-      bookingId: message.data['bookingId']?.toString().trim() ?? '',
-    );
+    queueNotificationNavigation(destination, bookingId: bookingId);
   }
 
   void _handleLocalNotificationResponse(NotificationResponse response) {
@@ -6699,31 +7831,72 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   ) async {
     final payload = _decodeNotificationPayload(response.payload);
     final bookingId = payload['bookingId']?.toString().trim() ?? '';
+    _applyRemoteCustomerBookingHint(payload);
+    if (payload['status']?.toString() == BookingStatus.completed.name) {
+      queueCompletionReceipt(bookingId);
+    }
     final destination = _notificationDestination(payload['destination']);
     final actionId = response.actionId?.trim() ?? '';
     final isBookingDecision =
         actionId == _acceptInstantBookingNotificationAction ||
         actionId == _rejectInstantBookingNotificationAction;
-    if (isBookingDecision &&
-        bookingId.isNotEmpty &&
-        payload['isInstant']?.toString() == 'true') {
-      silenceOwnerBookingAlert(bookingId);
-    }
     queueNotificationNavigation(destination, bookingId: bookingId);
     if (!isBookingDecision || bookingId.isEmpty) {
       return;
     }
-
-    _stopOwnerBookingAlarm();
+    if (!_notificationDecisionsInFlight.add(bookingId)) return;
+    _suppressOwnerBookingAlertLocally(bookingId);
+    _stopOwnerBookingAlarm(bookingId: bookingId);
+    final nextStatus = actionId == _acceptInstantBookingNotificationAction
+        ? BookingStatus.confirmed.name
+        : BookingStatus.rejected.name;
     try {
-      await updateBookingStatus(
-        bookingId,
-        actionId == _acceptInstantBookingNotificationAction
-            ? BookingStatus.confirmed
-            : BookingStatus.rejected,
+      await performOwnerBookingDecision(
+        bookingId: bookingId,
+        status: nextStatus,
+        cancel: () => _cancelOwnerBookingNotifications(
+          _localNotifications,
+          bookingId: bookingId,
+        ),
+        submit: () async {
+          // The launch payload identifies the request. Do not require its
+          // Firestore snapshot to have reached the freshly opened app yet.
+          final user =
+              auth.currentUser ??
+              await auth
+                  .authStateChanges()
+                  .firstWhere((user) => user != null)
+                  .timeout(const Duration(seconds: 10));
+          if (user == null) {
+            throw StateError('Sign in to respond to this booking.');
+          }
+          await _callProtectedFunction(
+            () => functions.httpsCallable('updateBookingStatus').call<void>({
+              'bookingId': bookingId,
+              'status': nextStatus,
+              'cancellationReason': '',
+              'actionSource': 'notification_action_foreground',
+            }),
+          );
+        },
       );
+      await _clearOwnerDecisionFeedback(bookingId);
+      try {
+        await _loadServerBooking(bookingId);
+      } catch (error) {
+        // The decision is already saved; the booking stream can reconcile.
+        _setSyncError(error);
+      }
     } catch (error) {
       _setSyncError(error);
+      await _showOwnerDecisionFailure(
+        bookingId,
+        error,
+        initializedNotifications: _localNotifications,
+      );
+    } finally {
+      _notificationDecisionsInFlight.remove(bookingId);
+      unawaited(_retryPendingOwnerBookingActions());
       _syncOwnerBookingAlarm();
     }
   }
@@ -6741,13 +7914,51 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   Future<void> _showForegroundPushNotification(RemoteMessage message) async {
-    if (message.data['action'] == 'stop_owner_booking_alarm') {
-      _stopOwnerBookingAlarm();
+    final bookingId = message.data['bookingId']?.toString().trim() ?? '';
+    if (_isOwnerBookingResolution(message.data) && bookingId.isNotEmpty) {
+      _suppressOwnerBookingAlertLocally(bookingId);
+      await _persistOwnerAlertSuppression(bookingId);
+      await _clearPendingOwnerBookingAction(bookingId);
       await _initializeLocalNotifications();
-      await _localNotifications.cancel(
-        id: _ownerBookingAlarmNotificationId,
-        tag: _ownerBookingAlarmNotificationTag,
+      await _cancelOwnerBookingNotifications(
+        _localNotifications,
+        bookingId: bookingId,
       );
+      await _clearOwnerDecisionFeedback(bookingId);
+      _syncOwnerBookingAlarm();
+      if (message.data['action'] == 'stop_owner_booking_alarm') return;
+    }
+    final status = message.data['status']?.toString() ?? '';
+    final isForegroundCustomerPopupUpdate =
+        _activeRole == UserRole.customer &&
+        _customerAccount != null &&
+        message.data['event']?.toString() != 'created' &&
+        <String>{
+          BookingStatus.confirmed.name,
+          BookingStatus.rejected.name,
+          BookingStatus.cancelled.name,
+          BookingStatus.completed.name,
+        }.contains(status);
+    if (isForegroundCustomerPopupUpdate) {
+      _applyRemoteCustomerBookingHint(message.data);
+      final bookingId = message.data['bookingId']?.toString().trim() ?? '';
+      if (status == BookingStatus.completed.name) {
+        queueCompletionReceipt(bookingId);
+      }
+      if (bookingId.isNotEmpty) {
+        unawaited(
+          (() async {
+            try {
+              await _loadServerBooking(bookingId);
+            } catch (error) {
+              // The pushed completion is already authoritative. Keep the fast
+              // local receipt and let the booking stream reconcile if this
+              // single-document refresh is temporarily unavailable.
+              _setSyncError(error);
+            }
+          })(),
+        );
+      }
       return;
     }
     final notification = message.notification;
@@ -6757,116 +7968,186 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     if ((title == null || title.isEmpty) && (body == null || body.isEmpty)) {
       return;
     }
-    final isOwnerBookingRequest =
-        message.data['channel'] == _ownerBookingRequestChannel.id;
+    final isOwnerBookingRequest = _isOwnerBookingRequestChannel(
+      message.data['channel'],
+    );
     if (isOwnerBookingRequest &&
         (_activeRole != UserRole.owner || _ownerAccount == null)) {
       return;
     }
-    final bookingId = message.data['bookingId']?.toString().trim() ?? '';
-    if (isOwnerBookingRequest &&
-        bookingId.isNotEmpty &&
-        (_isOwnerBookingAlertSuppressedLocally(bookingId) ||
-            (await _activeSuppressedOwnerAlerts()).contains(bookingId))) {
-      _stopOwnerBookingAlarm();
-      _syncOwnerBookingAlarm();
+    await _initializeLocalNotifications();
+    if (isOwnerBookingRequest) {
+      final deadline = _ownerAlertMessageDeadline(message);
+      if (bookingId.isEmpty || deadline == null) return;
+      await _showUnansweredOwnerBookingAlert(
+        notifications: _localNotifications,
+        bookingId: bookingId,
+        deadline: deadline,
+        title: title ?? 'Instant booking request',
+        body: body ?? 'A customer is waiting for accept or reject.',
+        data: message.data,
+        isStillPending: () {
+          final booking = _bookings
+              .where((item) => item.id == bookingId)
+              .firstOrNull;
+          return _activeRole == UserRole.owner &&
+              !_isOwnerBookingAlertSuppressedLocally(bookingId) &&
+              (booking == null || _ownerBookingCanRing(booking));
+        },
+      );
       return;
     }
-    await _initializeLocalNotifications();
     await _localNotifications.show(
-      id: isOwnerBookingRequest
-          ? _ownerBookingAlarmNotificationId
-          : DateTime.now().millisecondsSinceEpoch.remainder(1000000),
+      id: DateTime.now().millisecondsSinceEpoch.remainder(1000000),
       title: title ?? 'Pritze',
       body: body ?? '',
       notificationDetails: NotificationDetails(
         android: AndroidNotificationDetails(
-          isOwnerBookingRequest
-              ? _ownerBookingRequestChannel.id
-              : _pushNotificationChannel.id,
-          isOwnerBookingRequest
-              ? _ownerBookingRequestChannel.name
-              : _pushNotificationChannel.name,
-          channelDescription: isOwnerBookingRequest
-              ? _ownerBookingRequestChannel.description
-              : _pushNotificationChannel.description,
-          importance: isOwnerBookingRequest ? Importance.max : Importance.high,
-          priority: isOwnerBookingRequest ? Priority.max : Priority.high,
+          _pushNotificationChannel.id,
+          _pushNotificationChannel.name,
+          channelDescription: _pushNotificationChannel.description,
+          importance: Importance.high,
+          priority: Priority.high,
           icon: '@mipmap/ic_launcher',
-          category: isOwnerBookingRequest
-              ? AndroidNotificationCategory.alarm
-              : null,
-          ongoing: isOwnerBookingRequest,
-          autoCancel: !isOwnerBookingRequest,
-          enableVibration: isOwnerBookingRequest,
-          visibility: isOwnerBookingRequest
-              ? NotificationVisibility.public
-              : null,
-          tag: isOwnerBookingRequest ? _ownerBookingAlarmNotificationTag : null,
-          sound: isOwnerBookingRequest
-              ? const RawResourceAndroidNotificationSound(
-                  'owner_booking_request',
-                )
-              : null,
-          additionalFlags: isOwnerBookingRequest
-              ? Int32List.fromList([_androidInsistentNotificationFlag])
-              : null,
-          actions: isOwnerBookingRequest
-              ? _ownerInstantBookingNotificationActions
-              : null,
         ),
-        iOS: DarwinNotificationDetails(
-          sound: isOwnerBookingRequest ? 'owner_booking_request.wav' : null,
-          categoryIdentifier: isOwnerBookingRequest
-              ? _ownerBookingRequestDarwinCategory
-              : null,
-          interruptionLevel: isOwnerBookingRequest
-              ? InterruptionLevel.active
-              : null,
-        ),
-        macOS: DarwinNotificationDetails(
-          sound: isOwnerBookingRequest ? 'owner_booking_request.wav' : null,
-          categoryIdentifier: isOwnerBookingRequest
-              ? _ownerBookingRequestDarwinCategory
-              : null,
-        ),
+        iOS: const DarwinNotificationDetails(),
+        macOS: const DarwinNotificationDetails(),
       ),
       payload: _notificationPayload(message.data),
     );
   }
 
+  void _applyRemoteCustomerBookingHint(Map<String, dynamic> data) {
+    if (_activeRole != UserRole.customer || _customerAccount == null) return;
+    final bookingId = data['bookingId']?.toString().trim() ?? '';
+    final index = _bookings.indexWhere((booking) => booking.id == bookingId);
+    if (index == -1) return;
+    final current = _bookings[index];
+    if (current.customerUid != null &&
+        current.customerUid != _customerAccount!.id) {
+      return;
+    }
+    final status = data['status']?.toString() ?? '';
+    if (status == BookingStatus.completed.name) {
+      _applyRemoteCompletionHint(data);
+      return;
+    }
+    final occurredAtMillis = _int(
+      data['statusOccurredAtMillis'],
+      switch (status) {
+        'confirmed' => _int(
+          data['acceptedAtMillis'],
+          current.acceptedAt?.millisecondsSinceEpoch ?? 0,
+        ),
+        'rejected' => _int(
+          data['rejectedAtMillis'],
+          current.rejectedAt?.millisecondsSinceEpoch ?? 0,
+        ),
+        'cancelled' => _int(
+          data['cancelledAtMillis'],
+          current.cancelledAt?.millisecondsSinceEpoch ?? 0,
+        ),
+        _ => 0,
+      },
+    );
+    final occurredAt = occurredAtMillis > 0
+        ? DateTime.fromMillisecondsSinceEpoch(occurredAtMillis)
+        : DateTime.now();
+    if (status == BookingStatus.confirmed.name && current.isInstant) {
+      final startMillis = _int(data['startMillis'], 0);
+      _bookings[index] = current.copyWith(
+        status: BookingStatus.confirmed,
+        acceptedAt: occurredAt,
+        start: startMillis > 0
+            ? DateTime.fromMillisecondsSinceEpoch(startMillis)
+            : occurredAt.add(
+                Duration(minutes: _int(data['arrivalMinutes'], 15)),
+              ),
+      );
+      notifyListeners();
+      return;
+    }
+    if (status == BookingStatus.rejected.name) {
+      _bookings[index] = current.copyWith(
+        status: BookingStatus.rejected,
+        rejectedAt: occurredAt,
+        cancelledBy: data['cancelledBy']?.toString() ?? 'owner',
+        cancellationReason:
+            data['cancellationReason']?.toString() ?? 'Rejected by salon',
+      );
+      notifyListeners();
+      return;
+    }
+    if (status == BookingStatus.cancelled.name) {
+      _bookings[index] = current.copyWith(
+        status: BookingStatus.cancelled,
+        cancelledAt: occurredAt,
+        cancelledBy: data['cancelledBy']?.toString() ?? '',
+        cancellationReason: data['cancellationReason']?.toString() ?? '',
+      );
+      notifyListeners();
+    }
+  }
+
+  void _applyRemoteCompletionHint(Map<String, dynamic> data) {
+    if (_activeRole != UserRole.customer || _customerAccount == null) return;
+    final bookingId = data['bookingId']?.toString().trim() ?? '';
+    final index = _bookings.indexWhere((booking) => booking.id == bookingId);
+    if (index == -1) return;
+    final current = _bookings[index];
+    if (current.customerUid != null &&
+        current.customerUid != _customerAccount!.id) {
+      return;
+    }
+    if (current.status == BookingStatus.cancelled ||
+        current.status == BookingStatus.rejected) {
+      return;
+    }
+    final completedAtMillis = _int(
+      data['completedAtMillis'],
+      _int(data['statusOccurredAtMillis'], 0),
+    );
+    final completedAt = completedAtMillis > 0
+        ? DateTime.fromMillisecondsSinceEpoch(completedAtMillis)
+        : DateTime.now();
+    final payableAmount = _int(
+      data['customerPayableAmount'],
+      current.customerPayableAmount,
+    );
+    _bookings[index] = current.copyWith(
+      status: BookingStatus.completed,
+      completedAt: completedAt,
+      customerPayableAmount: payableAmount,
+      discountStatus: current.hasDiscount ? 'redeemed' : 'none',
+      proinStatus: current.hasProin ? 'redeemed' : 'none',
+      proinRedeemedAmount: current.proinAppliedAmount,
+      arrivalSharingActive: false,
+    );
+    notifyListeners();
+  }
+
+  bool _ownerBookingCanRing(Booking booking) =>
+      booking.isInstant &&
+      booking.status == BookingStatus.pending &&
+      DateTime.now().isBefore(
+        booking.createdAt.add(instantBookingResponseTimeout),
+      ) &&
+      !_isOwnerBookingAlertSuppressedLocally(booking.id);
+
   void _syncOwnerBookingAlarm() {
-    final shouldRing =
-        _activeRole == UserRole.owner &&
-        _ownerAccount != null &&
-        bookingsForSalon(ownerSalonId).any(
-          (booking) =>
-              booking.isInstant &&
-              booking.status == BookingStatus.pending &&
-              !_isOwnerBookingAlertSuppressedLocally(booking.id),
-        );
-    if (!shouldRing) {
-      _stopOwnerBookingAlarm();
+    if (_activeRole != UserRole.owner || _ownerAccount == null) {
+      _stopOwnerBookingAlarm(cancelNotifications: !isRestoringSession);
       return;
     }
-    if (_ownerBookingAlarmTimer != null) {
+    if (!bookingsForSalon(ownerSalonId).any(_ownerBookingCanRing)) {
+      // The cache may not contain a newly pushed request yet. Its own
+      // deadline or an authoritative resolution cancels its notification.
+      _stopOwnerBookingAlarm(cancelNotifications: false);
       return;
     }
+    if (_ownerBookingAlarmTimer != null) return;
     unawaited(_showOwnerBookingRequestAlarm());
     _ownerBookingAlarmTimer = Timer.periodic(_ownerBookingAlarmInterval, (_) {
-      final stillPending =
-          _activeRole == UserRole.owner &&
-          _ownerAccount != null &&
-          bookingsForSalon(ownerSalonId).any(
-            (booking) =>
-                booking.isInstant &&
-                booking.status == BookingStatus.pending &&
-                !_isOwnerBookingAlertSuppressedLocally(booking.id),
-          );
-      if (!stillPending) {
-        _stopOwnerBookingAlarm();
-        return;
-      }
       unawaited(_showOwnerBookingRequestAlarm());
     });
   }
@@ -6884,7 +8165,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       return;
     }
     _suppressOwnerBookingAlertLocally(normalizedId);
-    _stopOwnerBookingAlarm();
+    _stopOwnerBookingAlarm(bookingId: normalizedId);
     unawaited(
       _persistOwnerAlertSuppression(normalizedId).catchError((Object error) {
         _setSyncError(error);
@@ -6904,76 +8185,80 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     return false;
   }
 
-  void _stopOwnerBookingAlarm() {
+  void _stopOwnerBookingAlarm({
+    String? bookingId,
+    bool cancelNotifications = true,
+  }) {
+    _ownerBookingAlarmGeneration++;
     _ownerBookingAlarmTimer?.cancel();
     _ownerBookingAlarmTimer = null;
+    if (!cancelNotifications) return;
     unawaited(
-      _localNotifications.cancel(
-        id: _ownerBookingAlarmNotificationId,
-        tag: _ownerBookingAlarmNotificationTag,
+      _cancelOwnerBookingNotifications(
+        _localNotifications,
+        bookingId: bookingId,
       ),
     );
   }
 
   Future<void> _showOwnerBookingRequestAlarm() async {
-    final pending =
-        bookingsForSalon(ownerSalonId)
-            .where(
-              (booking) =>
-                  booking.isInstant &&
-                  booking.status == BookingStatus.pending &&
-                  !_isOwnerBookingAlertSuppressedLocally(booking.id),
-            )
-            .toList()
-          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
-    if (pending.isEmpty) {
-      _stopOwnerBookingAlarm();
-      return;
+    if (_ownerBookingAlarmRefreshRunning) return;
+    _ownerBookingAlarmRefreshRunning = true;
+    final generation = _ownerBookingAlarmGeneration;
+    try {
+      if (_activeRole != UserRole.owner || _ownerAccount == null) {
+        _stopOwnerBookingAlarm();
+        return;
+      }
+      final pending =
+          bookingsForSalon(ownerSalonId).where(_ownerBookingCanRing).toList()
+            ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      for (final booking in pending) {
+        // A notification-panel decision is made in another isolate. Always
+        // consult the durable stop, even while our Firestore cache is pending.
+        if (await OwnerBookingAlertState().isStopped(booking.id)) {
+          _suppressOwnerBookingAlertLocally(booking.id);
+          await _cancelOwnerBookingNotifications(
+            _localNotifications,
+            bookingId: booking.id,
+          );
+          continue;
+        }
+        await _initializeLocalNotifications();
+        final shown = await _showUnansweredOwnerBookingAlert(
+          notifications: _localNotifications,
+          bookingId: booking.id,
+          deadline: booking.createdAt.add(instantBookingResponseTimeout),
+          title: 'Instant booking request',
+          body: '${booking.customerName} is waiting for accept or reject.',
+          data: {
+            'destination': 'bookings',
+            'bookingId': booking.id,
+            'isInstant': 'true',
+            'createdAtMillis': booking.createdAt.millisecondsSinceEpoch,
+            'responseDeadlineMillis': booking.createdAt
+                .add(instantBookingResponseTimeout)
+                .millisecondsSinceEpoch,
+          },
+          isStillPending: () =>
+              generation == _ownerBookingAlarmGeneration &&
+              _activeRole == UserRole.owner &&
+              _bookings.any(
+                (current) =>
+                    current.id == booking.id && _ownerBookingCanRing(current),
+              ),
+        );
+        if (generation != _ownerBookingAlarmGeneration) return;
+        if (shown) return;
+      }
+      if (generation == _ownerBookingAlarmGeneration) {
+        _stopOwnerBookingAlarm(cancelNotifications: false);
+      }
+    } catch (error) {
+      _setSyncError(error);
+    } finally {
+      _ownerBookingAlarmRefreshRunning = false;
     }
-    final booking = pending.first;
-    await _initializeLocalNotifications();
-    await _localNotifications.show(
-      id: _ownerBookingAlarmNotificationId,
-      title: booking.isInstant
-          ? 'Instant booking request'
-          : 'New booking request',
-      body: '${booking.customerName} is waiting for accept or reject.',
-      notificationDetails: NotificationDetails(
-        android: AndroidNotificationDetails(
-          _ownerBookingRequestChannel.id,
-          _ownerBookingRequestChannel.name,
-          channelDescription: _ownerBookingRequestChannel.description,
-          importance: Importance.max,
-          priority: Priority.max,
-          icon: '@mipmap/ic_launcher',
-          category: AndroidNotificationCategory.alarm,
-          ongoing: true,
-          autoCancel: false,
-          enableVibration: true,
-          visibility: NotificationVisibility.public,
-          tag: _ownerBookingAlarmNotificationTag,
-          sound: RawResourceAndroidNotificationSound('owner_booking_request'),
-          additionalFlags: Int32List.fromList([
-            _androidInsistentNotificationFlag,
-          ]),
-          actions: _ownerInstantBookingNotificationActions,
-        ),
-        iOS: const DarwinNotificationDetails(
-          sound: 'owner_booking_request.wav',
-          categoryIdentifier: _ownerBookingRequestDarwinCategory,
-          interruptionLevel: InterruptionLevel.active,
-        ),
-        macOS: const DarwinNotificationDetails(
-          sound: 'owner_booking_request.wav',
-          categoryIdentifier: _ownerBookingRequestDarwinCategory,
-        ),
-      ),
-      payload: _notificationPayload({
-        'destination': 'bookings',
-        'bookingId': booking.id,
-        'isInstant': 'true',
-      }),
-    );
   }
 
   Future<void> _saveMessagingToken(String uid, {String? token}) async {
@@ -6993,23 +8278,127 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       if (_suppressTokenRegistration || auth.currentUser?.uid != uid) {
         return;
       }
-      final isOwnerSession = _activeRole == UserRole.owner;
+      // Auth can emit before the locally cached role has been restored. Use
+      // the authoritative account role so that startup never removes a real
+      // owner's device from the urgent-booking token list.
+      final accountSnapshot = await firestore
+          .collection('users')
+          .doc(uid)
+          .get();
+      final accountData = accountSnapshot.data() ?? const <String, dynamic>{};
+      final authoritativeRole =
+          _roleFromName(accountData['role'] as String?) ??
+          _roleFromName(accountData['activeRole'] as String?) ??
+          _activeRole;
+      // A salon owner who signed up as a customer first still has
+      // `role: customer` on their profile, and `resolveLaunchRole` makes them
+      // an owner locally from the salon they registered. Trusting the stored
+      // role alone dropped those owners from the alert list and wrote
+      // `ownerNotificationsEnabled: false`, so their booking requests never
+      // rang and nothing in the app showed why.
+      final isOwnerSession =
+          authoritativeRole == UserRole.owner || _activeRole == UserRole.owner;
+      if (_suppressTokenRegistration || auth.currentUser?.uid != uid) {
+        return;
+      }
       await firestore.collection('users').doc(uid).set({
         'fcmTokens': FieldValue.arrayUnion([messagingToken]),
-        'ownerAlertV3Tokens': isOwnerSession
+        'ownerAlertV4Tokens': isOwnerSession
             ? FieldValue.arrayUnion([messagingToken])
             : FieldValue.arrayRemove([messagingToken]),
+        // This build rings on the v4 channel only. Leaving the previous
+        // generation's list keeps the server from sending two alerts for the
+        // same request.
+        'ownerAlertV3Tokens': FieldValue.arrayRemove([messagingToken]),
         'lastFcmToken': messagingToken,
         'notificationsEnabled': true,
         'ownerNotificationsEnabled': isOwnerSession,
+        // The server routes owner alerts on this field and only claimLoginRole
+        // ever wrote it, so an owner whose profile still said `customer` was
+        // refused for good. Promote it here; sign-out clears it again.
+        if (isOwnerSession) 'activeRole': UserRole.owner.name,
         'fcmUpdatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
+      _registeredMessagingToken = messagingToken;
       _messagingTokenRetryTimer?.cancel();
       _messagingTokenRetryTimer = null;
       _messagingTokenRetryAttempt = 0;
     } catch (error) {
       _scheduleMessagingTokenRetry(uid);
       _setSyncError(error);
+    }
+  }
+
+  Future<void> _retryPendingOwnerBookingActions() async {
+    if (_disposed ||
+        _retryingOwnerBookingDecisions ||
+        _activeRole != UserRole.owner ||
+        auth.currentUser == null) {
+      return;
+    }
+    _retryingOwnerBookingDecisions = true;
+    _ownerBookingDecisionRetryTimer?.cancel();
+    try {
+      final entries = await OwnerBookingDecisionStore().pending();
+      final now = DateTime.now().millisecondsSinceEpoch;
+      for (final entry in entries) {
+        final parts = entry.split('|');
+        if (parts.length != 3) continue;
+        final bookingId = parts[0].trim();
+        if (_notificationDecisionsInFlight.contains(bookingId)) continue;
+        final status = parts[1].trim();
+        final createdAt = int.tryParse(parts[2]) ?? 0;
+        if (bookingId.isEmpty ||
+            !<String>{
+              BookingStatus.confirmed.name,
+              BookingStatus.rejected.name,
+            }.contains(status) ||
+            now - createdAt > _ownerAlertSuppressionDuration.inMilliseconds) {
+          if (bookingId.isNotEmpty) {
+            await _clearPendingOwnerBookingAction(bookingId);
+          }
+          continue;
+        }
+        try {
+          await _callProtectedFunction(
+            () => functions.httpsCallable('updateBookingStatus').call<void>({
+              'bookingId': bookingId,
+              'status': status,
+              'cancellationReason': '',
+              'actionSource': 'notification_action_retry',
+            }),
+          );
+          await _clearPendingOwnerBookingAction(bookingId);
+          await _clearOwnerDecisionFeedback(bookingId);
+          await _loadServerBooking(bookingId);
+        } on FirebaseFunctionsException catch (error) {
+          if (<String>{
+            'failed-precondition',
+            'not-found',
+            'permission-denied',
+            'invalid-argument',
+          }.contains(error.code)) {
+            await _showOwnerDecisionFailure(
+              bookingId,
+              error,
+              initializedNotifications: _localNotifications,
+            );
+          }
+        } catch (_) {
+          // Keep transient failures queued for the next automatic retry.
+        }
+      }
+    } catch (error) {
+      _setSyncError(error);
+    } finally {
+      _retryingOwnerBookingDecisions = false;
+      if (!_disposed &&
+          _activeRole == UserRole.owner &&
+          (await OwnerBookingDecisionStore().pending()).isNotEmpty) {
+        _ownerBookingDecisionRetryTimer = Timer(const Duration(seconds: 5), () {
+          unawaited(_retryPendingOwnerBookingActions());
+        });
+      }
     }
   }
 
@@ -7061,28 +8450,29 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     _messagingTokenRetryTimer?.cancel();
     _messagingTokenRetryTimer = null;
     _messagingTokenRetryAttempt = 0;
-    try {
-      final token = await messaging.getToken();
-      await firestore.collection('users').doc(uid).set({
-        if (token != null && token.isNotEmpty)
-          'fcmTokens': FieldValue.arrayRemove([token]),
-        if (token != null && token.isNotEmpty)
-          'ownerAlertV3Tokens': FieldValue.arrayRemove([token]),
-        'lastFcmToken': FieldValue.delete(),
-        'notificationsEnabled': false,
-        'ownerNotificationsEnabled': false,
-        'activeRole': FieldValue.delete(),
-        'fcmUpdatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-    } catch (error) {
-      _setSyncError(error);
-    } finally {
-      try {
-        await messaging.deleteToken();
-      } catch (error) {
-        _setSyncError(error);
-      }
-    }
+    await performSignOutDeregistration(
+      fallbackToken: _registeredMessagingToken,
+      readToken: messaging.getToken,
+      write: (token) => firestore.collection('users').doc(uid).set(
+        signOutDeregistrationFields(
+          token: token,
+          arrayRemove: FieldValue.arrayRemove,
+          delete: FieldValue.delete(),
+          serverTimestamp: FieldValue.serverTimestamp(),
+        ),
+        SetOptions(merge: true),
+      ),
+      deleteToken: messaging.deleteToken,
+      onWriteError: _setSyncError,
+      onDegraded: (error) {
+        // Expected on an iPhone with no APNs token yet. The account flags
+        // written above are the stop that matters.
+        if (kDebugMode) {
+          debugPrint('Sign-out push cleanup degraded: $error');
+        }
+      },
+    );
+    _registeredMessagingToken = null;
   }
 
   Future<void> _sendBookingPush(
@@ -7114,7 +8504,14 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 
   void _connectPrivateFirestore(User? user) {
-    _accountRestoreGeneration += 1;
+    final startupIsRestoringThisUser =
+        _isRestoringSession &&
+        (_startupRestoreUid == null ||
+            user == null ||
+            user.uid == _startupRestoreUid);
+    if (!startupIsRestoringThisUser) {
+      _accountRestoreGeneration += 1;
+    }
     for (final subscription in _privateSubscriptions) {
       unawaited(subscription.cancel());
     }
@@ -7127,7 +8524,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     _customerProinWallet = const ProinWalletSummary();
     _salonProinWallets.clear();
     _customerProinActivity.clear();
-    _stopOwnerBookingAlarm();
+    _stopOwnerBookingAlarm(
+      cancelNotifications: user == null && !startupIsRestoringThisUser,
+    );
     notifyListeners();
 
     if (user == null) {
@@ -7145,7 +8544,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     }
 
     _suppressTokenRegistration = false;
-    if (_pendingFirebaseLoginRole == null) {
+    if (_pendingFirebaseLoginRole == null && !startupIsRestoringThisUser) {
       unawaited(_restoreAccountForUser(user));
     }
     _listenToBookings('customer', 'customerUid', user.uid);
@@ -7213,17 +8612,25 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
             for (final items in _bookingSnapshots.values) {
               merged.addAll(items);
             }
-            for (final entry in _optimisticBookingUpdates.entries.toList()) {
-              final serverBooking = merged[entry.key];
-              if (serverBooking?.status == entry.value.status) {
-                _optimisticBookingUpdates.remove(entry.key);
-              } else if (serverBooking != null) {
-                merged[entry.key] = entry.value;
+            if (key == 'owner') {
+              for (final booking in _bookingSnapshots[key]!.values) {
+                if (booking.isInstant &&
+                    booking.status != BookingStatus.pending &&
+                    DateTime.now().isBefore(
+                      booking.createdAt.add(_ownerAlertSuppressionDuration),
+                    ) &&
+                    !_isOwnerBookingAlertSuppressedLocally(booking.id)) {
+                  silenceOwnerBookingAlert(booking.id);
+                }
               }
             }
+            final reconciled = reconcileOptimisticBookings(
+              serverBookings: merged,
+              optimistic: _optimisticBookingUpdates,
+            );
             _bookings
               ..clear()
-              ..addAll(merged.values);
+              ..addAll(reconciled.values);
             _syncOwnerBookingAlarm();
             notifyListeners();
           }),
@@ -7233,12 +8640,13 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   Future<void> _restoreAccountForUser(User user) async {
     final restoreGeneration = ++_accountRestoreGeneration;
     try {
-      final doc = await firestore.collection('users').doc(user.uid).get();
-      final ownerSalons = await firestore
+      final accountFuture = firestore.collection('users').doc(user.uid).get();
+      final ownerSalonsFuture = firestore
           .collection('salons')
           .where('ownerUid', isEqualTo: user.uid)
           .limit(1)
           .get();
+      final (doc, ownerSalons) = await (accountFuture, ownerSalonsFuture).wait;
       final data = doc.data() ?? {};
       _referralOnboardingRequired =
           data['referralOnboardingCompleted'] == false;
@@ -7265,7 +8673,11 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
           (ownerSalons.docs.first.data()['phone'] as String?) ?? '',
         );
         if (RegExp(r'^\+[1-9]\d{7,14}$').hasMatch(salonPhone)) {
-          await _claimOwnerProfilePhone(salonPhone);
+          unawaited(
+            _claimOwnerProfilePhone(salonPhone).catchError((Object error) {
+              _setSyncError(error);
+            }),
+          );
         }
       }
       if (restoreGeneration != _accountRestoreGeneration ||
@@ -7275,12 +8687,12 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       _activateRole(role, account);
       if (role == UserRole.customer) {
         unawaited(_refreshCustomerProinWalletInBackground());
+      } else if (role == UserRole.owner) {
+        unawaited(_retryPendingOwnerBookingActions());
       }
-      await _saveMessagingToken(user.uid);
-      if (restoreGeneration != _accountRestoreGeneration ||
-          auth.currentUser?.uid != user.uid) {
-        return;
-      }
+      // APNs can take several seconds to issue a token on a cold iPhone boot.
+      // Token registration is not required to display the signed-in home.
+      unawaited(_saveMessagingToken(user.uid));
       _syncOwnerBookingAlarm();
     } on CustomerNameRequiredException {
       if (restoreGeneration == _accountRestoreGeneration &&
@@ -7355,6 +8767,34 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     }
   }
 
+  Future<Map<String, dynamic>> _callOwnerMutation(
+    String functionName,
+    Map<String, Object?> data,
+  ) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        final result = await _callProtectedFunction(
+          () => functions
+              .httpsCallable(functionName)
+              .call<Map<String, dynamic>>(data),
+        ).timeout(const Duration(seconds: 15));
+        return result.data;
+      } catch (error) {
+        lastError = error;
+        final retryable =
+            error is TimeoutException ||
+            (error is FirebaseFunctionsException &&
+                isRetryableCallableErrorCode(error.code));
+        if (!retryable || attempt > 0) {
+          rethrow;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+      }
+    }
+    throw lastError ?? StateError('The salon update could not be completed.');
+  }
+
   Future<void> _refreshCallableCredentials({bool force = false}) async {
     final now = DateTime.now();
     final last = _lastCallableCredentialRefreshAt;
@@ -7368,7 +8808,9 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     final user = auth.currentUser;
     if (user != null) {
       try {
-        await user.getIdToken(true);
+        // Use Firebase's cached valid token on the normal path. A forced
+        // network refresh is reserved for an actual unauthenticated retry.
+        await user.getIdToken(force);
       } catch (error) {
         _lastCallableCredentialRefreshAt = null;
         if (kDebugMode) {
@@ -7557,24 +8999,6 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _upsertUser(
-    UserAccount account, {
-    required UserRole role,
-  }) async {
-    final accountPhone = RegExp(r'^\+91\d{10}$').hasMatch(account.contact)
-        ? account.contact
-        : auth.currentUser?.phoneNumber;
-    await firestore.collection('users').doc(account.id).set({
-      'name': account.name,
-      'contact': account.contact,
-      'email': auth.currentUser?.email?.trim().toLowerCase(),
-      'phone': accountPhone,
-      'provider': account.provider.label.toLowerCase(),
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
-    await _saveMessagingToken(account.id);
-  }
-
   Future<UserAccount> _completeRoleClaim(
     UserAccount account, {
     required UserRole role,
@@ -7612,11 +9036,10 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     if (role == UserRole.customer) {
       unawaited(_refreshCustomerProinWalletInBackground());
     }
-    try {
-      await _upsertUser(resolvedAccount, role: role);
-    } catch (error) {
-      _setSyncError(error);
-    }
+    // claimLoginRole already writes the authoritative profile. Push token
+    // registration is independent and should not add several extra network
+    // round trips to the login button.
+    unawaited(_saveMessagingToken(resolvedAccount.id));
     return resolvedAccount;
   }
 
@@ -7670,17 +9093,46 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     _phoneResendTokens.remove(normalizedPhone);
   }
 
-  Future<void> _setSalon(Salon salon) {
-    final data = _salonToMap(salon);
-    final uid = auth.currentUser?.uid;
-    if (uid != null) {
-      data['ownerUid'] = uid;
-    }
-    return firestore.collection('salons').doc(salon.id).set(data);
+  Future<void> _saveOwnerSalonServices() async {
+    final salon = ownerSalon;
+    await _callOwnerMutation('saveOwnerSalonServices', {
+      'salonId': salon.id,
+      'services': salon.services.map(_serviceToMap).toList(),
+    });
+  }
+
+  Future<void> _saveOwnerSalonProfileToCloud(Salon salon) async {
+    await _callOwnerMutation('saveOwnerSalonProfile', {
+      'salonId': salon.id,
+      'name': salon.name,
+      'ownerName': salon.ownerName,
+      'address': salon.address,
+      'directionsUrl': salon.directionsUrl,
+      'phone': salon.phone,
+      'email': salon.email,
+      'logoUrl': salon.logoUrl,
+      'photoUrls': salon.photoUrls,
+      'openTime': salon.openTime,
+      'closeTime': salon.closeTime,
+      'services': salon.services.map(_serviceToMap).toList(),
+    });
+  }
+
+  Future<void> _saveOwnerBarber(Barber barber) async {
+    await _callOwnerMutation('saveOwnerBarber', {
+      'barberId': barber.id,
+      ...barberToMap(barber),
+    });
   }
 
   Future<void> _setBarber(Barber barber) {
-    final data = _barberToMap(barber);
+    // Only this direct write may carry a sentinel. `saveOwnerBarber` sends
+    // the same map through a callable, which JSON-encodes its payload and
+    // rejects a FieldValue with "Invalid argument: Instance of 'FieldValue'"
+    // before the request ever leaves the device. The server stamps its own
+    // updatedAt, so the callable does not need one.
+    final data = barberToMap(barber);
+    data['updatedAt'] = FieldValue.serverTimestamp();
     final uid = auth.currentUser?.uid;
     if (uid != null) {
       data['ownerUid'] = uid;
@@ -7706,31 +9158,6 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
   }
 }
 
-Map<String, Object?> _salonToMap(Salon salon) {
-  return {
-    'name': salon.name,
-    'ownerName': salon.ownerName,
-    'address': salon.address,
-    'directionsUrl': salon.directionsUrl,
-    'phone': salon.phone,
-    'email': salon.email,
-    'logoUrl': salon.logoUrl,
-    'photoUrls': salon.photoUrls,
-    'distanceLabel': salon.distanceLabel,
-    'rating': salon.rating,
-    'reviewCount': salon.reviewCount,
-    'openTime': salon.openTime,
-    'closeTime': salon.closeTime,
-    'isOpen': salon.isOpen,
-    'instantBookingsEnabled': salon.instantBookingsEnabled,
-    'instantBookingsPausedDate': salon.instantBookingsPausedDate ?? '',
-    'services': canonicalSalonServices(
-      salon.services,
-    ).map(_serviceToMap).toList(),
-    'updatedAt': FieldValue.serverTimestamp(),
-  };
-}
-
 Map<String, Object?> _serviceToMap(SalonService service) {
   return {
     'id': service.id,
@@ -7744,7 +9171,10 @@ Map<String, Object?> _serviceToMap(SalonService service) {
   };
 }
 
-Map<String, Object?> _barberToMap(Barber barber) {
+/// Must stay JSON-encodable: this is sent as a callable payload, not only
+/// written to Firestore.
+@visibleForTesting
+Map<String, Object?> barberToMap(Barber barber) {
   return {
     'uid': barber.uid,
     'salonId': barber.salonId,
@@ -7756,7 +9186,6 @@ Map<String, Object?> _barberToMap(Barber barber) {
     'resumeSummary': barber.resumeSummary,
     'serviceIds': barber.serviceIds,
     'isActive': barber.isActive,
-    'updatedAt': FieldValue.serverTimestamp(),
   };
 }
 
@@ -7781,6 +9210,8 @@ Map<String, Object?> _bookingToFirestore(
     'serviceName': booking.serviceName,
     'servicePrice': booking.servicePrice,
     'servicePriceBreakdown': booking.servicePriceBreakdown,
+    'serviceNameBreakdown': booking.serviceNameBreakdown,
+    'extraServiceRequest': booking.extraServiceRequest?.toMap(),
     'bookingFee': booking.bookingFee,
     'paymentRequired': booking.paymentRequired,
     'paymentStatus': booking.paymentStatus,
@@ -7792,6 +9223,9 @@ Map<String, Object?> _bookingToFirestore(
     'customerPayableAmount': booking.customerPayableAmount,
     'pritzePayoutAmount': booking.pritzePayoutAmount,
     'salonTotalEarning': booking.salonTotalEarning,
+    'cashbackProinAmount': booking.cashbackProinAmount,
+    'cashbackValidityDays': booking.cashbackValidityDays,
+    'discountCashbackStatus': booking.discountCashbackStatus,
     'discountStatus': booking.discountStatus,
     'customerPayableBeforeProin': booking.customerPayableBeforeProin,
     'proinStatus': booking.proinStatus,
@@ -7887,10 +9321,30 @@ Map<String, Object?> _joinRequestToFirestore(
   };
 }
 
+/// Parses what it can and drops what it cannot. A collection-wide listener
+/// must never be left empty because one document has an unexpected shape.
+@visibleForTesting
+List<T> parseDocuments<T, D>(
+  Iterable<D> docs,
+  T Function(D) parse, {
+  void Function(Object error)? onSkipped,
+}) {
+  final parsed = <T>[];
+  for (final doc in docs) {
+    try {
+      parsed.add(parse(doc));
+    } catch (error) {
+      onSkipped?.call(error);
+    }
+  }
+  return parsed;
+}
+
 Salon _salonFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
   final data = doc.data() ?? {};
+  final rawServices = data['services'];
   final services = canonicalSalonServices(
-    (data['services'] as List<dynamic>? ?? [])
+    (rawServices is List ? rawServices : const [])
         .whereType<Map<dynamic, dynamic>>()
         .map((item) => _serviceFromMap(Map<String, dynamic>.from(item)))
         .toList(),
@@ -7913,8 +9367,22 @@ Salon _salonFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
     isOpen: data['isOpen'] == true,
     instantBookingsEnabled: data['instantBookingsEnabled'] != false,
     instantBookingsPausedDate: _string(data['instantBookingsPausedDate'], ''),
+    approvalStatus: _salonApprovalStatus(data['approvalStatus']),
     services: services,
   );
+}
+
+String _salonApprovalStatus(Object? value) {
+  switch (value?.toString().trim()) {
+    case 'pending':
+      return 'pending';
+    case 'rejected':
+      return 'rejected';
+    case 'approved':
+    default:
+      // Salons registered before the approval system remain live.
+      return 'approved';
+  }
 }
 
 SalonService _serviceFromMap(Map<String, dynamic> data) {
@@ -7935,7 +9403,7 @@ Barber _barberFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
   final data = doc.data() ?? {};
   return Barber(
     id: doc.id,
-    uid: data['uid'] as String?,
+    uid: data['uid'] is String ? data['uid'] as String : null,
     salonId: _string(data['salonId'], ''),
     name: _string(data['name'], 'Barber'),
     phone: _string(data['phone'], ''),
@@ -7951,10 +9419,12 @@ Barber _barberFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
   );
 }
 
-Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
-  final data = doc.data() ?? {};
+Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) =>
+    _bookingFromData(doc.id, doc.data() ?? const <String, dynamic>{});
+
+Booking _bookingFromData(String id, Map<String, dynamic> data) {
   return Booking(
-    id: doc.id,
+    id: id,
     customerUid: data['customerUid'] as String?,
     salonId: _string(data['salonId'], ''),
     serviceId: _string(data['serviceId'], ''),
@@ -7967,6 +9437,12 @@ Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
     serviceName: _string(data['serviceName'], ''),
     servicePrice: _int(data['servicePrice'], 0),
     servicePriceBreakdown: _intMap(data['servicePriceBreakdown']),
+    serviceNameBreakdown: data['serviceNameBreakdown'] is Map
+        ? Map<String, String>.from(data['serviceNameBreakdown'] as Map)
+        : const {},
+    extraServiceRequest: data['extraServiceRequest'] is Map
+        ? BookingExtraServiceRequest.fromMap(data['extraServiceRequest'] as Map)
+        : null,
     bookingFee: _int(data['bookingFee'], _zeroBookingFee),
     paymentRequired: data['paymentRequired'] == true,
     paymentStatus: _string(data['paymentStatus'], _zeroBookingFeeStatus),
@@ -7984,6 +9460,9 @@ Booking _bookingFromFirestore(DocumentSnapshot<Map<String, dynamic>> doc) {
       data['salonTotalEarning'],
       _int(data['servicePrice'], 0),
     ),
+    cashbackProinAmount: _int(data['cashbackProinAmount'], 0),
+    cashbackValidityDays: _int(data['cashbackValidityDays'], 0),
+    discountCashbackStatus: _string(data['discountCashbackStatus'], 'none'),
     discountStatus: _string(data['discountStatus'], 'none'),
     customerPayableBeforeProin: _int(
       data['customerPayableBeforeProin'],
@@ -8131,6 +9610,9 @@ DateTime _date(Object? value) {
   if (value is DateTime) {
     return value;
   }
+  if (value is num) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
   return DateTime.now();
 }
 
@@ -8144,13 +9626,15 @@ DateTime? _nullableDate(Object? value) {
   if (value is DateTime) {
     return value;
   }
+  if (value is num) {
+    return DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
   return null;
 }
 
 List<String> _stringList(Object? value) {
-  return (value as List<dynamic>? ?? []).whereType<String>().toList(
-    growable: false,
-  );
+  if (value is! List) return const [];
+  return value.whereType<String>().toList(growable: false);
 }
 
 List<ProinExpiringLot> _proinExpiringLots(Object? value) {
@@ -8183,12 +9667,6 @@ Map<String, int> _intMap(Object? value) {
       if (entry.key.toString().trim().isNotEmpty)
         entry.key.toString(): _int(entry.value, 0),
   });
-}
-
-String _dateKey(DateTime date) {
-  return '${date.year.toString().padLeft(4, '0')}-'
-      '${date.month.toString().padLeft(2, '0')}-'
-      '${date.day.toString().padLeft(2, '0')}';
 }
 
 String _guessImageContentType(String fileName) {

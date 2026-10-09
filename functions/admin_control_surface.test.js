@@ -15,6 +15,7 @@ test("Phase 2 administrator controls stay behind privileged callable functions",
     "updateBookingStatusAsAdmin",
     "rescheduleBookingAsAdmin",
     "updateSalonControlAsAdmin",
+    "reviewSalonOnboardingAsAdmin",
     "updateCustomerProfileAsAdmin",
     "updateCustomerControlAsAdmin",
     "updateSalonProfileAsAdmin",
@@ -29,6 +30,8 @@ test("Phase 2 administrator controls stay behind privileged callable functions",
     "getDiscountAdministrationDataAsAdmin",
     "upsertDiscountCampaignAsAdmin",
     "setDiscountVaultBudgetAsAdmin",
+    "setSalonPromotionCreditLimitAsAdmin",
+    "recordSalonSettlementPaymentAsAdmin",
     "updateReferralCodeAsAdmin",
   ]) {
     assert.match(source, new RegExp(`exports\\.${callable} = onCall`));
@@ -53,7 +56,27 @@ test("administrator writes create immutable audit records", () => {
   assert.match(source, /exports\.generateAdminOperationalAlerts = onSchedule/);
   assert.match(source, /collection\("discountCampaignVersions"\)/);
   assert.match(source, /action: "discount\.vault_budget_changed"/);
+  assert.match(source, /action: "salon\.promotion_credit_limit_changed"/);
+  assert.match(source, /action: "salon\.settlement_payment_recorded"/);
+  assert.match(source, /paymentMethod/);
+  assert.match(source, /salonDiscountBurnMultiplier/);
+  assert.match(source, /salon\.onboarding_\$\{decision\}/);
+  assert.match(source, /approvalStatus: decision/);
   assert.match(source, /"referral\.code_replaced"/);
+});
+
+test("new salons remain pending until an administrator reviews the listing", () => {
+  assert.match(source, /function salonApprovalStatus/);
+  assert.match(source, /function isSalonApproved/);
+  assert.match(source, /!isSalonApproved\(salon\)/);
+  assert.match(
+      rules,
+      /request\.resource\.data\.get\('approvalStatus', ''\) == 'pending'/,
+  );
+  // Missing properties raise in rules, so the approval gate must read the
+  // field through get(): half the live salons predate it.
+  assert.doesNotMatch(rules, /resource\.data\.approvalStatus\b/);
+  assert.match(rules, /keepsSalonApprovalState\(\)/);
 });
 
 test("private salon payment details are exposed only through admin data", () => {
@@ -70,6 +93,10 @@ test("private salon payment details are exposed only through admin data", () => 
     /match \/salons\/\{salonId\}\/payments\/\{paymentFile\}/,
   );
   assert.match(storageRules, /allow read: if ownsSalon\(salonId\)/);
+  assert.match(
+    storageRules,
+    /allow create, update: if \(ownsSalon\(salonId\) \|\| ownerSalonId\(salonId\)\)/,
+  );
 });
 
 test("team password sign-in is server-verified, rate-limited and audited", () => {

@@ -51,6 +51,8 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   Future<List<CheckoutDiscountOffer>>? _visibleDiscountOffersFuture;
   bool _useProin = false;
   final TextEditingController _couponController = TextEditingController();
+  final ScrollController _checkoutScrollController = ScrollController();
+  bool _reviewingOffersAfterLogin = false;
   bool _isApplyingCoupon = false;
   String _applyingVisibleCampaignId = '';
   String _appliedVisibleCampaignId = '';
@@ -69,6 +71,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
   @override
   void dispose() {
     _couponController.dispose();
+    _checkoutScrollController.dispose();
     super.dispose();
   }
 
@@ -288,6 +291,8 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                 minimum: const EdgeInsets.fromLTRB(18, 8, 18, 14),
                 child: _InstantBookingCard(
                   enabled: canRequestInstant && !_priceSelectionPending,
+                  signedIn: appState.hasActiveCustomerSession,
+                  pausedBySalon: !salon.instantBookingsEnabled,
                   isLoading: _isInstantBooking,
                   selectedArrivalMinutes: _instantArrivalMinutes,
                   activeBooking: activeCustomerBooking,
@@ -321,6 +326,8 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                         ? 'Cancel current booking first'
                         : isRescheduling
                         ? 'Confirm new time'
+                        : !appState.hasActiveCustomerSession
+                        ? 'Sign in and review discounts'
                         : 'Confirm appointment',
                   ),
                   style: FilledButton.styleFrom(
@@ -331,6 +338,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
               ),
       ),
       body: ListView(
+        controller: _checkoutScrollController,
         padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
         children: [
           _BookingSummary(
@@ -341,8 +349,17 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
             showBookingFee: false,
           ),
           const SizedBox(height: 12),
+          if (_reviewingOffersAfterLogin) ...[
+            const GlassCard(
+              key: ValueKey('review-discounts-before-booking'),
+              child: Text(
+                'You’re signed in. Choose any available discounts or Proin below, then confirm your booking at the final price.',
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           if (!appState.hasActiveCustomerSession)
-            const _SignInForOfferCard()
+            _SignInForOfferCard(onPressed: () => _signInForDiscounts(context))
           else
             FutureBuilder<DiscountQuote>(
               future: discountFuture,
@@ -585,6 +602,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
                 padding: const EdgeInsets.only(bottom: 10),
                 child: _CheckoutVisibleOffersCard(
                   offers: offers,
+                  initiallyExpanded: _reviewingOffersAfterLogin,
                   applyingCampaignId: _applyingVisibleCampaignId,
                   appliedCampaignId: _appliedVisibleCampaignId,
                   onApply: (offer) => _applyVisibleCheckoutDiscount(
@@ -621,8 +639,29 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
 
     final didLogin = await _showCustomerLoginSheet(context);
     if (didLogin == true && context.mounted) {
-      await _completeBooking(context, slot);
+      _reviewOffersAfterLogin();
     }
+  }
+
+  Future<void> _signInForDiscounts(BuildContext context) async {
+    final didLogin = await _showCustomerLoginSheet(context);
+    if (didLogin == true && context.mounted) {
+      _reviewOffersAfterLogin();
+    }
+  }
+
+  void _reviewOffersAfterLogin() {
+    _clearPricingQuotes();
+    setState(() => _reviewingOffersAfterLogin = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _checkoutScrollController.hasClients) {
+        _checkoutScrollController.animateTo(
+          0,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
   Future<void> _completeBooking(BuildContext context, TimeSlot slot) async {
@@ -722,7 +761,7 @@ class _SalonBookingScreenState extends State<SalonBookingScreen> {
 
     final didLogin = await _showCustomerLoginSheet(context);
     if (didLogin == true && context.mounted) {
-      await _completeInstantBooking(context);
+      _reviewOffersAfterLogin();
     }
   }
 
@@ -1482,7 +1521,9 @@ class _BookingSuccessDetailRow extends StatelessWidget {
 }
 
 class _SignInForOfferCard extends StatelessWidget {
-  const _SignInForOfferCard();
+  final VoidCallback onPressed;
+
+  const _SignInForOfferCard({required this.onPressed});
 
   @override
   Widget build(BuildContext context) {
@@ -1493,14 +1534,30 @@ class _SignInForOfferCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: AppColors.primary.withAlpha(32)),
       ),
-      child: const Row(
+      child: Row(
         children: [
-          Icon(Icons.local_offer_outlined, color: AppColors.primaryDark),
-          SizedBox(width: 10),
-          Expanded(
+          const Icon(Icons.local_offer_outlined, color: AppColors.primaryDark),
+          const SizedBox(width: 10),
+          const Expanded(
             child: Text(
-              'Sign in to reveal your personal Pritze discount.',
+              'Personal discounts',
               style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton(
+            key: const ValueKey('sign-in-for-personal-discounts'),
+            onPressed: onPressed,
+            style: FilledButton.styleFrom(
+              minimumSize: Size.zero,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text(
+              'Sign in / Sign up',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12),
             ),
           ),
         ],
@@ -1602,12 +1659,14 @@ class _CheckoutOffersLoadingCard extends StatelessWidget {
 
 class _CheckoutVisibleOffersCard extends StatefulWidget {
   final List<CheckoutDiscountOffer> offers;
+  final bool initiallyExpanded;
   final String applyingCampaignId;
   final String appliedCampaignId;
   final ValueChanged<CheckoutDiscountOffer> onApply;
 
   const _CheckoutVisibleOffersCard({
     required this.offers,
+    this.initiallyExpanded = false,
     required this.applyingCampaignId,
     required this.appliedCampaignId,
     required this.onApply,
@@ -1620,7 +1679,7 @@ class _CheckoutVisibleOffersCard extends StatefulWidget {
 
 class _CheckoutVisibleOffersCardState
     extends State<_CheckoutVisibleOffersCard> {
-  bool _expanded = false;
+  late bool _expanded = widget.initiallyExpanded;
 
   @override
   Widget build(BuildContext context) {
@@ -1819,7 +1878,8 @@ class _CheckoutVisibleOfferTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      'Save ₹${offer.discountAmount} · Pay ₹${offer.customerPayableAmount}',
+                      'Save ₹${offer.discountAmount} · Pay ₹${offer.customerPayableAmount}'
+                      '${offer.cashbackProinAmount > 0 ? ' · +${offer.cashbackProinAmount} Proin after service' : ''}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -2356,6 +2416,8 @@ class _BookingSummary extends StatelessWidget {
 
 class _InstantBookingCard extends StatelessWidget {
   final bool enabled;
+  final bool signedIn;
+  final bool pausedBySalon;
   final bool isLoading;
   final int selectedArrivalMinutes;
   final Booking? activeBooking;
@@ -2364,6 +2426,8 @@ class _InstantBookingCard extends StatelessWidget {
 
   const _InstantBookingCard({
     required this.enabled,
+    required this.signedIn,
+    required this.pausedBySalon,
     required this.isLoading,
     required this.selectedArrivalMinutes,
     required this.activeBooking,
@@ -2428,7 +2492,9 @@ class _InstantBookingCard extends StatelessWidget {
                 if (!enabled) ...[
                   const SizedBox(height: 8),
                   Text(
-                    'Instant booking is unavailable for this service right now.',
+                    pausedBySalon
+                        ? 'This salon has paused instant bookings. You can still schedule an appointment.'
+                        : 'Instant booking is unavailable for this service right now.',
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: AppColors.coral,
                       fontWeight: FontWeight.w600,
@@ -2448,7 +2514,11 @@ class _InstantBookingCard extends StatelessWidget {
                           )
                         : const Icon(Icons.flash_on_outlined),
                     label: Text(
-                      isLoading ? 'Sending...' : 'Request instant booking',
+                      isLoading
+                          ? 'Sending...'
+                          : signedIn
+                          ? 'Request instant booking'
+                          : 'Sign in and review discounts',
                     ),
                   ),
                 ),

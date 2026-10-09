@@ -89,6 +89,8 @@ test("discount operations stay behind privileged Firebase callables", () => {
   assert.match(source, /getDiscountAdministrationDataAsAdmin/);
   assert.match(source, /upsertDiscountCampaignAsAdmin/);
   assert.match(source, /setDiscountVaultBudgetAsAdmin/);
+  assert.match(source, /Salon discount burn multiplier/);
+  assert.match(source, /Change finance controls/);
   assert.match(source, /Manage discount eligibility and burn/);
   assert.match(source, /Coupon \/ voucher campaign/);
   assert.match(source, /Coupon visibility in app/);
@@ -102,7 +104,21 @@ test("discount operations stay behind privileged Firebase callables", () => {
   assert.match(source, /adminActionFieldHelp/);
   assert.match(source, /field-help/);
   assert.match(source, /one tappable row below the final price before booking/);
-  assert.match(source, /Find salon IDs in the Salons section/);
+  assert.match(source, /Eligible salons \(leave all unchecked for every salon\)/);
+  assert.match(source, /Copy ID/);
+  assert.match(source, /third booking/);
+  assert.match(source, /New journey campaign/);
+  assert.match(source, /Booking reward milestones/);
+  assert.match(source, /Create journey campaign/);
+  assert.match(source, /Customers see only the ordinary discount or Proin result/);
+  assert.match(source, /Maximum customer discount/);
+  assert.match(source, /Salon compensation \(% of customer discount\)/);
+  assert.match(source, /Compensation by customer booking number/);
+  assert.match(source, /Campaigns enabled at each salon/);
+  assert.match(source, /Manage campaigns/);
+  assert.match(source, /New salon approval requests/);
+  assert.match(source, /reviewSalonOnboardingAsAdmin/);
+  assert.match(source, /These salons are saved by their owners but are hidden from customers until you approve them/);
   assert.doesNotMatch(source, /from "firebase\/firestore"/);
 });
 
@@ -124,6 +140,16 @@ test("customer and salon records have audited full-profile controls", () => {
   assert.match(source, /same number cannot belong to a customer and salon owner/);
   assert.match(source, /Private payout details/);
   assert.match(source, /View payment QR/);
+  assert.match(source, /Salon finance/);
+  assert.match(source, /setSalonPromotionCreditLimitAsAdmin/);
+  assert.match(source, /recordSalonSettlementPaymentAsAdmin/);
+  assert.match(source, /Record external payment/);
+  assert.match(source, /Settle full amount/);
+  assert.match(source, /Add promotional credit/);
+  assert.match(source, /Payment method/);
+  assert.match(source, /Bank transfer/);
+  assert.match(source, /cash receipt or ledger reference/);
+  assert.match(source, /Add promotional credit when needed/);
 });
 
 test("the authenticated Control Center includes a practical operating guide", () => {
@@ -146,9 +172,14 @@ test("the authenticated Control Center includes a practical operating guide", ()
   assert.match(source, /FIRST SETUP ORDER/);
   assert.match(source, /Discount, coupon and Proin testing in the safest sequence/);
   assert.match(source, /Save new campaigns and programs inactive first/);
+  assert.match(source, /Budget exhausted/);
+  assert.match(source, /Funding unavailable/);
+  assert.match(source, /Customer, salon, service and use limits are checked at checkout/);
+  assert.match(styles, /\.proin-state\.exhausted/);
   assert.match(source, /Nothing from the starter buttons reaches customers until/);
   assert.match(source, /verbally shared and work only when typed/);
   assert.match(source, /Visible checkout offers appear as a small tappable row/);
+  assert.match(source, /booking 1 discount only, booking 2 discount \+ Proin/);
   assert.match(source, /Pritze owes salon/);
   assert.match(source, /view === "guide" && <GuideView/);
   assert.match(source, /className="sidebar-guide"/);

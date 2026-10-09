@@ -517,27 +517,41 @@ class _SalonCard extends StatelessWidget {
                             style: Theme.of(context).textTheme.bodyMedium,
                           ),
                           const SizedBox(height: 3),
-                          Text(
-                            availabilityLabel,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodySmall
-                                ?.copyWith(
-                                  color: availabilityColor,
-                                  fontWeight: FontWeight.w600,
+                          // The status is short, so the offer sits beside it
+                          // rather than consuming another line of the card.
+                          Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  availabilityLabel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.bodySmall
+                                      ?.copyWith(
+                                        color: availabilityColor,
+                                        fontWeight: FontWeight.w600,
+                                      ),
                                 ),
+                              ),
+                              if (appState.hasActiveCustomerSession &&
+                                  matchedServices.isNotEmpty) ...[
+                                const SizedBox(width: 8),
+                                // Not Flexible: two flexible children split
+                                // the row evenly and clipped the amount to
+                                // "Save up t…". The status beside it is the
+                                // one that may ellipsize instead.
+                                _PersonalDiscountPreview(
+                                  salonId: salon.id,
+                                  refreshVersion:
+                                      appState.discountOfferRefreshVersion,
+                                  serviceIds: matchedServices
+                                      .take(6)
+                                      .map((service) => service.id)
+                                      .toList(growable: false),
+                                ),
+                              ],
+                            ],
                           ),
-                          if (appState.hasActiveCustomerSession &&
-                              matchedServices.isNotEmpty) ...[
-                            const SizedBox(height: 5),
-                            _PersonalDiscountPreview(
-                              salonId: salon.id,
-                              serviceIds: matchedServices
-                                  .take(6)
-                                  .map((service) => service.id)
-                                  .toList(growable: false),
-                            ),
-                          ],
                         ],
                       ),
                     ),
@@ -572,17 +586,17 @@ class _SalonCard extends StatelessWidget {
                 const SizedBox(height: 11),
                 Row(
                   children: [
-                    if (instantAvailable) ...[
-                      Expanded(
-                        child: FilledButton.icon(
-                          onPressed: () =>
-                              openSalon(SalonDetailEntryAction.instant),
-                          icon: const Icon(Icons.bolt_outlined, size: 19),
-                          label: const Text('Book instantly'),
-                        ),
+                    Expanded(
+                      child: FilledButton.icon(
+                        key: ValueKey('salon-card-instant-${salon.id}'),
+                        onPressed: instantAvailable
+                            ? () => openSalon(SalonDetailEntryAction.instant)
+                            : null,
+                        icon: const Icon(Icons.bolt_outlined, size: 19),
+                        label: const Text('Book instantly'),
                       ),
-                      const SizedBox(width: 8),
-                    ],
+                    ),
+                    const SizedBox(width: 8),
                     Expanded(
                       child: OutlinedButton.icon(
                         key: ValueKey('salon-card-schedule-${salon.id}'),
@@ -608,10 +622,12 @@ class _SalonCard extends StatelessWidget {
 class _PersonalDiscountPreview extends StatefulWidget {
   final String salonId;
   final List<String> serviceIds;
+  final int refreshVersion;
 
   const _PersonalDiscountPreview({
     required this.salonId,
     required this.serviceIds,
+    required this.refreshVersion,
   });
 
   @override
@@ -622,10 +638,13 @@ class _PersonalDiscountPreview extends StatefulWidget {
 class _PersonalDiscountPreviewState extends State<_PersonalDiscountPreview> {
   Future<List<CheckoutDiscountOffer>>? _future;
 
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _future ??= AppStateScope.read(context).listCheckoutDiscountOffers(
+  String _requestKey(_PersonalDiscountPreview value) {
+    final serviceIds = value.serviceIds.toSet().toList()..sort();
+    return '${value.salonId}|${serviceIds.join(',')}|${value.refreshVersion}';
+  }
+
+  Future<List<CheckoutDiscountOffer>> _loadOffers() {
+    return AppStateScope.read(context).listCheckoutDiscountOffers(
       salonId: widget.salonId,
       serviceIds: widget.serviceIds,
       prefetchOnly: true,
@@ -633,34 +652,85 @@ class _PersonalDiscountPreviewState extends State<_PersonalDiscountPreview> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _future ??= _loadOffers();
+  }
+
+  @override
+  void didUpdateWidget(covariant _PersonalDiscountPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_requestKey(oldWidget) != _requestKey(widget)) {
+      _future = _loadOffers();
+    }
+  }
+
+  void _retry() {
+    setState(() => _future = _loadOffers());
+  }
+
+  @override
   Widget build(BuildContext context) {
     return FutureBuilder<List<CheckoutDiscountOffer>>(
       future: _future,
       builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Row(
+            children: [
+              const Icon(
+                Icons.cloud_off_rounded,
+                color: AppColors.amber,
+                size: 15,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  'Offers could not refresh',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: AppColors.amber,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              TextButton(onPressed: _retry, child: const Text('Retry')),
+            ],
+          );
+        }
         final offer = snapshot.data?.firstOrNull;
         if (offer == null || !offer.hasSaving) {
           return const SizedBox.shrink();
         }
-        return Row(
-          children: [
-            const Icon(
-              Icons.local_offer_rounded,
-              color: AppColors.success,
-              size: 15,
-            ),
-            const SizedBox(width: 4),
-            Expanded(
-              child: Text(
-                'Offers available: save up to ₹${offer.discountAmount}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppColors.success,
-                  fontWeight: FontWeight.w700,
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+          decoration: BoxDecoration(
+            color: AppColors.success.withAlpha(28),
+            border: Border.all(color: AppColors.success.withAlpha(150)),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.local_offer_rounded,
+                color: AppColors.success,
+                size: 15,
+              ),
+              const SizedBox(width: 5),
+              Flexible(
+                child: Text(
+                  'Save up to ₹${offer.discountAmount}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: AppColors.success,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         );
       },
     );

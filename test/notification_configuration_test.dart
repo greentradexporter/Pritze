@@ -30,10 +30,67 @@ void main() {
       appState,
       contains("Future<void> firebaseMessagingBackgroundHandler"),
     );
+    expect(appState, contains("'ownerAlertV4Tokens'"));
+    // The retired generation must still be cleared, or the server rings the
+    // device twice: once per channel it is registered for.
     expect(appState, contains("'ownerAlertV3Tokens'"));
-    expect(appState, contains('_ownerAlertsEnabledPreferenceKey'));
+    // The owner-alert flag has exactly one owner. The app and the FCM isolate
+    // reach it through that accessor so they cannot name different stores.
+    expect(appState, contains('OwnerAlertPreferences().isEnabled()'));
+    expect(appState, contains('OwnerAlertPreferences().setEnabled(enabled)'));
+    expect(appState, isNot(contains('ownerAlertsEnabled')));
+    final alertState = File(
+      'lib/services/owner_booking_alert_state.dart',
+    ).readAsStringSync();
+    expect(alertState, contains('class OwnerAlertPreferences'));
+    expect(
+      RegExp(r"'pritze\.notifications\.ownerAlertsEnabled'")
+          .allMatches(alertState)
+          .length,
+      1,
+    );
+    // The alarm stream, so a phone on silent still rings.
+    expect(
+      RegExp(r'audioAttributesUsage: AudioAttributesUsage\.alarm')
+          .allMatches(appState)
+          .length,
+      greaterThanOrEqualTo(2),
+    );
+    expect(appState, contains("'pritze_owner_booking_requests_v4'"));
+    expect(appState, contains('_legacyOwnerBookingRequestChannelIds'));
     expect(appState, contains("'ownerNotificationsEnabled': isOwnerSession"));
-    expect(appState, contains('await messaging.deleteToken()'));
+    // An owner whose stored role still says customer must still be treated as
+    // an owner session, and the field the server routes on must be promoted.
+    expect(
+      appState,
+      contains('authoritativeRole == UserRole.owner || '
+          '_activeRole == UserRole.owner'),
+    );
+    expect(appState, contains("if (isOwnerSession) 'activeRole'"));
+    final rules = File('firestore.rules').readAsStringSync();
+    // The profile allowlist rejects the whole write when a field is missing,
+    // which is how sign-out silently failed to de-register a device.
+    for (final field in <String>[
+      'fcmTokens',
+      'ownerAlertV4Tokens',
+      'ownerAlertV3Tokens',
+      'lastFcmToken',
+      'notificationsEnabled',
+      'ownerNotificationsEnabled',
+      'activeRole',
+    ]) {
+      expect(rules, contains("'$field'"), reason: '$field must be writable');
+    }
+    // Sign-out de-registration: the token read must not gate the write that
+    // actually stops delivery.
+    expect(appState, contains('performSignOutDeregistration('));
+    expect(appState, contains('signOutDeregistrationFields('));
+    expect(appState, contains('deleteToken: messaging.deleteToken'));
+    final deregistration = File(
+      'lib/services/push_deregistration.dart',
+    ).readAsStringSync();
+    expect(deregistration, contains("'notificationsEnabled': false"));
+    expect(deregistration, contains("'ownerNotificationsEnabled': false"));
     expect(
       appState,
       contains("await _sendBookingPush(bookingId, event: 'statusUpdated')"),
@@ -41,7 +98,7 @@ void main() {
     expect(appState, contains('additionalFlags:'));
     expect(appState, contains("'accept_instant_booking'"));
     expect(appState, contains("'reject_instant_booking'"));
-    expect(appState, contains('showsUserInterface: false'));
+    expect(appState, contains('showsUserInterface: true'));
     expect(
       RegExp(r'cancelNotification: true').allMatches(appState).length,
       greaterThanOrEqualTo(2),
@@ -61,10 +118,31 @@ void main() {
     expect(appState, contains('autoCancel: false'));
     expect(appState, contains('FirebaseMessaging.onMessageOpenedApp.listen'));
     expect(appState, contains('messaging.getInitialMessage()'));
+    expect(appState, contains('_applyRemoteCustomerBookingHint(message.data)'));
+    // The cross-isolate preferences all live in the alert service now; the
+    // app itself no longer reaches for a store of its own.
+    expect(alertState, contains('SharedPreferencesAsync('));
+    expect(appState, contains('_persistPendingOwnerBookingAction'));
+    expect(appState, contains('_cancelOwnerBookingNotifications'));
+    expect(appState, contains('_loadServerBooking(bookingId)'));
     expect(appState, contains('onDidReceiveNotificationResponse:'));
     expect(appState, contains('onDidReceiveBackgroundNotificationResponse:'));
     expect(appState, contains('notificationActionBackgroundHandler'));
     expect(appState, contains("httpsCallable('updateBookingStatus')"));
+    expect(appState, contains('_prepareBackgroundBookingActionFirebase'));
+    expect(appState, contains('FirebaseAppCheck.instance.getToken()'));
+    expect(appState, contains('Never restart the continuous alarm'));
+    expect(appState, contains('_backgroundBookingActionAuthTimeout'));
+    expect(appState, contains('authStateChanges()'));
+    final accountActions = File(
+      'lib/widgets/account_actions.dart',
+    ).readAsStringSync();
+    expect(
+      accountActions,
+      contains('_unreadNotificationBadgeLifetime'),
+      reason: 'The app should not surface stale booking history as unread.',
+    );
+    expect(accountActions, contains('_isCurrentUnreadBookingNotification'));
     expect(appState, contains('getNotificationAppLaunchDetails()'));
     expect(
       appState,
@@ -77,12 +155,30 @@ void main() {
     );
 
     final functions = File('functions/index.js').readAsStringSync();
+    expect(functions, contains('"pritze_owner_booking_requests_v4"'));
     expect(functions, contains('"pritze_owner_booking_requests_v3"'));
     expect(functions, contains('"pritze_owner_booking_requests_v2"'));
-    expect(functions, contains('tokenField: "ownerAlertV3Tokens"'));
-    expect(functions, contains('excludeTokenField: "ownerAlertV3Tokens"'));
+    expect(functions, contains('"ownerAlertV4Tokens"'));
+    expect(functions, contains('"ownerAlertV3Tokens"'));
+    // Each generation is addressed on its own token list and excluded from the
+    // older ones, so one device receives one alert.
+    expect(functions, contains('tokenField: OWNER_ALERT_TOKEN_FIELD'));
+    expect(
+      functions,
+      contains('excludeTokenField: OWNER_ALERT_TOKEN_FIELD'),
+    );
+    expect(functions, contains('excludeTokenFields: ['));
+    // A signed-out device must be refused server side too: FCM token
+    // rotation means its older tokens can still be in the list.
+    expect(functions, contains('data.notificationsEnabled === false'));
     expect(functions, contains('requireActiveOwnerSession: true'));
     expect(functions, contains('requiredActiveRolesByUser'));
+    expect(functions, contains('customerPayableAmount: money('));
+    expect(functions, contains('completedAtMillis: adminMillis('));
+    expect(
+      functions,
+      contains('Completion is the customer\'s payment trigger.'),
+    );
     expect(functions, contains('!requiredRoles.includes(data.activeRole)'));
     expect(functions, contains('data.ownerNotificationsEnabled !== true'));
     expect(functions, contains('onDocumentCreated'));
@@ -130,6 +226,11 @@ void main() {
       'android/app/src/main/AndroidManifest.xml',
     ).readAsStringSync();
     expect(manifest, contains('android.permission.POST_NOTIFICATIONS'));
+    expect(manifest, contains('android.permission.USE_FULL_SCREEN_INTENT'));
+    // Without these the full-screen intent wakes the phone to the keyguard
+    // and the request stays hidden behind it.
+    expect(manifest, contains('android:showWhenLocked="true"'));
+    expect(manifest, contains('android:turnScreenOn="true"'));
     expect(
       manifest,
       contains('com.google.firebase.messaging.default_notification_channel_id'),

@@ -1,10 +1,12 @@
 import 'dart:async';
 
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../models/app_models.dart';
 import '../../models/service_catalog.dart';
+import '../../services/owner_alert_readiness.dart';
 import '../../state/app_state.dart';
 import '../../state/app_state_scope.dart';
 import '../../theme/app_theme.dart';
@@ -14,6 +16,7 @@ import '../../widgets/app_ui.dart';
 import '../../widgets/account_actions.dart';
 import '../../widgets/auth_login_panel.dart';
 import '../../widgets/booking_status_timeline.dart';
+import '../../widgets/booking_extra_services.dart';
 import '../../widgets/status_chip.dart';
 import '../customer/customer_home_screen.dart';
 import 'salon_profile_setup_screen.dart';
@@ -65,6 +68,14 @@ class _SalonDashboardScreenState extends State<SalonDashboardScreen> {
       return const _OwnerLoginGate();
     }
     if (appState.ownerSalonOrNull == null) {
+      // Before the first snapshot an empty salon list is indistinguishable
+      // from "this owner has no salon". Registration replaces the dashboard
+      // and has nothing to pop back to, so never show it on a guess.
+      if (!appState.salonsLoaded) {
+        return const Scaffold(
+          body: Center(child: CircularProgressIndicator()),
+        );
+      }
       return const SalonProfileSetupScreen();
     }
     final activeInstantBooking = _activeInstantBooking(
@@ -548,11 +559,16 @@ class _OwnerOverview extends StatelessWidget {
               '${appState.todayBookingCount(salon.id)} appointments today. Track staff, revenue, and booking status.',
           icon: Icons.insights,
         ),
+        if (!salon.isApproved) ...[
+          const SizedBox(height: 14),
+          _SalonApprovalBanner(salon: salon),
+        ],
         if (!appState.isSalonSetupComplete(salon.id)) ...[
           const SizedBox(height: 14),
           _OwnerSetupBanner(salon: salon),
         ],
         const SizedBox(height: 14),
+        const _OwnerAlertReadinessBanner(),
         _InstantBookingControl(salon: salon),
         if (pendingRequests.isNotEmpty) ...[
           const SizedBox(height: 18),
@@ -883,9 +899,7 @@ class _InstantBookingControl extends StatelessWidget {
     final enabled = appState.isInstantBookingEnabled(salon.id);
     final isOpen = appState.isSalonCurrentlyOpen(salon.id);
     final color = enabled ? AppColors.primary : AppColors.muted;
-    final status = enabled
-        ? (isOpen ? 'On now' : 'On for opening')
-        : 'Paused today';
+    final status = enabled ? (isOpen ? 'On now' : 'On for opening') : 'Off';
 
     return GlassCard(
       color: enabled ? AppColors.champagne.withAlpha(92) : Colors.white,
@@ -916,32 +930,41 @@ class _InstantBookingControl extends StatelessWidget {
               ],
             ),
           ),
-          Switch(
-            value: enabled,
-            activeThumbColor: AppColors.primary,
-            onChanged: appState.isSaving
-                ? null
-                : (value) async {
-                    try {
-                      await appState.setOwnerInstantBookingEnabled(value);
-                    } catch (error) {
-                      if (!context.mounted) {
-                        return;
-                      }
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(
-                            friendlyErrorMessage(
-                              error,
-                              fallback:
-                                  'Instant booking availability could not be updated. Try again.',
-                            ),
-                          ),
+          if (appState.isInstantBookingSaving)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 13),
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+            )
+          else
+            Switch(
+              key: const ValueKey('instant-booking-availability-switch'),
+              value: enabled,
+              activeThumbColor: AppColors.primary,
+              onChanged: (value) async {
+                try {
+                  await appState.setOwnerInstantBookingEnabled(value);
+                } catch (error) {
+                  if (!context.mounted) {
+                    return;
+                  }
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        friendlyErrorMessage(
+                          error,
+                          fallback:
+                              'Instant booking availability could not be updated. Try again.',
                         ),
-                      );
-                    }
-                  },
-          ),
+                      ),
+                    ),
+                  );
+                }
+              },
+            ),
         ],
       ),
     );
@@ -1319,6 +1342,7 @@ class _OwnerBookingCard extends StatelessWidget {
             ].join(' · '),
           ),
           const SizedBox(height: 14),
+          BookingExtraServices(booking: booking),
           if (canRespond ||
               canStart ||
               canCancel ||
@@ -1622,6 +1646,7 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
   String _serviceQuery = '';
   bool _servicesExpanded = false;
   bool _isSaving = false;
+  String? _saveError;
 
   bool get _isEditing => widget.barber != null;
 
@@ -1763,6 +1788,12 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                       key: const ValueKey('barber-experience-field'),
                       controller: _experienceController,
                       keyboardType: TextInputType.number,
+                      validator: (value) {
+                        final years = int.tryParse(value ?? '');
+                        return years == null || years < 0 || years > 80
+                            ? 'Enter years of experience from 0 to 80'
+                            : null;
+                      },
                       decoration: const InputDecoration(
                         labelText: 'Years of experience',
                       ),
@@ -1861,6 +1892,14 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
                   ],
                 ),
               ),
+              if (_saveError != null) ...[
+                Text(
+                  _saveError!,
+                  key: const ValueKey('barber-save-error'),
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+                const SizedBox(height: 8),
+              ],
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
@@ -1914,9 +1953,15 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
 
   Future<void> _save(AppState appState) async {
     if (!_formKey.currentState!.validate()) {
+      setState(
+        () => _saveError = 'Check the name and years of experience above.',
+      );
       return;
     }
-    setState(() => _isSaving = true);
+    setState(() {
+      _isSaving = true;
+      _saveError = null;
+    });
     try {
       final barber = widget.barber;
       if (barber == null) {
@@ -1944,17 +1989,13 @@ class _AddBarberSheetState extends State<_AddBarberSheet> {
       }
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              friendlyErrorMessage(
-                error,
-                fallback: 'The barber details could not be saved. Try again.',
-              ),
-            ),
-          ),
-        );
-        setState(() => _isSaving = false);
+        setState(() {
+          _isSaving = false;
+          _saveError = friendlyErrorMessage(
+            error,
+            fallback: 'The barber details could not be saved. Try again.',
+          );
+        });
       }
     }
   }
@@ -2317,6 +2358,199 @@ class _OwnerLoginGateState extends State<_OwnerLoginGate> {
                 MaterialPageRoute(builder: (_) => const SalonDashboardScreen()),
               );
             },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Warns the owner when this phone will not ring for a booking request.
+///
+/// Every blocker here fails silently: the request is sent, the alert is
+/// posted, and the owner simply never hears it. Without this they cannot tell
+/// a quiet evening from a phone that has stopped alerting them.
+class _OwnerAlertReadinessBanner extends StatefulWidget {
+  const _OwnerAlertReadinessBanner();
+
+  @override
+  State<_OwnerAlertReadinessBanner> createState() =>
+      _OwnerAlertReadinessBannerState();
+}
+
+class _OwnerAlertReadinessBannerState extends State<_OwnerAlertReadinessBanner>
+    with WidgetsBindingObserver {
+  OwnerAlertReadiness? _readiness;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_refresh());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // The owner fixes these in system settings and comes back, so re-check on
+    // resume rather than leaving a warning up that they have already resolved.
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_refresh());
+    }
+  }
+
+  Future<void> _refresh() async {
+    try {
+      final settings = await FirebaseMessaging.instance
+          .getNotificationSettings();
+      final status = settings.authorizationStatus;
+      final readiness = await OwnerAlertDeviceSettings.check(
+        notificationsEnabled:
+            status == AuthorizationStatus.authorized ||
+            status == AuthorizationStatus.provisional,
+        // Token registration is reported separately by the backend; this
+        // banner covers what the owner can fix on the device itself.
+        hasPushToken: true,
+      );
+      if (mounted) setState(() => _readiness = readiness);
+    } catch (_) {
+      // A readiness check must never take the dashboard down with it.
+    }
+  }
+
+  Future<void> _fix(OwnerAlertBlocker blocker) async {
+    final opened = switch (blocker) {
+      OwnerAlertBlocker.fullScreenIntentDenied =>
+        await OwnerAlertDeviceSettings.openFullScreenIntentSettings(),
+      OwnerAlertBlocker.batteryOptimised =>
+        await OwnerAlertDeviceSettings.openBatteryOptimizationSettings(),
+      _ => false,
+    };
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Open Settings, find Pritze, and allow notifications and '
+            'background activity.',
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final readiness = _readiness;
+    if (readiness == null || readiness.isReady) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: GlassCard(
+        color: readiness.isSilent ? AppColors.champagne : AppColors.mint,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const SoftIconBox(
+                  icon: Icons.notifications_active_outlined,
+                  color: AppColors.primary,
+                  size: 44,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    readiness.isSilent
+                        ? 'Booking requests cannot reach this phone'
+                        : 'Booking requests may not ring on this phone',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      color: AppColors.primaryDark,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            for (final blocker in readiness.blockers) ...[
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Text(
+                      ownerAlertBlockerMessage(blocker),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: AppColors.primaryDark,
+                      ),
+                    ),
+                  ),
+                  if (blocker == OwnerAlertBlocker.fullScreenIntentDenied ||
+                      blocker == OwnerAlertBlocker.batteryOptimised)
+                    TextButton(
+                      key: ValueKey('fix-owner-alert-${blocker.name}'),
+                      onPressed: () => _fix(blocker),
+                      child: const Text('Fix'),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 4),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SalonApprovalBanner extends StatelessWidget {
+  final Salon salon;
+
+  const _SalonApprovalBanner({required this.salon});
+
+  @override
+  Widget build(BuildContext context) {
+    final pending = salon.isPendingApproval;
+    final color = pending ? AppColors.amber : AppColors.coral;
+    return GlassCard(
+      color: pending ? AppColors.champagne : AppColors.mint,
+      child: Row(
+        children: [
+          SoftIconBox(
+            icon: pending ? Icons.hourglass_top_rounded : Icons.info_outline,
+            color: color,
+            size: 44,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  pending
+                      ? 'Salon review in progress'
+                      : 'Salon listing needs review',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    color: AppColors.primaryDark,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  pending
+                      ? 'Your salon is saved and waiting for Pritze approval. It is not visible to customers and cannot receive bookings yet.'
+                      : 'Your salon is not visible to customers. Please contact Pritze support if you need help with the review.',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: AppColors.primaryDark,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),

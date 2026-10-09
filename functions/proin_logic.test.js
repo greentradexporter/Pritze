@@ -116,6 +116,12 @@ test("grant checks protect active dates, program budget and grant count", () => 
   }).allowed, false);
   assert.equal(proinProgramGrantAllowed({
     program,
+    usage: {grantedProin: 9950},
+    nowMillis,
+    rewardAmountProin: 40,
+  }).allowed, true);
+  assert.equal(proinProgramGrantAllowed({
+    program,
     usage: {grantCount: 100},
     nowMillis,
   }).allowed, false);

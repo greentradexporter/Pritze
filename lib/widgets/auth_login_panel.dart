@@ -436,7 +436,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       if (!mounted) {
         return;
       }
-      await _showLoginError(error);
+      await _showLoginError(error, onRetry: _submit);
     } finally {
       if (mounted) {
         setState(() => _isSubmitting = false);
@@ -472,7 +472,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       if (!mounted) {
         return;
       }
-      await _showLoginError(error);
+      await _showLoginError(error, onRetry: _submitGoogle);
     } finally {
       if (mounted) {
         setState(() => _isSubmitting = false);
@@ -606,7 +606,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       );
     } catch (error) {
       if (mounted) {
-        await _showLoginError(error);
+        await _showLoginError(error, onRetry: _resendPhoneOtp);
       }
     } finally {
       _isAutoCompletingPhoneOtp = false;
@@ -672,7 +672,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       _phoneOtpFocusNode.requestFocus();
     } catch (error) {
       if (mounted) {
-        await _showLoginError(error);
+        await _showLoginError(error, onRetry: _resendPhoneOtp);
       }
     } finally {
       if (mounted) {
@@ -796,7 +796,7 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
       _emailOtpFocusNode.requestFocus();
     } catch (error) {
       if (mounted) {
-        await _showLoginError(error);
+        await _showLoginError(error, onRetry: _resendEmailOtp);
       }
     } finally {
       if (mounted) {
@@ -887,8 +887,12 @@ class _AuthLoginPanelState extends State<AuthLoginPanel> {
     _showSnack(message);
   }
 
-  Future<void> _showLoginError(Object error) {
-    return showAppErrorDialog(context, friendlyAuthenticationError(error));
+  Future<void> _showLoginError(Object error, {VoidCallback? onRetry}) {
+    return showAppErrorDialog(
+      context,
+      friendlyAuthenticationError(error),
+      onRetry: onRetry,
+    );
   }
 }
 

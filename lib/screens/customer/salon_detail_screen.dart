@@ -53,7 +53,8 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
     final isBookable = appState.isSalonBookable(salon.id);
     final isSetupComplete = appState.isSalonSetupComplete(salon.id);
     final isCurrentlyOpen = appState.isSalonCurrentlyOpen(salon.id);
-    final canBookInstantly = isBookable && isCurrentlyOpen;
+    final instantEnabled = appState.isInstantBookingEnabled(salon.id);
+    final canBookInstantly = isBookable && isCurrentlyOpen && instantEnabled;
     final barbers = appState.barbersForSalon(salon.id);
     final instantServices = services
         .where(
@@ -152,7 +153,9 @@ class _SalonDetailScreenState extends State<SalonDetailScreen> {
                         const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            isSetupComplete
+                            isCurrentlyOpen && !instantEnabled
+                                ? 'Instant bookings are paused by this salon. You can still schedule an appointment.'
+                                : isSetupComplete
                                 ? 'This salon is currently closed. You can still schedule an appointment during its opening hours.'
                                 : 'This salon is listed while its booking setup is being completed.',
                           ),
@@ -759,6 +762,10 @@ class _InstantServiceSelectionScreenState
         )
         .toList();
     final normalizedQuery = _searchQuery.trim().toLowerCase();
+    final availableIds = instantServices.map((service) => service.id).toSet();
+    final selectionAvailable =
+        _selectedServiceIds.isNotEmpty &&
+        _selectedServiceIds.every(availableIds.contains);
     final visibleServices = instantServices.where((service) {
       return normalizedQuery.isEmpty ||
           service.name.toLowerCase().contains(normalizedQuery) ||
@@ -776,7 +783,7 @@ class _InstantServiceSelectionScreenState
           minimum: const EdgeInsets.fromLTRB(18, 10, 18, 14),
           child: FilledButton.icon(
             key: const ValueKey('continue-instant-services'),
-            onPressed: _selectedServiceIds.isEmpty
+            onPressed: !selectionAvailable
                 ? null
                 : () => _continueToBooking(salon),
             icon: const Icon(Icons.arrow_forward_rounded),
@@ -833,11 +840,14 @@ class _InstantServiceSelectionScreenState
             const Divider(height: 1),
             Expanded(
               child: visibleServices.isEmpty
-                  ? const EmptyState(
+                  ? EmptyState(
                       icon: Icons.design_services_outlined,
-                      title: 'No instant services available',
-                      message:
-                          'Try again while the salon is accepting instant bookings.',
+                      title: salon.instantBookingsEnabled
+                          ? 'No instant services available'
+                          : 'Instant bookings paused',
+                      message: salon.instantBookingsEnabled
+                          ? 'Try again while the salon is accepting instant bookings.'
+                          : 'This salon is not accepting instant requests. You can still schedule an appointment.',
                     )
                   : ListView.separated(
                       padding: const EdgeInsets.all(18),
@@ -876,6 +886,12 @@ class _InstantServiceSelectionScreenState
 
   void _continueToBooking(Salon salon) {
     final selected = _selectedServiceIds.toList();
+    final appState = AppStateScope.read(context);
+    if (selected.isEmpty ||
+        !appState.isInstantMultiServiceBookingAvailable(salon.id, selected)) {
+      setState(() {});
+      return;
+    }
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => SalonBookingScreen(

@@ -191,6 +191,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                   const SizedBox(height: 12),
                   TextFormField(
                     controller: _phoneController,
+                    onChanged: (_) => setState(() {}),
                     keyboardType: TextInputType.phone,
                     decoration: const InputDecoration(
                       labelText: 'Owner phone number',
@@ -199,6 +200,26 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
                       prefixIcon: Icon(Icons.phone_outlined),
                     ),
                     validator: _phone,
+                  ),
+                  TextButton.icon(
+                    key: const ValueKey('enable-owner-phone-login'),
+                    onPressed:
+                        _isSaving ||
+                            appState.isOwnerPhoneLoginEnabled(
+                              _phoneController.text,
+                            )
+                        ? null
+                        : () => _saveProfile(context),
+                    icon: Icon(
+                      appState.isOwnerPhoneLoginEnabled(_phoneController.text)
+                          ? Icons.verified_outlined
+                          : Icons.phonelink_lock_outlined,
+                    ),
+                    label: Text(
+                      appState.isOwnerPhoneLoginEnabled(_phoneController.text)
+                          ? 'Phone login enabled'
+                          : 'Save and enable phone login',
+                    ),
                   ),
                   const SizedBox(height: 12),
                   TextFormField(
@@ -264,7 +285,7 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
               ),
             ),
             const SizedBox(height: 24),
-            const SectionHeader(title: 'Private payment details'),
+            const SectionHeader(title: 'UPI payout details'),
             const SizedBox(height: 10),
             _SalonPaymentDetailsCard(
               upiIdController: _upiIdController,
@@ -371,7 +392,11 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      await showAppErrorDialog(context, friendlyOnboardingError(error));
+      await showAppErrorDialog(
+        context,
+        friendlyOnboardingError(error),
+        onRetry: () => _addMasterServices(context),
+      );
     } finally {
       if (mounted) {
         setState(() => _isImportingServices = false);
@@ -581,6 +606,10 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
+      // Phone login is set up from the account menu, not here. Interrupting
+      // a listing save with an OTP prompt made it feel like part of
+      // onboarding, so owners dismissed it and never found it again.
+      if (!context.mounted) return;
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('Listing saved')));
@@ -588,7 +617,11 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      await showAppErrorDialog(context, friendlyOnboardingError(error));
+      await showAppErrorDialog(
+        context,
+        friendlyOnboardingError(error),
+        onRetry: () => _saveProfile(context),
+      );
     } finally {
       if (mounted) {
         setState(() => _isSaving = false);
@@ -657,7 +690,11 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      await showAppErrorDialog(context, friendlyOnboardingError(error));
+      await showAppErrorDialog(
+        context,
+        friendlyOnboardingError(error),
+        onRetry: () => _pickAndUploadSalonPhotos(context),
+      );
     } finally {
       if (mounted) {
         setState(() => _isUploadingPhotos = false);
@@ -680,12 +717,16 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       ).saveOwnerPaymentUpiId(_upiIdController.text);
       if (!context.mounted) return;
       _upiIdController.text = AppStateScope.read(context).ownerPaymentUpiId;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Private payment details saved')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('UPI payout details saved')));
     } catch (error) {
       if (context.mounted) {
-        await showAppErrorDialog(context, friendlyOnboardingError(error));
+        await showAppErrorDialog(
+          context,
+          friendlyOnboardingError(error),
+          onRetry: () => _savePaymentDetails(context),
+        );
       }
     } finally {
       if (mounted) setState(() => _isSavingPaymentDetails = false);
@@ -723,12 +764,16 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
         contentType: image.mimeType,
       );
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Private payment QR code uploaded')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Payment QR code uploaded')));
     } catch (error) {
       if (context.mounted) {
-        await showAppErrorDialog(context, friendlyOnboardingError(error));
+        await showAppErrorDialog(
+          context,
+          friendlyOnboardingError(error),
+          onRetry: () => _pickAndUploadPaymentQr(context),
+        );
       }
     } finally {
       if (mounted) setState(() => _isUploadingPaymentQr = false);
@@ -745,7 +790,11 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       ).showSnackBar(const SnackBar(content: Text('Payment QR code removed')));
     } catch (error) {
       if (context.mounted) {
-        await showAppErrorDialog(context, friendlyOnboardingError(error));
+        await showAppErrorDialog(
+          context,
+          friendlyOnboardingError(error),
+          onRetry: () => _removePaymentQr(context),
+        );
       }
     } finally {
       if (mounted) setState(() => _isUploadingPaymentQr = false);
@@ -769,7 +818,11 @@ class _SalonProfileSetupScreenState extends State<SalonProfileSetupScreen> {
       if (!context.mounted) {
         return;
       }
-      await showAppErrorDialog(context, friendlyOnboardingError(error));
+      await showAppErrorDialog(
+        context,
+        friendlyOnboardingError(error),
+        onRetry: () => _removeSalonPhoto(context, photoUrl),
+      );
     } finally {
       if (mounted) {
         setState(() => _isUploadingPhotos = false);
@@ -851,11 +904,6 @@ class _SalonPaymentDetailsCard extends StatelessWidget {
                       'UPI payout details',
                       style: Theme.of(context).textTheme.titleMedium,
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Only your salon account and the Pritze backend team can access these details. Customers cannot see them.',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
                   ],
                 ),
               ),
@@ -878,7 +926,6 @@ class _SalonPaymentDetailsCard extends StatelessWidget {
             decoration: const InputDecoration(
               labelText: 'UPI ID',
               hintText: 'salonname@bank',
-              helperText: 'Used privately by Pritze for salon payouts.',
               prefixIcon: Icon(Icons.alternate_email),
             ),
           ),
@@ -1453,7 +1500,11 @@ class _ServiceCardState extends State<_ServiceCard> {
       }
     } catch (error) {
       if (context.mounted) {
-        await showAppErrorDialog(context, friendlyOnboardingError(error));
+        await showAppErrorDialog(
+          context,
+          friendlyOnboardingError(error),
+          onRetry: () => _savePrice(context),
+        );
       }
     } finally {
       if (mounted) {
@@ -1481,7 +1532,15 @@ class _ServiceCardState extends State<_ServiceCard> {
       if (!context.mounted) {
         return;
       }
-      await showAppErrorDialog(context, friendlyOnboardingError(error));
+      await showAppErrorDialog(
+        context,
+        friendlyOnboardingError(error),
+        onRetry: () => _updateServiceControls(
+          context,
+          isAvailable: isAvailable,
+          instantBookingEnabled: instantBookingEnabled,
+        ),
+      );
     }
   }
 

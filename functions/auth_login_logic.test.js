@@ -54,10 +54,19 @@ test("phone-role conflict messages clearly identify both roles", () => {
 });
 
 test("a profile phone cannot silently become another owner login", () => {
-  assert.equal(
-    sameRolePhoneConflictMessage("owner"),
-    "Unable to log in because this phone number is already registered to " +
-      "another salon owner account. Use the original login method.",
+  const message = sameRolePhoneConflictMessage("owner");
+  // Never auto-link: proving control of the number does not prove ownership
+  // of the account that registered it. The message must instead say how to
+  // make this number usable, which the previous wording did not.
+  assert.match(message, /sign in with google or email/i);
+  assert.match(message, /turn on phone login/i);
+  assert.doesNotMatch(message, /use the original login method/i);
+});
+
+test("a customer phone conflict points at the original sign-in method", () => {
+  assert.match(
+    sameRolePhoneConflictMessage("customer"),
+    /belongs to another customer account/i,
   );
 });
 

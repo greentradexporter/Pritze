@@ -7,7 +7,9 @@ const {
   calculateDiscountQuote,
   discountBudgetAllows,
   discountCampaignEligible,
+  discountCampaignForContext,
   discountCampaignSelectableAtCheckout,
+  discountPayoutMultiplier,
 } = require("./discount_logic");
 
 const context = {
@@ -40,9 +42,69 @@ test("a ten-percent discount pays the salon twice the discount", () => {
     discountBaseAmount: 100,
     discountAmount: 10,
     customerPayableAmount: 90,
+    payoutMultiplierApplied: 2,
+    salonPayoutPercentApplied: 200,
+    cashbackProinAmount: 0,
+    cashbackValidityDays: 0,
+    cashbackProgramId: "",
     pritzePayoutAmount: 20,
     salonTotalEarning: 110,
   });
+});
+
+test("the global vault multiplier controls salon-funded discount burn", () => {
+  const salonCampaign = {
+    discountType: "fixed",
+    fixedDiscountAmount: 10,
+    payoutMultiplier: 7,
+    fundingSource: "salon_promotion_credits",
+  };
+  const multiplier = discountPayoutMultiplier(salonCampaign, {
+    salonDiscountBurnMultiplier: 1.5,
+  });
+  const quote = calculateDiscountQuote(
+    "salon-campaign",
+    salonCampaign,
+    100,
+    100,
+    multiplier,
+  );
+  assert.equal(multiplier, 1.5);
+  assert.equal(quote.payoutMultiplierApplied, 1.5);
+  assert.equal(quote.pritzePayoutAmount, 15);
+  assert.equal(discountPayoutMultiplier({
+    ...salonCampaign,
+    fundingSource: "platform_vault",
+    payoutMultiplier: 3,
+  }, {salonDiscountBurnMultiplier: 1.5}), 3);
+});
+
+test("a campaign can vary salon compensation by the customer's booking number", () => {
+  const campaign = {
+    discountType: "fixed",
+    fixedDiscountAmount: 100,
+    fundingSource: "salon_promotion_credits",
+    salonPayoutPercent: 50,
+    salonPayoutPercentByBookingNumber: {1: 100, 2: 0, 3: 2},
+  };
+  assert.equal(discountPayoutMultiplier(campaign, {}, 1), 1);
+  assert.equal(discountPayoutMultiplier(campaign, {}, 2), 0);
+  assert.equal(discountPayoutMultiplier(campaign, {}, 3), 0.02);
+  assert.equal(discountPayoutMultiplier(campaign, {}, 4), 0.5);
+
+  const secondBooking = calculateDiscountQuote(
+    "booking-two", campaign, 200, 200,
+    discountPayoutMultiplier(campaign, {}, 2),
+  );
+  assert.equal(secondBooking.discountAmount, 100);
+  assert.equal(secondBooking.pritzePayoutAmount, 0);
+  assert.equal(secondBooking.salonPayoutPercentApplied, 0);
+  assert.equal(discountBudgetAllows({
+    totalPayoutBudget: 0,
+    maximumUsesPerCustomer: 2,
+  }, secondBooking, {
+    campaign: {}, salon: {}, customer: {}, vault: {availableAmount: 0},
+  }), true);
 });
 
 test("a fixed voucher discounts the configured rupee amount", () => {
@@ -124,6 +186,62 @@ test("campaigns can target booking number, salon history, salon and service", ()
     ...context,
     salonCompletedCount: 1,
   }), false);
+});
+
+test("one journey campaign resolves different rewards by booking number", () => {
+  const campaign = {
+    active: true,
+    name: "Customer journey",
+    journeyCountScope: "platform",
+    maximumUsesPerCustomer: 4,
+    journeyMilestones: [
+      {bookingNumber: 1, rewardType: "discount", discountType: "percent", discountPercent: 10},
+      {bookingNumber: 2, rewardType: "discount_proin", discountType: "fixed", fixedDiscountAmount: 20, cashbackProinAmount: 40, cashbackValidityDays: 30},
+      {bookingNumber: 3, rewardType: "proin", discountType: "none", cashbackProinAmount: 80, cashbackValidityDays: 45},
+      {bookingNumber: 10, rewardType: "discount", discountType: "fixed", fixedDiscountAmount: 50},
+    ],
+  };
+  const first = discountCampaignForContext(campaign, context);
+  assert.equal(first.discountPercent, 10);
+  assert.equal(first.cashbackProinAmount, 0);
+  const second = discountCampaignForContext(campaign, {
+    ...context,
+    completedBookingCount: 1,
+  });
+  assert.equal(second.fixedDiscountAmount, 20);
+  assert.equal(second.cashbackProinAmount, 40);
+  const thirdContext = {...context, completedBookingCount: 2};
+  const third = discountCampaignForContext(campaign, thirdContext);
+  assert.equal(discountCampaignEligible(campaign, thirdContext), true);
+  const proinOnlyQuote = calculateDiscountQuote(
+    "journey",
+    third,
+    100,
+  );
+  assert.equal(proinOnlyQuote.discountAmount, 0);
+  assert.equal(proinOnlyQuote.cashbackProinAmount, 80);
+  assert.equal(discountBudgetAllows(campaign, proinOnlyQuote, {
+    campaign: {}, salon: {}, customer: {}, vault: {availableAmount: 0},
+  }), true);
+  assert.equal(discountCampaignEligible(campaign, {
+    ...context,
+    completedBookingCount: 3,
+  }), false);
+});
+
+test("salon-scoped journeys count only completed visits at that salon", () => {
+  const campaign = {
+    active: true,
+    journeyCountScope: "salon",
+    journeyMilestones: [
+      {bookingNumber: 2, rewardType: "discount", discountType: "fixed", fixedDiscountAmount: 25},
+    ],
+  };
+  assert.equal(discountCampaignEligible(campaign, {
+    ...context,
+    completedBookingCount: 8,
+    salonCompletedCount: 1,
+  }), true);
 });
 
 test("checkout offers require selection and hide private vouchers", () => {
@@ -238,8 +356,8 @@ test("platform-funded discounts still use the central vault only", () => {
 
 test("shown quotes are consumed and financial totals are tracked server-side", () => {
   const source = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
-  assert.match(source, /exports\.listCheckoutDiscountOffers = onCall/);
-  assert.match(source, /exports\.applyVisibleCheckoutDiscount = onCall/);
+  assert.match(source, /exports\.listCheckoutDiscountOffers = onMobileCall/);
+  assert.match(source, /exports\.applyVisibleCheckoutDiscount = onMobileCall/);
   assert.match(source, /visibleAtCheckout === true/);
   assert.match(source, /collection\("discountQuotes"\)\.doc/);
   assert.match(source, /lockedDiscountQuoteError/);
@@ -248,4 +366,6 @@ test("shown quotes are consumed and financial totals are tracked server-side", (
   assert.match(source, /collection\("discountPlatformTotals"\)/);
   assert.match(source, /collection\("discountSalonPromotionCreditReservations"\)/);
   assert.match(source, /collection\("salonPromotionCreditUsage"\)/);
+  assert.match(source, /loadDiscountCandidateFunding/);
+  assert.match(source, /firestore\.getAll\(/);
 });

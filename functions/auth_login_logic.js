@@ -55,10 +55,19 @@ function loginRoleConflictMessage(requestedRole, existingRole, hasPhone) {
     `is already registered as a ${existingLabel}.`;
 }
 
+// Reached when the phone is registered to a different account than the one
+// signing in — typically an owner who registered with Google and is now
+// trying the phone tab, which Firebase treats as a separate identity. The
+// old wording ("use the original login method") named neither the method
+// nor the way to make this number work in future.
 function sameRolePhoneConflictMessage(role) {
-  const roleLabel = role === "owner" ? "salon owner" : "customer";
-  return `Unable to log in because this phone number is already registered ` +
-    `to another ${roleLabel} account. Use the original login method.`;
+  if (role === "owner") {
+    return "This phone number belongs to a salon account that signs in a " +
+      "different way. Sign in with Google or email, then turn on phone " +
+      "login from your salon listing to use this number next time.";
+  }
+  return "This phone number belongs to another customer account. Sign in " +
+    "the same way that account was created.";
 }
 
 function phoneKey(phone) {

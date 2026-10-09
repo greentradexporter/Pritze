@@ -25,7 +25,10 @@ test("Phase 4 arrival writes stay behind customer-owned callables", () => {
     "updateCustomerArrivalLocation",
     "stopCustomerArrivalSharing",
   ]) {
-    assert.match(functionSource, new RegExp(`exports\\.${callable} = onCall`));
+    assert.match(
+      functionSource,
+      new RegExp(`exports\\.${callable} = onMobileCall`),
+    );
   }
   assert.match(functionSource, /requireCustomerArrivalBooking\(booking, uid\)/);
   assert.match(functionSource, /exports\.expireCustomerArrivalSharing = onSchedule/);

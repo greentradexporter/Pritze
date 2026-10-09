@@ -254,7 +254,12 @@ function normalizeProinProgramInput(input = {}) {
   };
 }
 
-function proinProgramGrantAllowed({program, usage = {}, nowMillis}) {
+function proinProgramGrantAllowed({
+  program,
+  usage = {},
+  nowMillis,
+  rewardAmountProin = null,
+}) {
   if (program?.active !== true) {
     return {allowed: false, reason: "This Proin program is paused."};
   }
@@ -264,7 +269,8 @@ function proinProgramGrantAllowed({program, usage = {}, nowMillis}) {
     return {allowed: false, reason: "This Proin program is not currently open."};
   }
   const reward = proinInteger(
-    program.rewardAmountProin,
+    rewardAmountProin === null || rewardAmountProin === undefined ?
+      program.rewardAmountProin : rewardAmountProin,
     "Reward amount",
     {allowZero: false},
   );

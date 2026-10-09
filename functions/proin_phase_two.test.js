@@ -11,7 +11,7 @@ const backendSource = fs.readFileSync(
 
 test("Phase 2 coupon writes stay server-only and idempotent", () => {
   assert.match(indexSource, /exports\.upsertProinCouponAsAdmin = onCall/);
-  assert.match(indexSource, /exports\.claimProinCoupon = onCall/);
+  assert.match(indexSource, /exports\.claimProinCoupon = onMobileCall/);
   assert.match(indexSource, /collection: "proinCouponAttempts"/);
   assert.match(backendSource, /collection\("proinCouponClaims"\)/);
   assert.match(backendSource, /collection\("proinCouponUsage"\)/);

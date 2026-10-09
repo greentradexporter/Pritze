@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
@@ -12,21 +14,59 @@ import 'state/app_state.dart';
 import 'theme/app_theme.dart';
 import 'widgets/trimtime_logo.dart';
 import 'widgets/customer_booking_confirmation_gate.dart';
+import 'widgets/ios_owner_booking_request_gate.dart';
 import 'widgets/app_update_prompt.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await ReferralLinkService.initialize();
-  final firebase = await FirebaseBootstrap.initialize();
+  // Draw a native-looking Flutter launch screen immediately. Firebase core is
+  // local work, but starting it before `runApp` used to leave iOS showing its
+  // static launch screen until all plugin setup had reached Dart.
+  runApp(const PritzeBootstrapApp());
+}
 
-  if (!firebase.enabled) {
-    runApp(FirebaseUnavailableApp(error: firebase.error));
-    return;
+class PritzeBootstrapApp extends StatefulWidget {
+  const PritzeBootstrapApp({super.key});
+
+  @override
+  State<PritzeBootstrapApp> createState() => _PritzeBootstrapAppState();
+}
+
+class _PritzeBootstrapAppState extends State<PritzeBootstrapApp> {
+  FirebaseBootstrap? _firebase;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_startFirebase());
   }
-  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
-  runApp(
-    AppStateProvider(
+  Future<void> _startFirebase() async {
+    final firebase = await FirebaseBootstrap.initialize();
+    if (!mounted) return;
+    if (firebase.enabled) {
+      FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+    }
+    setState(() => _firebase = firebase);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final firebase = _firebase;
+    if (firebase == null) {
+      return MaterialApp(
+        title: 'Pritze',
+        theme: AppTheme.build(),
+        home: const _SessionRestoreScreen(),
+        debugShowCheckedModeBanner: false,
+      );
+    }
+
+    if (!firebase.enabled) {
+      return FirebaseUnavailableApp(error: firebase.error);
+    }
+
+    return AppStateProvider(
       createAppState: () => FirebaseAppState(
         firestore: firebase.firestore!,
         functions: firebase.functions!,
@@ -35,23 +75,48 @@ Future<void> main() async {
         storage: firebase.storage!,
       ),
       child: const TrimtimeApp(),
-    ),
-  );
+    );
+  }
 }
 
-class TrimtimeApp extends StatelessWidget {
+class TrimtimeApp extends StatefulWidget {
   const TrimtimeApp({super.key});
+
+  @override
+  State<TrimtimeApp> createState() => _TrimtimeAppState();
+}
+
+class _TrimtimeAppState extends State<TrimtimeApp> {
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
+  @override
+  void initState() {
+    super.initState();
+    // Deep-link discovery is useful for referral onboarding, but asking the
+    // operating system for an initial link must never delay the first frame.
+    unawaited(ReferralLinkService.initialize());
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: _navigatorKey,
       title: 'Pritze',
       theme: AppTheme.build(),
-      // Keep the update prompt inside the app Navigator so its mandatory
-      // dialog can always be presented above the currently visible route.
-      home: const AppUpdatePrompt(
-        child: CustomerBookingConfirmationGate(child: AppEntryScreen()),
+      // These listeners must outlive individual pages. Several customer and
+      // owner navigation flows replace the complete route stack, so placing
+      // them in `home` silently disabled popups after the first navigation.
+      builder: (context, child) => AppUpdatePrompt(
+        navigatorKey: _navigatorKey,
+        child: IosOwnerBookingRequestGate(
+          navigatorKey: _navigatorKey,
+          child: CustomerBookingConfirmationGate(
+            navigatorKey: _navigatorKey,
+            child: child ?? const SizedBox.shrink(),
+          ),
+        ),
       ),
+      home: const AppEntryScreen(),
       debugShowCheckedModeBanner: false,
     );
   }

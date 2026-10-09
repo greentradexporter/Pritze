@@ -7,7 +7,7 @@ const TERMINAL_BOOKING_STATUSES = new Set([
 const INSTANT_ARRIVAL_MINUTES = new Set([15, 20, 25]);
 const RESCHEDULE_CUTOFF_MS = 2 * 60 * 60 * 1000;
 const SALON_ARRIVAL_GRACE_MS = 5 * 60 * 1000;
-const INSTANT_RESPONSE_TIMEOUT_MS = 150 * 1000;
+const INSTANT_RESPONSE_TIMEOUT_MS = 120 * 1000;
 const SERVICE_AUTO_COMPLETE_GRACE_MS = 5 * 60 * 1000;
 
 function asMillis(value) {
@@ -49,6 +49,24 @@ function shouldAutoCompleteService(booking, nowMillis = Date.now()) {
   return Number.isFinite(deadline) && nowMillis >= deadline;
 }
 
+function instantResponseDeadlineMillis(booking) {
+  const createdAtMillis = asMillis(booking?.createdAt);
+  return Number.isFinite(createdAtMillis) ?
+    createdAtMillis + INSTANT_RESPONSE_TIMEOUT_MS : NaN;
+}
+
+function shouldAlertOwnerForBooking(booking, nowMillis = Date.now()) {
+  const deadline = instantResponseDeadlineMillis(booking);
+  return booking?.isInstant === true && booking.status === "pending" &&
+    Number.isFinite(deadline) && nowMillis < deadline;
+}
+
+function isInstantEnabledForSalon(salon) {
+  // The owner switch remains off until the owner explicitly enables it.
+  // Legacy pause dates must never override an explicit false value.
+  return Boolean(salon) && salon.instantBookingsEnabled !== false;
+}
+
 function isBlockingBooking(booking, nowMillis = Date.now()) {
   if (!booking || TERMINAL_BOOKING_STATUSES.has(booking.status)) {
     return false;
@@ -58,7 +76,8 @@ function isBlockingBooking(booking, nowMillis = Date.now()) {
   }
   if (booking.status === "pending") {
     if (booking.isInstant === true) {
-      return true;
+      const responseDeadline = instantResponseDeadlineMillis(booking);
+      return Number.isFinite(responseDeadline) && nowMillis < responseDeadline;
     }
     return nowMillis < asMillis(booking.start);
   }
@@ -138,6 +157,10 @@ function bookingTransitionError({
     }
     if (nextStatus !== "confirmed") {
       return "An instant request can only be accepted or rejected.";
+    }
+    const deadline = instantResponseDeadlineMillis(booking);
+    if (Number.isFinite(deadline) && nowMillis >= deadline) {
+      return "This instant request has expired. Ask the customer to book again.";
     }
     return null;
   }
@@ -250,11 +273,14 @@ module.exports = {
   bookingEndMillis,
   bookingTransitionError,
   canRescheduleBooking,
+  instantResponseDeadlineMillis,
   isBlockingBooking,
+  isInstantEnabledForSalon,
   isWithinSalonHours,
   parseClockMinutes,
   serviceAutoCompleteAtMillis,
   shouldAutoCompleteService,
+  shouldAlertOwnerForBooking,
   slotSegmentMillis,
   zonedDateParts,
 };

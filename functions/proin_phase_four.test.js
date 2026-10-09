@@ -40,7 +40,7 @@ test("Phase 4 gives customers a server-filtered Proin statement", () => {
     "lib/screens/customer/customer_profile_screen.dart",
   );
 
-  assert.match(indexSource, /exports\.getCustomerProinActivity = onCall/);
+  assert.match(indexSource, /exports\.getCustomerProinActivity = onMobileCall/);
   assert.match(backendSource, /where\("walletId", "==", walletId\)/);
   assert.match(backendSource, /orderBy\("createdAt", "desc"\)/);
   assert.match(stateSource, /refreshCustomerProinActivity/);
@@ -59,8 +59,8 @@ test("salon owners can view only their promotional credit wallet and expiry", ()
     "lib/screens/salon/salon_dashboard_screen.dart",
   );
 
-  assert.match(indexSource, /exports\.getSalonProinWallet = onCall/);
-  assert.match(indexSource, /exports\.claimSalonProinCoupon = onCall/);
+  assert.match(indexSource, /exports\.getSalonProinWallet = onMobileCall/);
+  assert.match(indexSource, /exports\.claimSalonProinCoupon = onMobileCall/);
   assert.match(indexSource, /salonSnapshot\.data\(\)\?\.ownerUid/);
   assert.match(backendSource, /salonWalletData/);
   assert.match(backendSource, /salon_promotion_credits/);

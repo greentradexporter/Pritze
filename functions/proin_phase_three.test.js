@@ -18,7 +18,10 @@ test("Phase 3 Proin redemption is server-authoritative", () => {
     "claimProinCoupon",
     "applyCheckoutCoupon",
   ]) {
-    assert.match(indexSource, new RegExp(`exports\\.${callable} = onCall`));
+    assert.match(
+      indexSource,
+      new RegExp(`exports\\.${callable} = onMobileCall`),
+    );
   }
   assert.match(indexSource, /enforceAppCheck: true/);
   assert.match(indexSource, /requestedProin/);

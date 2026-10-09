@@ -9,6 +9,7 @@ function signedMoney(value) {
 }
 
 const DEFAULT_SALON_PROMOTION_CREDIT_LIMIT = 1000;
+const DEFAULT_SALON_DISCOUNT_BURN_MULTIPLIER = 2;
 const DISCOUNT_FUNDING_SOURCES = Object.freeze([
   "salon_promotion_credits",
   "platform_vault",
@@ -39,15 +40,47 @@ function timestampMillis(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function discountJourneyBookingNumber(campaign, context) {
+  return campaign?.journeyCountScope === "salon" ?
+    money(context.salonCompletedCount) + 1 :
+    money(context.completedBookingCount) + 1;
+}
+
+function discountCampaignForContext(campaign, context) {
+  const milestones = Array.isArray(campaign?.journeyMilestones) ?
+    campaign.journeyMilestones : [];
+  if (milestones.length === 0) return campaign;
+  const bookingNumber = discountJourneyBookingNumber(campaign, context);
+  const milestone = milestones.find((item) =>
+    money(item?.bookingNumber) === bookingNumber,
+  );
+  if (!milestone) return null;
+  const rewardType = ["discount", "discount_proin", "proin"]
+    .includes(milestone.rewardType) ? milestone.rewardType : "discount";
+  const includesDiscount = rewardType !== "proin";
+  const includesProin = rewardType !== "discount";
+  return {
+    ...campaign,
+    discountType: includesDiscount && milestone.discountType === "percent" ?
+      "percent" : "fixed",
+    discountPercent: includesDiscount ?
+      Number(milestone.discountPercent) || 0 : 0,
+    fixedDiscountAmount: includesDiscount ?
+      money(milestone.fixedDiscountAmount) : 0,
+    maximumDiscountAmount: includesDiscount ?
+      money(milestone.maximumDiscountAmount) : 0,
+    cashbackProinAmount: includesProin ?
+      money(milestone.cashbackProinAmount) : 0,
+    cashbackValidityDays: includesProin ?
+      money(milestone.cashbackValidityDays) : 0,
+    journeyMilestoneBookingNumber: bookingNumber,
+    journeyCountScope: campaign.journeyCountScope === "salon" ?
+      "salon" : "platform",
+  };
+}
+
 function discountCampaignEligible(campaign, context) {
   if (campaign?.active !== true) return false;
-  const discountType = campaign.discountType === "fixed" ? "fixed" : "percent";
-  const percent = Number(campaign.discountPercent);
-  const fixedAmount = money(campaign.fixedDiscountAmount);
-  if (discountType === "percent" &&
-      (!Number.isFinite(percent) || percent <= 0 || percent > 100)) return false;
-  if (discountType === "fixed" && fixedAmount <= 0) return false;
-  if (money(campaign.totalPayoutBudget) <= 0) return false;
   const eligibleBase = discountBaseAmount(campaign, context);
   if (eligibleBase < money(campaign.minimumServiceAmount)) return false;
 
@@ -93,6 +126,17 @@ function discountCampaignEligible(campaign, context) {
   ) {
     return false;
   }
+  const effectiveCampaign = discountCampaignForContext(campaign, context);
+  if (!effectiveCampaign) return false;
+  const discountType = effectiveCampaign.discountType === "fixed" ?
+    "fixed" : "percent";
+  const percent = Number(effectiveCampaign.discountPercent);
+  const fixedAmount = money(effectiveCampaign.fixedDiscountAmount);
+  const proinAmount = money(effectiveCampaign.cashbackProinAmount);
+  const hasDiscount = discountType === "percent" ?
+    Number.isFinite(percent) && percent > 0 && percent <= 100 :
+    fixedAmount > 0;
+  if (!hasDiscount && proinAmount <= 0) return false;
   return true;
 }
 
@@ -123,6 +167,7 @@ function calculateDiscountQuote(
   campaign,
   originalAmount,
   discountBase = originalAmount,
+  payoutMultiplierOverride = null,
 ) {
   const original = money(originalAmount);
   const eligibleAmount = Math.min(original, money(discountBase));
@@ -138,9 +183,16 @@ function calculateDiscountQuote(
     maximumDiscount > 0 ? Math.min(calculatedDiscount, maximumDiscount) :
       calculatedDiscount,
   );
-  const payoutMultiplier = Number(campaign.payoutMultiplier) > 0 ?
-    Number(campaign.payoutMultiplier) : 2;
+  const configuredMultiplier = Number(payoutMultiplierOverride);
+  const campaignMultiplier = Number(campaign.payoutMultiplier);
+  const payoutMultiplier = payoutMultiplierOverride !== null &&
+    payoutMultiplierOverride !== undefined &&
+    Number.isFinite(configuredMultiplier) &&
+    configuredMultiplier >= 0 ? configuredMultiplier :
+    Number.isFinite(campaignMultiplier) && campaignMultiplier > 0 ?
+      campaignMultiplier : DEFAULT_SALON_DISCOUNT_BURN_MULTIPLIER;
   const pritzePayoutAmount = Math.floor(discountAmount * payoutMultiplier);
+  const cashbackProinAmount = money(campaign.cashbackProinAmount);
   return {
     campaignId,
     campaignName: String(campaign.name ?? "Pritze discount").trim() ||
@@ -156,22 +208,40 @@ function calculateDiscountQuote(
     discountBaseAmount: eligibleAmount,
     discountAmount,
     customerPayableAmount: original - discountAmount,
+    payoutMultiplierApplied: payoutMultiplier,
+    salonPayoutPercentApplied: Math.round(payoutMultiplier * 10000) / 100,
+    cashbackProinAmount,
+    cashbackValidityDays: cashbackProinAmount > 0 ?
+      money(campaign.cashbackValidityDays) : 0,
+    cashbackProgramId: cashbackProinAmount > 0 ?
+      String(campaign.cashbackProgramId ?? "").trim() : "",
+    ...(money(campaign.journeyMilestoneBookingNumber) > 0 ? {
+      journeyMilestoneBookingNumber:
+        money(campaign.journeyMilestoneBookingNumber),
+      journeyCountScope: campaign.journeyCountScope === "salon" ?
+        "salon" : "platform",
+    } : {}),
     pritzePayoutAmount,
     salonTotalEarning: original - discountAmount + pritzePayoutAmount,
   };
 }
 
 function discountBudgetAllows(campaign, quote, usage) {
-  if (quote.discountAmount <= 0 || quote.pritzePayoutAmount <= 0) return false;
+  if (quote.discountAmount <= 0 && money(quote.cashbackProinAmount) <= 0) {
+    return false;
+  }
+  const payoutAmount = money(quote.pritzePayoutAmount);
   const totalUsed = money(usage.campaign?.reservedPayoutAmount) +
     money(usage.campaign?.realizedPayoutAmount);
-  if (totalUsed + quote.pritzePayoutAmount > money(campaign.totalPayoutBudget)) {
+  if (payoutAmount > 0 &&
+      totalUsed + payoutAmount > money(campaign.totalPayoutBudget)) {
     return false;
   }
   const salonBudget = money(campaign.perSalonPayoutBudget);
   const salonUsed = money(usage.salon?.reservedPayoutAmount) +
     money(usage.salon?.realizedPayoutAmount);
-  if (salonBudget > 0 && salonUsed + quote.pritzePayoutAmount > salonBudget) {
+  if (payoutAmount > 0 && salonBudget > 0 &&
+      salonUsed + payoutAmount > salonBudget) {
     return false;
   }
   const customerBudget = money(campaign.perCustomerPayoutBudget);
@@ -179,7 +249,7 @@ function discountBudgetAllows(campaign, quote, usage) {
     money(usage.customer?.realizedPayoutAmount);
   if (
     customerBudget > 0 &&
-    customerUsed + quote.pritzePayoutAmount > customerBudget
+    payoutAmount > 0 && customerUsed + payoutAmount > customerBudget
   ) {
     return false;
   }
@@ -187,8 +257,8 @@ function discountBudgetAllows(campaign, quote, usage) {
   const customerUses = money(usage.customer?.reservedUses) +
     money(usage.customer?.realizedUses);
   if (customerUses >= maximumUses) return false;
-  const vaultAllows =
-    money(usage.vault?.availableAmount) >= quote.pritzePayoutAmount;
+  if (payoutAmount === 0) return true;
+  const vaultAllows = money(usage.vault?.availableAmount) >= payoutAmount;
   if (discountFundingSource(quote || campaign) === "platform_vault") {
     return vaultAllows;
   }
@@ -200,7 +270,7 @@ function discountBudgetAllows(campaign, quote, usage) {
     DEFAULT_SALON_PROMOTION_CREDIT_LIMIT;
   return vaultAllows &&
     signedMoney(usage.salonCreditWallet?.availableProin) + creditLimit >=
-      quote.pritzePayoutAmount;
+      payoutAmount;
 }
 
 function emptyDiscountQuote(originalAmount) {
@@ -218,20 +288,57 @@ function emptyDiscountQuote(originalAmount) {
     discountBaseAmount: 0,
     discountAmount: 0,
     customerPayableAmount: original,
+    payoutMultiplierApplied: 0,
+    salonPayoutPercentApplied: 0,
+    cashbackProinAmount: 0,
+    cashbackValidityDays: 0,
+    cashbackProgramId: "",
     pritzePayoutAmount: 0,
     salonTotalEarning: original,
   };
 }
 
+function discountPayoutMultiplier(campaign, vault = {}, bookingNumber = null) {
+  const hasExplicitPercent = Object.prototype.hasOwnProperty.call(
+    campaign || {},
+    "salonPayoutPercent",
+  );
+  const perBooking = campaign?.salonPayoutPercentByBookingNumber;
+  const rulePercent = bookingNumber !== null && perBooking &&
+    Object.prototype.hasOwnProperty.call(perBooking, String(bookingNumber)) ?
+    Number(perBooking[String(bookingNumber)]) : Number.NaN;
+  const defaultPercent = Number(campaign?.salonPayoutPercent);
+  const payoutPercent = Number.isFinite(rulePercent) ? rulePercent :
+    defaultPercent;
+  if ((hasExplicitPercent || Number.isFinite(rulePercent)) &&
+      Number.isFinite(payoutPercent) && payoutPercent >= 0 &&
+      payoutPercent <= 1000) {
+    return Math.round(payoutPercent * 100) / 10000;
+  }
+  if (discountFundingSource(campaign) === "salon_promotion_credits") {
+    const configured = Number(vault?.salonDiscountBurnMultiplier);
+    return Number.isFinite(configured) && configured >= 1 && configured <= 10 ?
+      Math.round(configured * 100) / 100 :
+      DEFAULT_SALON_DISCOUNT_BURN_MULTIPLIER;
+  }
+  const campaignMultiplier = Number(campaign?.payoutMultiplier);
+  return Number.isFinite(campaignMultiplier) && campaignMultiplier > 0 ?
+    campaignMultiplier : DEFAULT_SALON_DISCOUNT_BURN_MULTIPLIER;
+}
+
 module.exports = {
   calculateDiscountQuote,
+  DEFAULT_SALON_DISCOUNT_BURN_MULTIPLIER,
   DEFAULT_SALON_PROMOTION_CREDIT_LIMIT,
   DISCOUNT_FUNDING_SOURCES,
   discountBaseAmount,
   discountBudgetAllows,
   discountCampaignEligible,
+  discountCampaignForContext,
   discountCampaignSelectableAtCheckout,
+  discountJourneyBookingNumber,
   discountFundingSource,
+  discountPayoutMultiplier,
   emptyDiscountQuote,
   money,
   signedMoney,

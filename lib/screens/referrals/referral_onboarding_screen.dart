@@ -208,7 +208,11 @@ class _ReferralOnboardingScreenState extends State<ReferralOnboardingScreen> {
       }
     } catch (error) {
       if (mounted) {
-        await showAppErrorDialog(context, friendlyOnboardingError(error));
+        await showAppErrorDialog(
+          context,
+          friendlyOnboardingError(error),
+          onRetry: () => _complete(code),
+        );
       }
     } finally {
       if (mounted) {

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -336,6 +338,13 @@ AppErrorPresentation friendlyAuthenticationError(Object error) {
 }
 
 AppErrorPresentation friendlyOnboardingError(Object error) {
+  if (error is TimeoutException) {
+    return const AppErrorPresentation(
+      title: 'The cloud is taking longer than expected',
+      message:
+          'Your change was not confirmed yet. Check your connection and try once more.',
+    );
+  }
   if (error is FirebaseAuthException) {
     return friendlyAuthenticationError(error);
   }
@@ -352,9 +361,29 @@ AppErrorPresentation friendlyOnboardingError(Object error) {
         !lowerDetail.contains('exception') &&
         !lowerDetail.contains('permission') &&
         !lowerDetail.contains('internal');
-    if ((error.code == 'invalid-argument' || error.code == 'not-found') &&
+    if ((error.code == 'invalid-argument' ||
+            error.code == 'not-found' ||
+            error.code == 'failed-precondition') &&
         safeDetail) {
       return AppErrorPresentation(title: 'Check your details', message: detail);
+    }
+    if (const {
+      'deadline-exceeded',
+      'internal',
+      'unavailable',
+      'unknown',
+    }.contains(error.code)) {
+      return const AppErrorPresentation(
+        title: 'The cloud is temporarily slow',
+        message:
+            'Your change could not be confirmed. Check your connection and try again.',
+      );
+    }
+    if (error.code == 'permission-denied' || error.code == 'unauthenticated') {
+      return const AppErrorPresentation(
+        title: 'Session needs refreshing',
+        message: 'Please sign in again before changing salon details.',
+      );
     }
     return _genericError;
   }
@@ -399,8 +428,9 @@ String _accountConflictMessage(String raw) {
 
 Future<void> showAppErrorDialog(
   BuildContext context,
-  AppErrorPresentation error,
-) {
+  AppErrorPresentation error, {
+  VoidCallback? onRetry,
+}) {
   return showDialog<void>(
     context: context,
     builder: (dialogContext) => AlertDialog(
@@ -433,8 +463,14 @@ Future<void> showAppErrorDialog(
         SizedBox(
           width: double.infinity,
           child: FilledButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('Try again'),
+            key: const ValueKey('app-error-primary-action'),
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              if (onRetry != null) {
+                WidgetsBinding.instance.addPostFrameCallback((_) => onRetry());
+              }
+            },
+            child: Text(onRetry == null ? 'Close' : 'Try again'),
           ),
         ),
       ],

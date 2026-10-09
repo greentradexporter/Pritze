@@ -11,6 +11,8 @@ import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../services/firebase_bootstrap.dart';
+
 const _androidPackageName = 'com.trimtime.app';
 const _fallbackPlayStoreUrl =
     'https://play.google.com/store/apps/details?id=$_androidPackageName';
@@ -62,8 +64,9 @@ const appUpdateRetryDelays = <Duration>[
 
 class AppUpdatePrompt extends StatefulWidget {
   final Widget child;
+  final GlobalKey<NavigatorState>? navigatorKey;
 
-  const AppUpdatePrompt({super.key, required this.child});
+  const AppUpdatePrompt({super.key, required this.child, this.navigatorKey});
 
   @override
   State<AppUpdatePrompt> createState() => _AppUpdatePromptState();
@@ -202,9 +205,10 @@ class _AppUpdatePromptState extends State<AppUpdatePrompt> {
     required bool isIOS,
   }) async {
     try {
-      final response = await FirebaseFunctions.instance
-          .httpsCallable(isIOS ? 'getIosAppUpdate' : 'getAndroidAppUpdate')
-          .call<Map<String, dynamic>>();
+      final response =
+          await FirebaseFunctions.instanceFor(region: firebaseFunctionsRegion)
+              .httpsCallable(isIOS ? 'getIosAppUpdate' : 'getAndroidAppUpdate')
+              .call<Map<String, dynamic>>();
       return response.data;
     } catch (_) {
       final snapshot = await FirebaseFirestore.instance
@@ -219,31 +223,80 @@ class _AppUpdatePromptState extends State<AppUpdatePrompt> {
 
   Future<void> _showUpdateDialog(String storeUrl, {required bool isIOS}) {
     if (_updateDialogShown || !mounted) return Future.value();
+    final navigatorContext = widget.navigatorKey?.currentContext ?? context;
     _updateDialogShown = true;
     return showDialog<void>(
-      context: context,
+      context: navigatorContext,
       barrierDismissible: false,
-      builder: (dialogContext) => PopScope(
-        canPop: false,
-        child: AlertDialog(
-          icon: const Icon(Icons.system_update_alt_rounded),
-          title: const Text('Update available'),
-          content: const Text(
-            'A new version of Pritze is available. Update now to continue with the latest features and fixes.',
-          ),
-          actions: [
-            FilledButton.icon(
-              onPressed: () => _openStore(storeUrl, isIOS: isIOS),
-              icon: const Icon(Icons.open_in_new_rounded),
-              label: const Text('Update now'),
-            ),
-          ],
-        ),
-      ),
+      builder: (dialogContext) {
+        var openingStore = false;
+        String? storeError;
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            return PopScope(
+              canPop: false,
+              child: AlertDialog(
+                icon: const Icon(Icons.system_update_alt_rounded),
+                title: const Text('Update available'),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'A new version of Pritze is available. Update now to continue with the latest features and fixes.',
+                    ),
+                    if (storeError != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        storeError!,
+                        style: TextStyle(
+                          color: Theme.of(dialogContext).colorScheme.error,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ],
+                ),
+                actions: [
+                  FilledButton.icon(
+                    onPressed: openingStore
+                        ? null
+                        : () async {
+                            setDialogState(() {
+                              openingStore = true;
+                              storeError = null;
+                            });
+                            final opened = await _openStore(
+                              storeUrl,
+                              isIOS: isIOS,
+                            );
+                            if (!dialogContext.mounted) return;
+                            setDialogState(() {
+                              openingStore = false;
+                              if (!opened) {
+                                storeError =
+                                    'The app store could not be opened. Check your connection and try again.';
+                              }
+                            });
+                          },
+                    icon: openingStore
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.open_in_new_rounded),
+                    label: Text(openingStore ? 'Opening store…' : 'Update now'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
-  Future<void> _openStore(String fallbackUrl, {required bool isIOS}) async {
+  Future<bool> _openStore(String fallbackUrl, {required bool isIOS}) async {
     final nativeStoreUri = isIOS
         ? Uri.parse('itms-apps://itunes.apple.com/app/id$_iosAppId')
         : Uri.parse('market://details?id=$_androidPackageName');
@@ -252,7 +305,7 @@ class _AppUpdatePromptState extends State<AppUpdatePrompt> {
         nativeStoreUri,
         mode: LaunchMode.externalApplication,
       )) {
-        return;
+        return true;
       }
     } catch (_) {
       // Devices without a native store handler fall back to the HTTPS listing.
@@ -260,7 +313,11 @@ class _AppUpdatePromptState extends State<AppUpdatePrompt> {
     final webUri =
         Uri.tryParse(fallbackUrl) ??
         Uri.parse(isIOS ? _fallbackAppStoreUrl : _fallbackPlayStoreUrl);
-    await launchUrl(webUri, mode: LaunchMode.externalApplication);
+    try {
+      return await launchUrl(webUri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      return false;
+    }
   }
 
   int _readBuildNumber(Object? value) {

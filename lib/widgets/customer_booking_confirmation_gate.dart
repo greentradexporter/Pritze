@@ -3,15 +3,30 @@ import 'package:flutter/material.dart';
 import '../models/app_models.dart';
 import '../screens/customer/my_bookings_screen.dart';
 import '../screens/customer/customer_completion_receipt_screen.dart';
+import '../screens/customer/customer_home_screen.dart';
+import '../screens/customer/salon_booking_screen.dart';
 import '../state/app_state.dart';
 import '../state/app_state_scope.dart';
 import '../theme/app_theme.dart';
 import 'booking_status_timeline.dart';
 
+const customerAutomaticPopupLifetime = Duration(minutes: 2);
+
+bool isCustomerAutomaticPopupFresh(DateTime occurredAt, DateTime now) {
+  final age = now.difference(occurredAt);
+  // A small device/server clock skew must not hide a genuinely new event.
+  return age.isNegative || age <= customerAutomaticPopupLifetime;
+}
+
 class CustomerBookingConfirmationGate extends StatefulWidget {
   final Widget child;
+  final GlobalKey<NavigatorState>? navigatorKey;
 
-  const CustomerBookingConfirmationGate({super.key, required this.child});
+  const CustomerBookingConfirmationGate({
+    super.key,
+    required this.child,
+    this.navigatorKey,
+  });
 
   @override
   State<CustomerBookingConfirmationGate> createState() =>
@@ -25,26 +40,41 @@ class _CustomerBookingConfirmationGateState
   @override
   Widget build(BuildContext context) {
     final appState = AppStateScope.watch(context);
+    if (appState.activeRole != UserRole.customer) {
+      return widget.child;
+    }
     final now = DateTime.now();
-    final completedBooking = appState.customerBookings
-        .where(
-          (item) =>
-              item.status == BookingStatus.completed &&
-              item.completedAt != null &&
-              now.difference(item.completedAt!).abs() <
-                  const Duration(hours: 24) &&
-              !appState.hasSeenNotification(
-                UserRole.customer,
-                _completionKey(item),
-              ),
-        )
-        .firstOrNull;
+    final requestedCompletionId = appState.pendingCompletionReceiptBookingId;
+    final requestedCompletedBooking = requestedCompletionId.isNotEmpty
+        ? appState.customerBookings
+              .where(
+                (item) =>
+                    item.id == requestedCompletionId &&
+                    item.status == BookingStatus.completed &&
+                    item.completedAt != null &&
+                    isCustomerAutomaticPopupFresh(item.completedAt!, now),
+              )
+              .firstOrNull
+        : null;
+    final completedBooking =
+        requestedCompletedBooking ??
+        appState.customerBookings
+            .where(
+              (item) =>
+                  item.status == BookingStatus.completed &&
+                  item.completedAt != null &&
+                  isCustomerAutomaticPopupFresh(item.completedAt!, now) &&
+                  !appState.hasSeenNotification(
+                    UserRole.customer,
+                    _completionKey(item),
+                  ),
+            )
+            .firstOrNull;
     final outcomeBooking = appState.customerBookings
         .where(
           (item) =>
               _isCustomerVisibleOutcome(item) &&
-              now.difference(_outcomeAt(item)).abs() <
-                  const Duration(hours: 24) &&
+              isCustomerAutomaticPopupFresh(_outcomeAt(item), now) &&
               !_hasSeenOutcome(appState, item),
         )
         .firstOrNull;
@@ -54,8 +84,7 @@ class _CustomerBookingConfirmationGateState
               item.isInstant &&
               item.status == BookingStatus.confirmed &&
               item.acceptedAt != null &&
-              now.difference(item.acceptedAt!).abs() <
-                  const Duration(minutes: 20) &&
+              isCustomerAutomaticPopupFresh(item.acceptedAt!, now) &&
               !appState.hasSeenNotification(
                 UserRole.customer,
                 _confirmationKey(item),
@@ -65,41 +94,75 @@ class _CustomerBookingConfirmationGateState
 
     if (completedBooking != null && !_isShowingConfirmation) {
       _isShowingConfirmation = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        appState.markNotificationsSeen(UserRole.customer, [
-          _completionKey(completedBooking),
-        ]);
-        _showCompletionReceipt(completedBooking);
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) {
+          _isShowingConfirmation = false;
+          return;
+        }
+        var presented = false;
+        try {
+          await _showCompletionReceipt(completedBooking);
+          presented = true;
+        } finally {
+          if (presented) {
+            appState.markNotificationsSeen(UserRole.customer, [
+              _completionKey(completedBooking),
+            ]);
+            appState.clearPendingCompletionReceipt(completedBooking.id);
+          }
+          if (mounted) setState(() => _isShowingConfirmation = false);
+        }
       });
     } else if (outcomeBooking != null && !_isShowingConfirmation) {
       _isShowingConfirmation = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        appState.markNotificationsSeen(
-          UserRole.customer,
-          _outcomeKeys(outcomeBooking),
-        );
-        _showOutcome(outcomeBooking);
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) {
+          _isShowingConfirmation = false;
+          return;
+        }
+        var presented = false;
+        try {
+          await _showOutcome(outcomeBooking);
+          presented = true;
+        } finally {
+          if (presented) {
+            appState.markNotificationsSeen(
+              UserRole.customer,
+              _outcomeKeys(outcomeBooking),
+            );
+          }
+          if (mounted) setState(() => _isShowingConfirmation = false);
+        }
       });
     } else if (booking != null && !_isShowingConfirmation) {
       _isShowingConfirmation = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
         if (!mounted) {
+          _isShowingConfirmation = false;
           return;
         }
-        appState.markNotificationsSeen(UserRole.customer, [
-          _confirmationKey(booking),
-        ]);
-        _showConfirmation(booking);
+        var presented = false;
+        try {
+          await _showConfirmation(booking);
+          presented = true;
+        } finally {
+          if (presented) {
+            appState.markNotificationsSeen(UserRole.customer, [
+              _confirmationKey(booking),
+            ]);
+          }
+          if (mounted) setState(() => _isShowingConfirmation = false);
+        }
       });
     }
     return widget.child;
   }
 
   Future<void> _showCompletionReceipt(Booking booking) async {
+    final navigatorContext = _navigatorContext;
+    if (navigatorContext == null) return;
     await showGeneralDialog<void>(
-      context: context,
+      context: navigatorContext,
       barrierDismissible: false,
       barrierLabel: 'Service completed payment summary',
       transitionDuration: const Duration(milliseconds: 240),
@@ -108,14 +171,15 @@ class _CustomerBookingConfirmationGateState
       transitionBuilder: (context, animation, secondaryAnimation, child) =>
           FadeTransition(opacity: animation, child: child),
     );
-    if (mounted) setState(() => _isShowingConfirmation = false);
   }
 
   Future<void> _showConfirmation(Booking booking) async {
     final appState = AppStateScope.read(context);
     final salon = appState.getSalon(booking.salonId);
+    final navigatorContext = _navigatorContext;
+    if (navigatorContext == null) return;
     await showGeneralDialog<void>(
-      context: context,
+      context: navigatorContext,
       barrierDismissible: false,
       barrierLabel: 'Booking confirmed',
       transitionDuration: const Duration(milliseconds: 240),
@@ -212,8 +276,7 @@ class _CustomerBookingConfirmationGateState
                     width: double.infinity,
                     child: FilledButton.icon(
                       onPressed: () {
-                        Navigator.pop(dialogContext);
-                        Navigator.of(context).push(
+                        Navigator.of(dialogContext).pushReplacement(
                           MaterialPageRoute<void>(
                             builder: (_) => const MyBookingsScreen(),
                           ),
@@ -241,9 +304,6 @@ class _CustomerBookingConfirmationGateState
         return FadeTransition(opacity: animation, child: child);
       },
     );
-    if (mounted) {
-      setState(() => _isShowingConfirmation = false);
-    }
   }
 
   Future<void> _showOutcome(Booking booking) async {
@@ -267,9 +327,16 @@ class _CustomerBookingConfirmationGateState
         : isRejected
         ? Icons.block_rounded
         : Icons.event_busy_rounded;
+    // Being turned away does not mean the salon has nothing left today, so
+    // offer its next slot rather than sending the customer away empty handed.
+    final nextSlot = appState
+        .slotsForService(booking.salonId, booking.serviceId)
+        .firstOrNull;
+    final navigatorContext = _navigatorContext;
+    if (navigatorContext == null) return;
 
     await showGeneralDialog<void>(
-      context: context,
+      context: navigatorContext,
       barrierDismissible: false,
       barrierLabel: title,
       transitionDuration: const Duration(milliseconds: 240),
@@ -346,12 +413,44 @@ class _CustomerBookingConfirmationGateState
                     ),
                   ),
                   const SizedBox(height: 24),
+                  if (nextSlot != null) ...[
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        key: const ValueKey('rejected-book-later-slot'),
+                        onPressed: () {
+                          Navigator.of(dialogContext).pushReplacement(
+                            MaterialPageRoute<void>(
+                              builder: (_) => SalonBookingScreen(
+                                salonId: booking.salonId,
+                                serviceId: booking.serviceId,
+                              ),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.event_available_outlined),
+                        label: Text(
+                          'Book a slot from '
+                          '${appState.formatTime(nextSlot.start)}',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
                   SizedBox(
                     width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: () => Navigator.pop(dialogContext),
-                      icon: const Icon(Icons.search_rounded),
-                      label: const Text('Find another salon'),
+                    // Steps down to secondary only when a slot is offered
+                    // above it, so the dialog always has one primary action.
+                    child: _FindAnotherSalonButton(
+                      isPrimary: nextSlot == null,
+                      onPressed: () {
+                        Navigator.of(dialogContext).pushAndRemoveUntil(
+                          MaterialPageRoute<void>(
+                            builder: (_) => const CustomerHomeScreen(),
+                          ),
+                          (_) => false,
+                        );
+                      },
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -359,8 +458,7 @@ class _CustomerBookingConfirmationGateState
                     width: double.infinity,
                     child: OutlinedButton.icon(
                       onPressed: () {
-                        Navigator.pop(dialogContext);
-                        Navigator.of(context).push(
+                        Navigator.of(dialogContext).pushReplacement(
                           MaterialPageRoute<void>(
                             builder: (_) => const MyBookingsScreen(),
                           ),
@@ -380,9 +478,29 @@ class _CustomerBookingConfirmationGateState
         return FadeTransition(opacity: animation, child: child);
       },
     );
-    if (mounted) {
-      setState(() => _isShowingConfirmation = false);
-    }
+  }
+
+  BuildContext? get _navigatorContext =>
+      widget.navigatorKey?.currentContext ??
+      (Navigator.maybeOf(context)?.context);
+}
+
+class _FindAnotherSalonButton extends StatelessWidget {
+  final bool isPrimary;
+  final VoidCallback onPressed;
+
+  const _FindAnotherSalonButton({
+    required this.isPrimary,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    const icon = Icon(Icons.search_rounded);
+    const label = Text('Find another salon');
+    return isPrimary
+        ? FilledButton.icon(onPressed: onPressed, icon: icon, label: label)
+        : OutlinedButton.icon(onPressed: onPressed, icon: icon, label: label);
   }
 }
 

@@ -49,6 +49,7 @@
 		<string>geo</string>
 		<string>maps</string>
 		<string>tel</string>
+		<string>upi</string>
 		<string>whatsapp</string>
 		<string>whatsapp-api</string>
 	</array>

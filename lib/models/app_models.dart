@@ -43,6 +43,32 @@ class AppNotificationNavigation {
   });
 }
 
+class CompletedBookingUpiPaymentDetails {
+  final String bookingId;
+  final String salonId;
+  final String salonName;
+  final int amountInr;
+  final String currency;
+  final String upiId;
+  final String upiUri;
+  final String qrCodeUrl;
+  final String transactionReference;
+  final bool paymentAvailable;
+
+  const CompletedBookingUpiPaymentDetails({
+    required this.bookingId,
+    required this.salonId,
+    required this.salonName,
+    required this.amountInr,
+    this.currency = 'INR',
+    this.upiId = '',
+    this.upiUri = '',
+    this.qrCodeUrl = '',
+    this.transactionReference = '',
+    this.paymentAvailable = false,
+  });
+}
+
 extension BookingStatusLabel on BookingStatus {
   String get label {
     switch (this) {
@@ -149,6 +175,8 @@ class DiscountQuote {
   final int customerPayableAmount;
   final int pritzePayoutAmount;
   final int salonTotalEarning;
+  final int cashbackProinAmount;
+  final int cashbackValidityDays;
   final DateTime? expiresAt;
   final DateTime? campaignEndsAt;
 
@@ -167,6 +195,8 @@ class DiscountQuote {
     int? customerPayableAmount,
     this.pritzePayoutAmount = 0,
     int? salonTotalEarning,
+    this.cashbackProinAmount = 0,
+    this.cashbackValidityDays = 0,
     this.expiresAt,
     this.campaignEndsAt,
   }) : customerPayableAmount = customerPayableAmount ?? originalAmount,
@@ -204,6 +234,8 @@ class CheckoutDiscountOffer {
   final int originalAmount;
   final int discountAmount;
   final int customerPayableAmount;
+  final int cashbackProinAmount;
+  final int cashbackValidityDays;
   final DateTime? campaignEndsAt;
 
   const CheckoutDiscountOffer({
@@ -216,6 +248,8 @@ class CheckoutDiscountOffer {
     required this.originalAmount,
     required this.discountAmount,
     required this.customerPayableAmount,
+    this.cashbackProinAmount = 0,
+    this.cashbackValidityDays = 0,
     this.campaignEndsAt,
   });
 
@@ -506,6 +540,7 @@ class Salon {
   final bool isOpen;
   final bool instantBookingsEnabled;
   final String? instantBookingsPausedDate;
+  final String approvalStatus;
   final List<SalonService> services;
 
   const Salon({
@@ -526,6 +561,7 @@ class Salon {
     required this.isOpen,
     this.instantBookingsEnabled = true,
     this.instantBookingsPausedDate,
+    this.approvalStatus = 'approved',
     required this.services,
   });
 
@@ -547,6 +583,7 @@ class Salon {
     bool? isOpen,
     bool? instantBookingsEnabled,
     String? instantBookingsPausedDate,
+    String? approvalStatus,
     List<SalonService>? services,
   }) {
     return Salon(
@@ -569,6 +606,7 @@ class Salon {
           instantBookingsEnabled ?? this.instantBookingsEnabled,
       instantBookingsPausedDate:
           instantBookingsPausedDate ?? this.instantBookingsPausedDate,
+      approvalStatus: approvalStatus ?? this.approvalStatus,
       services: services ?? this.services,
     );
   }
@@ -587,6 +625,10 @@ class Salon {
 
   List<SalonService> get availableServices =>
       services.where((service) => service.isAvailable).toList(growable: false);
+
+  bool get isApproved => approvalStatus == 'approved';
+
+  bool get isPendingApproval => approvalStatus == 'pending';
 }
 
 class Barber {
@@ -661,6 +703,40 @@ class TimeSlot {
   String get key => '$barberId-${start.toIso8601String()}';
 }
 
+class BookingExtraServiceRequest {
+  const BookingExtraServiceRequest({
+    required this.id,
+    required this.proposedByRole,
+    required this.names,
+    required this.prices,
+    required this.durationMinutes,
+  });
+  final String id;
+  final String proposedByRole;
+  final Map<String, String> names;
+  final Map<String, int> prices;
+  final int durationMinutes;
+  int get amount => prices.values.fold(0, (sum, price) => sum + price);
+
+  factory BookingExtraServiceRequest.fromMap(Map data) =>
+      BookingExtraServiceRequest(
+        id: data['id'] as String,
+        proposedByRole: data['proposedByRole'] as String,
+        names: Map<String, String>.from(data['names'] as Map),
+        prices: (data['prices'] as Map).map(
+          (key, value) => MapEntry(key as String, (value as num).toInt()),
+        ),
+        durationMinutes: (data['durationMinutes'] as num).toInt(),
+      );
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'proposedByRole': proposedByRole,
+    'names': names,
+    'prices': prices,
+    'durationMinutes': durationMinutes,
+  };
+}
+
 class Booking {
   final String id;
   final String? customerUid;
@@ -675,6 +751,8 @@ class Booking {
   final String serviceName;
   final int servicePrice;
   final Map<String, int> servicePriceBreakdown;
+  final Map<String, String> serviceNameBreakdown;
+  final BookingExtraServiceRequest? extraServiceRequest;
   final int bookingFee;
   final bool paymentRequired;
   final String paymentStatus;
@@ -687,6 +765,9 @@ class Booking {
   final int customerPayableAmount;
   final int pritzePayoutAmount;
   final int salonTotalEarning;
+  final int cashbackProinAmount;
+  final int cashbackValidityDays;
+  final String discountCashbackStatus;
   final String discountStatus;
   final String proinStatus;
   final int proinRequestedAmount;
@@ -727,6 +808,8 @@ class Booking {
     this.serviceName = '',
     this.servicePrice = 0,
     this.servicePriceBreakdown = const {},
+    this.serviceNameBreakdown = const {},
+    this.extraServiceRequest,
     this.bookingFee = 0,
     this.paymentRequired = false,
     this.paymentStatus = 'not_required',
@@ -739,6 +822,9 @@ class Booking {
     int? customerPayableAmount,
     this.pritzePayoutAmount = 0,
     int? salonTotalEarning,
+    this.cashbackProinAmount = 0,
+    this.cashbackValidityDays = 0,
+    this.discountCashbackStatus = 'none',
     this.discountStatus = 'none',
     this.proinStatus = 'none',
     this.proinRequestedAmount = 0,
@@ -829,6 +915,9 @@ class Booking {
     String? serviceName,
     int? servicePrice,
     Map<String, int>? servicePriceBreakdown,
+    Map<String, String>? serviceNameBreakdown,
+    BookingExtraServiceRequest? extraServiceRequest,
+    bool clearExtraServiceRequest = false,
     int? bookingFee,
     bool? paymentRequired,
     String? paymentStatus,
@@ -841,6 +930,9 @@ class Booking {
     int? customerPayableAmount,
     int? pritzePayoutAmount,
     int? salonTotalEarning,
+    int? cashbackProinAmount,
+    int? cashbackValidityDays,
+    String? discountCashbackStatus,
     String? discountStatus,
     String? proinStatus,
     int? proinRequestedAmount,
@@ -882,6 +974,10 @@ class Booking {
       servicePrice: servicePrice ?? this.servicePrice,
       servicePriceBreakdown:
           servicePriceBreakdown ?? this.servicePriceBreakdown,
+      serviceNameBreakdown: serviceNameBreakdown ?? this.serviceNameBreakdown,
+      extraServiceRequest: clearExtraServiceRequest
+          ? null
+          : extraServiceRequest ?? this.extraServiceRequest,
       bookingFee: bookingFee ?? this.bookingFee,
       paymentRequired: paymentRequired ?? this.paymentRequired,
       paymentStatus: paymentStatus ?? this.paymentStatus,
@@ -896,6 +992,10 @@ class Booking {
           customerPayableAmount ?? this.customerPayableAmount,
       pritzePayoutAmount: pritzePayoutAmount ?? this.pritzePayoutAmount,
       salonTotalEarning: salonTotalEarning ?? this.salonTotalEarning,
+      cashbackProinAmount: cashbackProinAmount ?? this.cashbackProinAmount,
+      cashbackValidityDays: cashbackValidityDays ?? this.cashbackValidityDays,
+      discountCashbackStatus:
+          discountCashbackStatus ?? this.discountCashbackStatus,
       discountStatus: discountStatus ?? this.discountStatus,
       proinStatus: proinStatus ?? this.proinStatus,
       proinRequestedAmount: proinRequestedAmount ?? this.proinRequestedAmount,

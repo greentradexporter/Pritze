@@ -47,6 +47,22 @@ service cloud.firestore {
         hasRequiredSalonContact();
     }
 
+    function keepsSalonApprovalState() {
+      // Legacy salons were visible before the approval gate. Their owner may
+      // safely receive the approved field on the first post-upgrade edit, or
+      // leave it unset.
+      //
+      // Read through get(): rules raise an evaluation error on a missing
+      // property rather than returning null, so comparing the field directly
+      // denied every edit by exactly the legacy owners this is meant to
+      // admit. Half the live salons have no approvalStatus.
+      return resource.data.get('approvalStatus', null) == null
+        ? request.resource.data.get('approvalStatus', null) == null ||
+          request.resource.data.get('approvalStatus', null) == 'approved'
+        : request.resource.data.get('approvalStatus', null) ==
+          resource.data.get('approvalStatus', null);
+    }
+
     // Every salon uses one fixed service catalogue. Salon owners may change a
     // service's price, duration, availability and instant-booking setting, but
     // may not add, rename, reorder or remove catalogue entries.
@@ -85,6 +101,10 @@ service cloud.firestore {
         services[29].name == 'Party / Bridal Makeup.';
     }
 
+    // Allowlist, so every field the app writes to its own profile must be
+    // named here or the whole write is rejected. Sign-out and push
+    // registration write several fields in one request: one missing name
+    // silently stops a device de-registering or registering at all.
     function updatesOnlyOwnProfileFields() {
       return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
         'name',
@@ -93,10 +113,16 @@ service cloud.firestore {
         'phone',
         'provider',
         'fcmTokens',
+        'ownerAlertV4Tokens',
         'ownerAlertV3Tokens',
         'lastFcmToken',
         'notificationsEnabled',
         'ownerNotificationsEnabled',
+        // Sign-out clears this so the server stops routing owner booking
+        // alerts to a phone nobody is signed in on. Only claimLoginRole sets
+        // it; it gates notification routing, never any rule's authority,
+        // which reads the immutable 'role' field instead.
+        'activeRole',
         'fcmUpdatedAt',
         'updatedAt'
       ]);
@@ -331,10 +357,12 @@ service cloud.firestore {
       allow read: if true;
       allow create: if signedInAs('owner') &&
         request.resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.get('approvalStatus', '') == 'pending' &&
         hasRequiredSalonProfile();
       allow update: if signedInAs('owner') &&
         resource.data.ownerUid == request.auth.uid &&
         request.resource.data.ownerUid == request.auth.uid &&
+        keepsSalonApprovalState() &&
         hasRequiredSalonProfile();
       allow delete: if signedInAs('owner') &&
         resource.data.ownerUid == request.auth.uid;
