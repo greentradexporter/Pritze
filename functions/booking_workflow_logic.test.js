@@ -361,11 +361,19 @@ test("iOS update lookup has a safe App Store fallback", () => {
     "utf8",
   );
   assert.match(functionSource, /exports\.getIosAppUpdate = onMobileCall/);
-  assert.match(functionSource, /IOS_CURRENT_BUILD_NUMBER = 28/);
-  assert.match(functionSource, /IOS_NEXT_VERSION = "1\.0\.16"/);
-  assert.match(functionSource, /IOS_NEXT_BUILD_NUMBER = 29/);
+  // The shipped build comes from ios_release.json, not from constants edited
+  // by hand: those drifted nine versions behind the App Store and pinned
+  // every iOS user to build 29, so nobody was ever prompted to update.
+  assert.match(functionSource, /IOS_LAST_CONFIRMED_PUBLIC_BUILD_NUMBER = 28/);
+  assert.match(functionSource, /resolveIosUpdateVersion\(/);
+  assert.match(functionSource, /candidateBuild: iosRelease\.candidateBuildNumber/);
+  assert.match(functionSource, /candidateVersionName: iosRelease\.versionName/);
+  assert.doesNotMatch(functionSource, /IOS_NEXT_BUILD_NUMBER/);
+  assert.doesNotMatch(functionSource, /IOS_CURRENT_BUILD_NUMBER/);
+  // A failed lookup must be visible to the client rather than silently
+  // advertising a build the store may not serve.
+  assert.match(functionSource, /appStoreVerified: storeVersionName !== ""/);
   assert.match(functionSource, /itunes\.apple\.com\/lookup/);
-  assert.match(functionSource, /versionAtLeast\(publicVersion, IOS_NEXT_VERSION\)/);
   assert.match(functionSource, /doc\("ios"\)/);
   assert.match(functionSource, /apps\.apple\.com\/in\/app\/pritze\/id6792811282/);
 });

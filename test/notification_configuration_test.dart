@@ -262,6 +262,19 @@ void main() {
       'ios/Runner/Runner.entitlements',
     ).readAsStringSync();
     expect(entitlements, contains('<key>aps-environment</key>'));
+    // No salon owner is on iOS yet, so the owner alert is deliberately an
+    // ordinary notification there: iOS cannot loop a sound, and the
+    // time-sensitive entitlement would add an App ID capability the archive
+    // has to be signed against. The per-message level stays plumbed through
+    // so raising it later is a one-line change.
+    expect(
+      entitlements,
+      isNot(contains('usernotifications.time-sensitive')),
+      reason: 'adding this needs the App ID capability enabled first',
+    );
+    expect(appState, contains('interruptionLevel: InterruptionLevel.active'));
+    expect(functions, contains('message.apnsInterruptionLevel || "active"'));
+    expect(functions, isNot(contains('apnsInterruptionLevel: "')));
   });
 }
 

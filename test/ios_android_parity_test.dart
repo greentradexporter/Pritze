@@ -67,9 +67,55 @@ void main() {
       appState,
       contains('categoryIdentifier: _ownerBookingRequestDarwinCategory'),
     );
+    // iOS delivers the owner alert through APNs, so Accept and Reject arrive
+    // as RemoteMessage.actionIdentifier rather than through the local
+    // notification plugin. Reading it is the difference between the buttons
+    // deciding the booking and merely opening the app.
+    expect(appState, contains('message.actionIdentifier'));
+    // Both delivery routes must end in the same decision path.
+    expect(
+      RegExp(
+        r'_submitNotificationBookingDecision\(',
+      ).allMatches(appState).length,
+      greaterThanOrEqualTo(3),
+    );
 
     final functions = File('functions/index.js').readAsStringSync();
     expect(functions, contains('IOS_OWNER_BOOKING_REQUEST_CATEGORY'));
     expect(functions, contains('PRITZE_BOOKING_REQUEST_V2'));
+  });
+
+  test('iOS update enforcement tracks the shipped build, not a constant', () {
+    final functions = File('functions/index.js').readAsStringSync();
+    // The iOS prompt used frozen constants nobody updated, so the advertised
+    // build could never move past 29 while the App Store sat at 1.0.20.
+    expect(functions, contains('resolveIosUpdateVersion('));
+    expect(functions, contains('ios_release.json'));
+    expect(functions, isNot(contains('IOS_NEXT_BUILD_NUMBER')));
+    expect(functions, isNot(contains('IOS_CURRENT_BUILD_NUMBER')));
+    expect(
+      functions,
+      contains('IOS_LAST_CONFIRMED_PUBLIC_BUILD_NUMBER'),
+      reason: 'the floor still belongs in source',
+    );
+    // Android keeps its own release file; the two must stay symmetrical.
+    expect(File('functions/ios_release.json').existsSync(), isTrue);
+    expect(File('functions/android_release.json').existsSync(), isTrue);
+  });
+
+  test('iOS uploads declare export compliance', () {
+    // The app only uses HTTPS, which is exempt. Without this declaration every
+    // upload reaches App Store Connect as "Missing Compliance" and cannot be
+    // released to testers until someone answers the question by hand.
+    final infoPlist = File('ios/Runner/Info.plist').readAsStringSync();
+    expect(infoPlist, contains('<key>ITSAppUsesNonExemptEncryption</key>'));
+    final declaration = infoPlist.substring(
+      infoPlist.indexOf('<key>ITSAppUsesNonExemptEncryption</key>'),
+    );
+    expect(
+      declaration.trimLeft().split('\n')[1].trim(),
+      '<false/>',
+      reason: 'only HTTPS is used, so no non-exempt encryption is declared',
+    );
   });
 }

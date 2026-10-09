@@ -43,6 +43,12 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<!-- The app only uses HTTPS, which is exempt. Declaring it here answers
+	     the export compliance question at build time; without it every upload
+	     lands in App Store Connect as "Missing Compliance" and cannot be
+	     given to testers until someone answers it by hand. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>comgooglemaps</string>

@@ -4,12 +4,14 @@ const admin = require("firebase-admin");
 // made every callable pay for them on cold start, including the ones that
 // never send mail or talk to the Play Developer API.
 const androidRelease = require("./android_release.json");
+const iosRelease = require("./ios_release.json");
 const {updateBookingExtraServices} = require("./booking_extra_services");
 const {linkOwnerPhoneLogin} = require("./owner_phone_login");
 const {
   highestPublishedVersionCode,
   resolveAndroidUpdateVersion,
 } = require("./android_update_logic");
+const {resolveIosUpdateVersion} = require("./ios_update_logic");
 const {
   inferStoredRole,
   loginRoleConflictMessage,
@@ -184,9 +186,10 @@ const ANDROID_RELEASE_CACHE_MS = 5 * 60 * 1000;
 let androidReleaseCache = {expiresAt: 0, versionCode: null};
 // Keep this aligned with the newest build that is publicly downloadable.
 // Do not advance it merely because a newer build was uploaded for review.
-const IOS_CURRENT_BUILD_NUMBER = 28;
-const IOS_NEXT_VERSION = "1.0.16";
-const IOS_NEXT_BUILD_NUMBER = 29;
+// Floor only. The build being shipped lives in ios_release.json, so this no
+// longer has to be edited every release - which is why it had drifted nine
+// versions behind the App Store and pinned every iOS user to build 29.
+const IOS_LAST_CONFIRMED_PUBLIC_BUILD_NUMBER = 28;
 const IOS_APP_STORE_LOOKUP_URL =
   "https://itunes.apple.com/lookup?id=6792811282&country=in";
 const IOS_APP_STORE_URL =
@@ -275,31 +278,36 @@ exports.getIosAppUpdate = onMobileCall(
   const configured = snapshot.data() || {};
   const configuredBuildNumber = positiveInteger(
     configured.latestBuildNumber || configured.latestVersionCode,
-    IOS_CURRENT_BUILD_NUMBER,
+    IOS_LAST_CONFIRMED_PUBLIC_BUILD_NUMBER,
   );
-  let publicBuildNumber = IOS_CURRENT_BUILD_NUMBER;
+  let storeVersionName = "";
   try {
     const response = await fetch(IOS_APP_STORE_LOOKUP_URL, {
       signal: AbortSignal.timeout(8000),
     });
     if (response.ok) {
       const payload = await response.json();
-      const publicVersion = String(payload?.results?.[0]?.version || "");
-      if (versionAtLeast(publicVersion, IOS_NEXT_VERSION)) {
-        publicBuildNumber = IOS_NEXT_BUILD_NUMBER;
-      }
+      storeVersionName = String(payload?.results?.[0]?.version || "");
     }
   } catch (error) {
     console.warn("App Store version lookup failed", {
       message: error?.message || String(error),
     });
   }
-  const latestBuildNumber = publicBuildNumber >= IOS_NEXT_BUILD_NUMBER ?
-    Math.max(configuredBuildNumber, publicBuildNumber) :
-    Math.min(configuredBuildNumber, IOS_CURRENT_BUILD_NUMBER);
+  const latestBuildNumber = resolveIosUpdateVersion({
+    lastConfirmedPublicBuild: IOS_LAST_CONFIRMED_PUBLIC_BUILD_NUMBER,
+    candidateBuild: iosRelease.candidateBuildNumber,
+    candidateVersionName: iosRelease.versionName,
+    configuredBuild: configuredBuildNumber,
+    storeVersionName,
+  });
   const appStoreUrl = String(configured.appStoreUrl || "").trim() ||
     IOS_APP_STORE_URL;
-  return {latestBuildNumber, appStoreUrl};
+  return {
+    latestBuildNumber,
+    appStoreUrl,
+    appStoreVerified: storeVersionName !== "",
+  };
   },
 );
 
@@ -9774,7 +9782,11 @@ async function sendToUsers(userIds, message) {
             ? {
                 sound: message.apnsSound || "default",
                 category: message.apnsCategory || "PRITZE_BOOKING_UPDATE",
-                "interruption-level": "active",
+                // Apple asks for time-sensitive to be used sparingly, so only
+                // the owner booking request claims it. Everything else stays
+                // 'active' and is correctly suppressed by a Focus mode.
+                "interruption-level":
+                  message.apnsInterruptionLevel || "active",
               }
             : {}),
         },

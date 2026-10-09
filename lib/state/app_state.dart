@@ -523,6 +523,10 @@ Future<bool> _showUnansweredOwnerBookingAlert({
       iOS: const DarwinNotificationDetails(
         sound: 'owner_booking_request.wav',
         categoryIdentifier: _ownerBookingRequestDarwinCategory,
+        // A normal alert. iOS cannot loop a notification sound, and no salon
+        // owner is on iOS yet, so the owner alert deliberately stays an
+        // ordinary notification here. Raising this to timeSensitive also
+        // needs the matching entitlement and App ID capability.
         interruptionLevel: InterruptionLevel.active,
       ),
       macOS: const DarwinNotificationDetails(
@@ -7820,6 +7824,17 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
     }
     final destination = _notificationDestination(message.data['destination']);
     queueNotificationNavigation(destination, bookingId: bookingId);
+    // iOS shows the owner alert from APNs rather than as a local notification,
+    // so Accept and Reject arrive here as an action identifier instead of
+    // through the notification plugin. Without this the buttons only opened
+    // the app and the owner had to decide again inside it.
+    unawaited(
+      _submitNotificationBookingDecision(
+        bookingId: bookingId,
+        actionId: message.actionIdentifier?.trim() ?? '',
+        actionSource: 'notification_action_remote',
+      ),
+    );
   }
 
   void _handleLocalNotificationResponse(NotificationResponse response) {
@@ -7836,11 +7851,25 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
       queueCompletionReceipt(bookingId);
     }
     final destination = _notificationDestination(payload['destination']);
-    final actionId = response.actionId?.trim() ?? '';
+    queueNotificationNavigation(destination, bookingId: bookingId);
+    await _submitNotificationBookingDecision(
+      bookingId: bookingId,
+      actionId: response.actionId?.trim() ?? '',
+      actionSource: 'notification_action_foreground',
+    );
+  }
+
+  /// Applies an Accept or Reject tapped on the notification itself, from either
+  /// delivery route. Anything else - a plain tap, a dismiss, a non-owner
+  /// notification - is ignored.
+  Future<void> _submitNotificationBookingDecision({
+    required String bookingId,
+    required String actionId,
+    required String actionSource,
+  }) async {
     final isBookingDecision =
         actionId == _acceptInstantBookingNotificationAction ||
         actionId == _rejectInstantBookingNotificationAction;
-    queueNotificationNavigation(destination, bookingId: bookingId);
     if (!isBookingDecision || bookingId.isEmpty) {
       return;
     }
@@ -7875,7 +7904,7 @@ class FirebaseAppState extends AppState with WidgetsBindingObserver {
               'bookingId': bookingId,
               'status': nextStatus,
               'cancellationReason': '',
-              'actionSource': 'notification_action_foreground',
+              'actionSource': actionSource,
             }),
           );
         },
