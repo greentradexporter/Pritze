@@ -9,6 +9,7 @@ const {
   normalizeReferralCode,
   referralRewardSummary,
   referralTargetAllowed,
+  salonReferralsAwaitingReward,
 } = require("./referral_logic");
 
 test("referral codes are six characters with letters and numbers", () => {
@@ -113,6 +114,37 @@ test("referral rewards exclude expired campaigns and other recipients", () => {
   assert.equal(summary.salonInviterRewardProin, 0);
   assert.equal(summary.earnedSalonReferralProin, 500);
   assert.equal(summary.earnedReferralProin, 500);
+});
+
+test("a referred salon stays pending until its reward can be paid", () => {
+  const salon = (proinAwardStatus, extra = {}) => ({
+    inviterUid: "owner-1",
+    referredRole: "owner",
+    status: "qualified",
+    proinAwardStatus,
+    ...extra,
+  });
+  assert.equal(salonReferralsAwaitingReward({
+    inviterUid: "owner-1",
+    referrals: [
+      salon(undefined),
+      salon("waiting_for_admin_approval"),
+      salon("waiting_for_first_completed_booking"),
+      salon("awarded"),
+      salon("waiting_for_program"),
+      salon("partial_or_retry"),
+      salon("waiting_for_admin_approval", {inviterUid: "owner-2"}),
+      salon("waiting_for_admin_approval", {status: "pending"}),
+      salon(undefined, {referredRole: "customer"}),
+    ],
+  }), 3);
+  assert.equal(salonReferralsAwaitingReward(), 0);
+
+  const source = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
+  assert.match(source, /money\(data\.pendingSalonCount\) \+ salonsAwaitingReward/);
+  assert.match(source, /money\(data\.qualifiedSalonCount\) - salonsAwaitingReward/);
+  assert.match(source, /proinBackend\.nextReferralAwardScanPage\(/);
+  assert.match(source, /proinBackend\.nextPendingCashbackScanPage\(/);
 });
 
 test("referral codes and one-time redemptions are reserved transactionally", () => {

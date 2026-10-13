@@ -83,3 +83,16 @@ test("Phase 4 reconciliation includes settled reimbursement evidence", () => {
     /settledFromReimbursements === finance\.settledExpenseInr/,
   );
 });
+
+test("salon-funded discounts keep the Proin ledger in step", () => {
+  const indexSource = source("functions/index.js");
+  const backendSource = source("functions/proin_backend.js");
+  const discountSource = source("functions/discount_logic.js");
+
+  assert.match(indexSource, /proinBackend\.redeemSalonCreditLotsInTransaction\(/);
+  assert.match(indexSource, /let remainingLotBackedAmount = payoutAmount;/);
+  assert.match(indexSource, /refreshWalletExpiry\(salonCreditWalletToRefresh\)/);
+  assert.doesNotMatch(indexSource, /function discountSalonPromotionCreditLimit/);
+  assert.match(discountSource, /function discountSalonPromotionCreditLimit/);
+  assert.match(backendSource, /unallocatedBudgetInr: fieldValue\.increment\(redeemedProin\)/);
+});

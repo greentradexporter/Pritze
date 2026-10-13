@@ -74,6 +74,11 @@ test("Proin operations stay behind privileged Firebase callables", () => {
   assert.match(source, /The coupon code users type/);
   assert.match(source, /Referral codes/);
   assert.match(source, /View and edit the actual customer and salon referral codes/);
+  assert.match(source, /control: "proinReferralApproved"/);
+  assert.match(source, /managed by its discount campaign/);
+  assert.match(source, /Salon promotional credit is listed under the salon's name/);
+  assert.match(source, /Showing the 1,000 newest codes/);
+  assert.match(source, /Approve referral rewards/);
   assert.match(source, /Duplicate codes are rejected/);
   assert.match(source, /Customer rewards for customer Proin/);
   assert.match(source, /it does not initiate a bank or UPI transfer/i);

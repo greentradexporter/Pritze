@@ -99,10 +99,29 @@ function referralRewardSummary({
   };
 }
 
+// A salon referral is marked qualified as soon as the referred salon
+// registers, but its reward also needs referral approval and a first completed
+// booking. Until then the inviter should still see it as pending.
+const SALON_REFERRAL_WAITING_STATES = new Set([
+  "waiting_for_referred_salon",
+  "waiting_for_admin_approval",
+  "waiting_for_first_completed_booking",
+]);
+
+function salonReferralsAwaitingReward({referrals = [], inviterUid = ""} = {}) {
+  return referrals.filter((referral) =>
+    referral?.inviterUid === inviterUid &&
+    referral?.referredRole === "owner" &&
+    referral?.status === "qualified" &&
+    (!referral.proinAwardStatus ||
+      SALON_REFERRAL_WAITING_STATES.has(referral.proinAwardStatus))).length;
+}
+
 module.exports = {
   REFERRAL_CODE_PATTERN,
   generateReferralCode,
   normalizeReferralCode,
   referralRewardSummary,
   referralTargetAllowed,
+  salonReferralsAwaitingReward,
 };

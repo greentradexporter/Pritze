@@ -262,15 +262,25 @@ function discountBudgetAllows(campaign, quote, usage) {
   if (discountFundingSource(quote || campaign) === "platform_vault") {
     return vaultAllows;
   }
-  const creditLimit = Object.prototype.hasOwnProperty.call(
-    usage.vault || {},
-    "salonCreditLimitAmount",
-  ) ?
-    money(usage.vault?.salonCreditLimitAmount) :
-    DEFAULT_SALON_PROMOTION_CREDIT_LIMIT;
+  const creditLimit = discountSalonPromotionCreditLimit(
+    usage.vault,
+    usage.salonCreditWallet,
+  );
   return vaultAllows &&
     signedMoney(usage.salonCreditWallet?.availableProin) + creditLimit >=
       payoutAmount;
+}
+
+// A limit set for one salon wins over the platform-wide credit line, so the
+// offer shown at checkout and the booking reservation agree on what is left.
+function discountSalonPromotionCreditLimit(vault, wallet) {
+  if (Object.prototype.hasOwnProperty.call(wallet || {}, "creditLimitProin")) {
+    return money(wallet.creditLimitProin);
+  }
+  if (Object.prototype.hasOwnProperty.call(vault || {}, "salonCreditLimitAmount")) {
+    return money(vault.salonCreditLimitAmount);
+  }
+  return DEFAULT_SALON_PROMOTION_CREDIT_LIMIT;
 }
 
 function emptyDiscountQuote(originalAmount) {
@@ -339,6 +349,7 @@ module.exports = {
   discountJourneyBookingNumber,
   discountFundingSource,
   discountPayoutMultiplier,
+  discountSalonPromotionCreditLimit,
   emptyDiscountQuote,
   money,
   signedMoney,

@@ -162,6 +162,7 @@ test("Firestore rules isolate referral, discount and Proin financial state", {
       "proinFinance/current",
       "proinIdempotencyKeys/key-1",
       "proinReconciliationReports/report-1",
+      "proinJobState/referralAwardRetry",
       "proinCoupons/coupon-hash",
       "proinCouponVersions/coupon-hash__v1",
       "proinCouponUsage/coupon-hash",

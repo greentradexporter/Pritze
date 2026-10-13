@@ -10,6 +10,7 @@ const {
   discountCampaignForContext,
   discountCampaignSelectableAtCheckout,
   discountPayoutMultiplier,
+  discountSalonPromotionCreditLimit,
 } = require("./discount_logic");
 
 const context = {
@@ -331,6 +332,42 @@ test("salon-funded discounts can use a configurable negative credit line", () =>
     ...usage,
     vault: {availableAmount: 1000, salonCreditLimitAmount: 0},
   }), false);
+});
+
+test("a salon's own credit limit decides its salon-funded discounts", () => {
+  const campaign = {
+    totalPayoutBudget: 2000,
+    fundingSource: "salon_promotion_credits",
+    maximumUsesPerCustomer: 10,
+  };
+  const quote = calculateDiscountQuote("campaign", {
+    discountType: "fixed",
+    fixedDiscountAmount: 50,
+    payoutMultiplier: 1,
+    fundingSource: "salon_promotion_credits",
+  }, 1000);
+  const usage = {
+    campaign: {},
+    salon: {},
+    customer: {},
+    vault: {availableAmount: 1000, salonCreditLimitAmount: 1000},
+  };
+  assert.equal(quote.pritzePayoutAmount, 50);
+  // A lower limit for this salon stops the offer before checkout, so the
+  // booking is never refused when the credit is reserved.
+  assert.equal(discountBudgetAllows(campaign, quote, {
+    ...usage,
+    salonCreditWallet: {availableProin: 0, creditLimitProin: 0},
+  }), false);
+  assert.equal(discountBudgetAllows(campaign, quote, {
+    ...usage,
+    salonCreditWallet: {availableProin: -1000, creditLimitProin: 2000},
+  }), true);
+  assert.equal(
+    discountSalonPromotionCreditLimit({salonCreditLimitAmount: 700}, {}),
+    700,
+  );
+  assert.equal(discountSalonPromotionCreditLimit(undefined, undefined), 1000);
 });
 
 test("platform-funded discounts still use the central vault only", () => {

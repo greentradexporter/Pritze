@@ -9,7 +9,7 @@
     "admin:provision-password-users": "node scripts/provision_admin_password_users.js",
     "migrate:enable-all-booking-services": "node scripts/enable_all_booking_services.js",
     "test": "node --test",
-    "test:firestore": "npx --yes firebase-tools@13 emulators:exec --config ../firebase.json --project demo-pritze-rules --only firestore \"node --test firestore_rules.integration.test.js proin_backend.integration.test.js\""
+    "test:firestore": "npx --yes firebase-tools@13 emulators:exec --config ../firebase.json --project demo-pritze-rules --only firestore \"node --test firestore_rules.integration.test.js proin_backend.integration.test.js salon_credit_booking.integration.test.js\""
   },
   "dependencies": {
     "firebase-admin": "^12.7.0",

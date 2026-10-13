@@ -97,9 +97,9 @@ Coupons and Proin programs are separate records:
   earned;
 - a customer can claim a particular coupon only once.
 
-Coupon codes contain 6-20 letters and numbers. Codes are normalized to
-uppercase. Firestore stores a SHA-256 code hash and a masked label, never the
-plain code. Operations must retain the plain code in the approved campaign
+Coupon codes contain 4-20 letters and numbers, with at least one letter. Codes
+are normalized to uppercase. Firestore stores a SHA-256 code hash and a masked
+label, never the plain code. Operations must retain the plain code in the approved campaign
 record used to communicate it to customers.
 
 Create the linked `coupon` program first, then use

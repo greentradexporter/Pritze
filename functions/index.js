@@ -66,6 +66,7 @@ const {
   normalizeReferralCode,
   referralRewardSummary,
   referralTargetAllowed,
+  salonReferralsAwaitingReward,
 } = require("./referral_logic");
 const {
   calculateDiscountQuote,
@@ -78,6 +79,7 @@ const {
   discountCampaignSelectableAtCheckout,
   discountFundingSource,
   discountPayoutMultiplier,
+  discountSalonPromotionCreditLimit,
   emptyDiscountQuote,
   money,
   signedMoney,
@@ -515,12 +517,15 @@ exports.setSalonPromotionCreditLimitAsAdmin = onCall(
     const salonRef = firestore.collection("salons").doc(salonId);
     const walletRef = firestore.collection("proinWallets")
       .doc(discountSalonPromotionWalletId(salonId));
+    const usageRef = firestore.collection("salonPromotionCreditUsage")
+      .doc(walletRef.id);
     const auditRef = firestore.collection("adminAuditLogs").doc();
     let result = null;
     await firestore.runTransaction(async (transaction) => {
-      const [salonSnapshot, walletSnapshot] = await Promise.all([
+      const [salonSnapshot, walletSnapshot, usageSnapshot] = await Promise.all([
         transaction.get(salonRef),
         transaction.get(walletRef),
+        transaction.get(usageRef),
       ]);
       if (!salonSnapshot.exists) {
         throw new HttpsError("not-found", "Salon not found.");
@@ -531,6 +536,17 @@ exports.setSalonPromotionCreditLimitAsAdmin = onCall(
         throw new HttpsError(
           "failed-precondition",
           "The credit limit cannot be below this salon's current negative balance.",
+        );
+      }
+      // Granted credits can hide credit-line use behind a positive balance.
+      // A limit below that use would leave those credits unable to expire.
+      const creditLineUsedProin = money(usageSnapshot.data()?.reservedProin) +
+        money(usageSnapshot.data()?.redeemedProin);
+      if (creditLimitProin < creditLineUsedProin) {
+        throw new HttpsError(
+          "failed-precondition",
+          `The credit limit cannot be below the ${creditLineUsedProin} Proin ` +
+            "this salon has already used on its credit line.",
         );
       }
       const before = {
@@ -2512,7 +2528,14 @@ exports.getProinBookingQuote = onMobileCall(
 );
 
 exports.runProinReconciliationAsAdmin = onCall(
-  {invoker: "public", enforceAppCheck: false, cpu: "gcf_gen1"},
+  {
+    invoker: "public",
+    enforceAppCheck: false,
+    cpu: "gcf_gen1",
+    // Reconciliation reads the whole Proin ledger.
+    memory: "1GiB",
+    timeoutSeconds: 300,
+  },
   async (request) => {
     const adminUid = await requirePlatformAdministrator(request);
     const reason = requiredAdminReason(request.data?.reason);
@@ -2558,7 +2581,14 @@ exports.expireProinLots = onSchedule(
 );
 
 exports.reconcileProinFinancialState = onSchedule(
-  {schedule: "every day 03:15", timeZone: "Asia/Kolkata", cpu: "gcf_gen1"},
+  {
+    schedule: "every day 03:15",
+    timeZone: "Asia/Kolkata",
+    cpu: "gcf_gen1",
+    // Reconciliation reads the whole Proin ledger.
+    memory: "1GiB",
+    timeoutSeconds: 300,
+  },
   async () => proinBackend.reconcile(),
 );
 
@@ -2643,17 +2673,14 @@ async function scanQualifiedReferralRewards({
   includePreviouslyProcessed = false,
   limit = 100,
 } = {}) {
-  const firestore = admin.firestore();
-  let query = firestore.collection("referrals")
-    .where("status", "==", "qualified");
-  if (!includePreviouslyProcessed) {
-    query = query.where("proinAwardPending", "==", true);
-  }
-  const snapshot = await query.limit(Math.max(1, Math.min(500, limit))).get();
+  const documents = await proinBackend.nextReferralAwardScanPage({
+    includePreviouslyProcessed,
+    limit,
+  });
   let processedCount = 0;
   let awardedCount = 0;
   const failures = [];
-  for (const document of snapshot.docs) {
+  for (const document of documents) {
     try {
       const result = await processQualifiedReferralRewards(
         document.id,
@@ -2669,7 +2696,7 @@ async function scanQualifiedReferralRewards({
     }
   }
   return {
-    scannedCount: snapshot.size,
+    scannedCount: documents.length,
     processedCount,
     awardedCount,
     failureCount: failures.length,
@@ -3836,7 +3863,9 @@ exports.createBooking = onMobileCall({
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
+  let salonCreditWalletToRefresh = "";
   await firestore.runTransaction(async (transaction) => {
+    salonCreditWalletToRefresh = "";
     const [currentSalonSnapshot, activeCustomer, activeInstant, ...lockSnapshots] =
       await Promise.all([
         transaction.get(salonRef),
@@ -3985,18 +4014,19 @@ exports.createBooking = onMobileCall({
         consumedByBookingId: bookingRef.id,
       });
     }
-    if (discountReservation) {
-      reserveDiscountInTransaction(
-        transaction,
-        discountReservation,
-        discountQuote,
-        {
-          bookingId: bookingRef.id,
-          salonId,
-          customerUid: uid,
-          fundingState: discountFundingState,
-        },
-      );
+    if (discountReservation && reserveDiscountInTransaction(
+      transaction,
+      discountReservation,
+      discountQuote,
+      {
+        bookingId: bookingRef.id,
+        salonId,
+        customerUid: uid,
+        fundingState: discountFundingState,
+      },
+    )) {
+      salonCreditWalletToRefresh =
+        discountReservation.salonPromotionWalletRef.id;
     }
     transaction.set(activeCustomerRef, activeBookingMarker({
       bookingId: bookingRef.id,
@@ -4029,6 +4059,19 @@ exports.createBooking = onMobileCall({
       }));
     }
   });
+
+  // The booking has committed; a stale next-expiry summary on the salon's
+  // credit wallet must not fail it.
+  if (salonCreditWalletToRefresh) {
+    try {
+      await proinBackend.refreshWalletExpiry(salonCreditWalletToRefresh);
+    } catch (error) {
+      console.error("salon credit wallet expiry refresh failed", {
+        bookingId: bookingRef.id,
+        message: error?.message || String(error),
+      });
+    }
+  }
 
   // Return the committed booking so the mobile app does not need a second
   // cross-region Firestore read immediately after this callable completes.
@@ -4342,9 +4385,11 @@ async function updateBookingStatusHandler(
   let updatedBooking = null;
   let statusChanged = false;
   let proinWalletToRefresh = "";
+  let salonCreditWalletToRefresh = "";
   await firestore.runTransaction(async (transaction) => {
     statusChanged = false;
     proinWalletToRefresh = "";
+    salonCreditWalletToRefresh = "";
     const actorRef = platformAdmin || systemActor ? null :
       firestore.collection("users").doc(uid);
     const initialReads = await Promise.all([
@@ -4631,16 +4676,17 @@ async function updateBookingStatusHandler(
         {merge: true},
       );
     }
-    if (discountResolution) {
-      resolveReservedDiscountInTransaction({
-        transaction,
-        firestore,
-        refs: discountResolution.refs,
-        booking,
-        bookingId,
-        outcome: discountResolution.outcome,
-        fundingState: discountResolution.fundingState,
-      });
+    if (discountResolution && resolveReservedDiscountInTransaction({
+      transaction,
+      firestore,
+      refs: discountResolution.refs,
+      booking,
+      bookingId,
+      outcome: discountResolution.outcome,
+      fundingState: discountResolution.fundingState,
+    })) {
+      salonCreditWalletToRefresh =
+        discountResolution.refs.salonPromotionWalletRef.id;
     }
 
     if (assignedBarber) {
@@ -4736,6 +4782,10 @@ async function updateBookingStatusHandler(
   if (proinWalletToRefresh) {
     await followUp("wallet_expiry", () =>
       proinBackend.refreshWalletExpiry(proinWalletToRefresh));
+  }
+  if (salonCreditWalletToRefresh) {
+    await followUp("salon_credit_wallet_expiry", () =>
+      proinBackend.refreshWalletExpiry(salonCreditWalletToRefresh));
   }
 
   await followUp("status_notifications", async () => {
@@ -5082,11 +5132,10 @@ exports.awardDiscountCashbackOnBookingCompleted = onDocumentUpdated(
 exports.retryPendingDiscountCashback = onSchedule(
   "every 5 minutes",
   async () => {
-    const snapshot = await admin.firestore().collection("bookings")
-      .where("discountCashbackStatus", "==", "pending")
-      .limit(100)
-      .get();
-    for (const document of snapshot.docs) {
+    const documents = await proinBackend.nextPendingCashbackScanPage({
+      limit: 100,
+    });
+    for (const document of documents) {
       const booking = document.data();
       if (booking.status !== "completed") continue;
       try {
@@ -6305,12 +6354,19 @@ exports.getReferralSummary = onMobileCall(
       })),
       referrals,
     });
+    // The stored salon count moves to qualified when the salon registers;
+    // show it as qualified only once its reward conditions are met.
+    const salonsAwaitingReward = Math.min(
+      money(data.qualifiedSalonCount),
+      salonReferralsAwaitingReward({referrals, inviterUid: uid}),
+    );
     return {
       pendingCustomerCount: money(data.pendingCustomerCount),
       qualifiedCustomerCount: money(data.qualifiedCustomerCount),
-      pendingSalonCount: role === "owner" ? money(data.pendingSalonCount) : 0,
+      pendingSalonCount: role === "owner" ?
+        money(data.pendingSalonCount) + salonsAwaitingReward : 0,
       qualifiedSalonCount: role === "owner" ?
-        money(data.qualifiedSalonCount) : 0,
+        money(data.qualifiedSalonCount) - salonsAwaitingReward : 0,
       ...rewards,
     };
   },
@@ -7616,8 +7672,8 @@ function reserveDiscountInTransaction(
     lastReservedBookingId: bookingId,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }, {merge: true});
-  if (discountFundingSource(quote) !== "salon_promotion_credits") return;
-  reserveSalonPromotionCreditInTransaction({
+  if (discountFundingSource(quote) !== "salon_promotion_credits") return false;
+  return reserveSalonPromotionCreditInTransaction({
     transaction,
     refs,
     quote,
@@ -7674,7 +7730,8 @@ function resolveReservedDiscountInTransaction({
     lastReleasedBookingId: bookingId,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }, {merge: true});
-  if (isSalonPromotionCreditFundedDiscount(booking)) {
+  const salonCreditLotsChanged =
+    isSalonPromotionCreditFundedDiscount(booking) &&
     resolveSalonPromotionCreditInTransaction({
       transaction,
       firestore,
@@ -7684,9 +7741,8 @@ function resolveReservedDiscountInTransaction({
       outcome,
       fundingState,
     });
-  }
 
-  if (!isRedeemed || payoutAmount <= 0) return;
+  if (!isRedeemed || payoutAmount <= 0) return salonCreditLotsChanged;
   const salonId = String(booking.salonId ?? "").trim();
   transaction.set(firestore.collection("salonWallets").doc(salonId), {
     salonId,
@@ -7708,8 +7764,11 @@ function resolveReservedDiscountInTransaction({
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }, {merge: false});
+  return salonCreditLotsChanged;
 }
 
+// Returns true when granted credit lots changed, so the caller can refresh the
+// wallet's next-expiry summary after the booking commits.
 function reserveSalonPromotionCreditInTransaction({
   transaction,
   refs,
@@ -7719,7 +7778,7 @@ function reserveSalonPromotionCreditInTransaction({
   fundingState,
 }) {
   const payoutAmount = money(quote.pritzePayoutAmount);
-  if (payoutAmount <= 0) return;
+  if (payoutAmount <= 0) return false;
   const wallet = fundingState?.salonCreditWallet || {};
   const vault = fundingState?.vault || {};
   const creditLimitProin = discountSalonPromotionCreditLimit(vault, wallet);
@@ -7733,12 +7792,12 @@ function reserveSalonPromotionCreditInTransaction({
   }
   const timestamp = admin.firestore.FieldValue.serverTimestamp();
   const nowMillis = Date.now();
-  const targetLotBackedAmount = Math.min(
-    payoutAmount,
-    Math.max(0, availableBefore),
-  );
+  // Granted credits are spent before the credit line, soonest expiry first.
+  // Capping this at the wallet balance left unused credit in a lot whenever
+  // the salon was already on its credit line, and that credit could then
+  // neither expire nor be revoked.
   const lotAllocations = [];
-  let remainingLotBackedAmount = targetLotBackedAmount;
+  let remainingLotBackedAmount = payoutAmount;
   const lots = Array.isArray(fundingState?.salonCreditLots) ?
     [...fundingState.salonCreditLots] : [];
   for (const lot of lots.sort((left, right) =>
@@ -7856,8 +7915,11 @@ function reserveSalonPromotionCreditInTransaction({
       createdAt: timestamp,
     },
   );
+  return lotAllocations.length > 0;
 }
 
+// Returns true when granted credit lots changed, so the caller can refresh the
+// wallet's next-expiry summary after the booking commits.
 function resolveSalonPromotionCreditInTransaction({
   transaction,
   firestore,
@@ -7868,7 +7930,7 @@ function resolveSalonPromotionCreditInTransaction({
   fundingState,
 }) {
   const payoutAmount = money(booking.pritzePayoutAmount);
-  if (payoutAmount <= 0) return;
+  if (payoutAmount <= 0) return false;
   const isRedeemed = outcome === "redeemed";
   const reservation = fundingState?.salonCreditReservation;
   if (!reservation || reservation.status !== "reserved" ||
@@ -7898,6 +7960,7 @@ function resolveSalonPromotionCreditInTransaction({
   const lotsById = new Map((fundingState?.salonCreditLots || [])
     .map((lot) => [String(lot.id || ""), lot]));
   const timestamp = admin.firestore.FieldValue.serverTimestamp();
+  const redeemedLotAllocations = [];
   for (const allocation of lotAllocations) {
     const lot = lotsById.get(allocation.lotId);
     if (!lot?.ref || money(lot.reservedProin) < allocation.amountProin) {
@@ -7905,6 +7968,12 @@ function resolveSalonPromotionCreditInTransaction({
         "data-loss",
         "A salon promotional credit lot is not balanced.",
       );
+    }
+    if (isRedeemed) {
+      redeemedLotAllocations.push({
+        programId: lot.programId,
+        amountProin: allocation.amountProin,
+      });
     }
     const reservedAfter = money(lot.reservedProin) - allocation.amountProin;
     const availableAfter = isRedeemed ?
@@ -8013,6 +8082,14 @@ function resolveSalonPromotionCreditInTransaction({
       createdAt: timestamp,
     },
   );
+  // Written last: this increments the Proin finance totals, which a customer
+  // Proin resolution in the same transaction sets earlier.
+  proinBackend.redeemSalonCreditLotsInTransaction({
+    transaction,
+    walletId: refs.salonPromotionWalletRef.id,
+    allocations: redeemedLotAllocations,
+  });
+  return lotAllocations.length > 0;
 }
 
 async function readDiscountResolutionFundingState({
@@ -8057,16 +8134,6 @@ async function readDiscountResolutionFundingState({
 function isSalonPromotionCreditFundedDiscount(booking = {}) {
   return String(booking.discountFundingSource || "").trim() ===
     "salon_promotion_credits";
-}
-
-function discountSalonPromotionCreditLimit(vault = {}, wallet = {}) {
-  if (Object.prototype.hasOwnProperty.call(wallet || {}, "creditLimitProin")) {
-    return money(wallet?.creditLimitProin);
-  }
-  if (Object.prototype.hasOwnProperty.call(vault || {}, "salonCreditLimitAmount")) {
-    return money(vault?.salonCreditLimitAmount);
-  }
-  return DEFAULT_SALON_PROMOTION_CREDIT_LIMIT;
 }
 
 function discountPromotionLotStatus({
@@ -9477,10 +9544,12 @@ async function claimOwnerBookingAlert(bookingRef, eventId) {
 async function expirePendingInstantBooking(bookingRef, bookingId) {
   let expiredBooking = null;
   let proinWalletToRefresh = "";
+  let salonCreditWalletToRefresh = "";
   const firestore = admin.firestore();
   await firestore.runTransaction(async (transaction) => {
     expiredBooking = null;
     proinWalletToRefresh = "";
+    salonCreditWalletToRefresh = "";
     const snapshot = await transaction.get(bookingRef);
     const booking = snapshot.data();
     if (
@@ -9550,16 +9619,17 @@ async function expirePendingInstantBooking(bookingRef, bookingId) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     transaction.update(bookingRef, update);
-    if (discountResolution) {
-      resolveReservedDiscountInTransaction({
-        transaction,
-        firestore,
-        refs: discountResolution.refs,
-        booking,
-        bookingId,
-        outcome: "released",
-        fundingState: discountResolution.fundingState,
-      });
+    if (discountResolution && resolveReservedDiscountInTransaction({
+      transaction,
+      firestore,
+      refs: discountResolution.refs,
+      booking,
+      bookingId,
+      outcome: "released",
+      fundingState: discountResolution.fundingState,
+    })) {
+      salonCreditWalletToRefresh =
+        discountResolution.refs.salonPromotionWalletRef.id;
     }
     if (activeCustomerRef && activeCustomer?.data()?.bookingId === bookingId) {
       transaction.set(activeCustomerRef, {
@@ -9579,6 +9649,14 @@ async function expirePendingInstantBooking(bookingRef, bookingId) {
   });
   if (proinWalletToRefresh) {
     await proinBackend.refreshWalletExpiry(proinWalletToRefresh);
+  }
+  if (salonCreditWalletToRefresh) {
+    // A stale next-expiry summary must not hold back the customer's notice.
+    await proinBackend.refreshWalletExpiry(salonCreditWalletToRefresh)
+      .catch((error) => console.error(
+        "salon credit wallet expiry refresh failed",
+        {bookingId, message: error?.message || String(error)},
+      ));
   }
   if (expiredBooking) {
     const booking = await hydrateBookingRecipients(expiredBooking);

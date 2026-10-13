@@ -343,6 +343,8 @@ type ProinProgram = {
   startsAtMillis: number;
   endsAtMillis: number;
   version: number;
+  systemManaged?: boolean;
+  linkedDiscountCampaignId?: string;
 };
 
 type ProinProgramUsage = {
@@ -448,8 +450,11 @@ type ProinReconciliationReport = {
   createdAtMillis: number;
 };
 
+type ProinTruncatedList = "programs" | "coupons" | "salonWallets" | "customerWallets" | "lots" | "payableReimbursements" | "settledReimbursements" | "referralCodes" | "referrals";
+
 type ProinAdminData = {
   generatedAtMillis: number;
+  truncated: Partial<Record<ProinTruncatedList, boolean>>;
   programs: ProinProgram[];
   programUsage: ProinProgramUsage[];
   coupons: ProinCoupon[];
@@ -800,6 +805,7 @@ const sampleDiscountData: DiscountAdministrationData = {
 
 const sampleProinData: ProinAdminData = {
   generatedAtMillis: now,
+  truncated: {},
   programs: [
     { programId: "customer_referral", name: "Customer referral reward", sourceType: "referral_customer", walletType: "customer_rewards", qualificationEvent: "first_completed_booking", rewardRecipient: "inviter", referralTargetRole: "customer", referralInviterRole: "customer", active: false, rewardAmountProin: 100, rewardValidityDays: 60, totalBudgetProin: 10000, maximumTotalGrants: 100, maximumGrantsPerAccount: 10, minimumBookingAmount: 0, maximumProinPerBooking: 100, maximumRedemptionPercent: 25, stackableWithDiscount: false, eligibleSalonIds: [], eligibleServiceIds: [], termsVersion: "referral-v1", startsAtMillis: now - day, endsAtMillis: now + 60 * day, version: 1 },
     { programId: "coupon_welcome", name: "Welcome coupon", sourceType: "coupon", walletType: "customer_rewards", qualificationEvent: "coupon_claimed", rewardRecipient: "account", referralTargetRole: "", referralInviterRole: "", active: false, rewardAmountProin: 50, rewardValidityDays: 30, totalBudgetProin: 5000, maximumTotalGrants: 100, maximumGrantsPerAccount: 1, minimumBookingAmount: 0, maximumProinPerBooking: 50, maximumRedemptionPercent: 25, stackableWithDiscount: false, eligibleSalonIds: [], eligibleServiceIds: [], termsVersion: "coupon-v1", startsAtMillis: now - day, endsAtMillis: now + 30 * day, version: 1 },
@@ -1059,6 +1065,7 @@ function sanitiseProinData(value: unknown): ProinAdminData {
   const finance = data?.finance as Partial<ProinFinance> | undefined;
   return {
     generatedAtMillis: Number(data?.generatedAtMillis) || Date.now(),
+    truncated: data?.truncated && typeof data.truncated === "object" ? data.truncated : {},
     programs: Array.isArray(data?.programs) ? data.programs : [],
     programUsage: Array.isArray(data?.programUsage) ? data.programUsage : [],
     coupons: Array.isArray(data?.coupons) ? data.coupons.map((coupon) => ({
@@ -1328,7 +1335,7 @@ export default function AdminDashboard() {
           {view === "arrivals" && <ArrivalsView data={data} salonMap={salonMap} currentTime={currentTime} onOpenBooking={(booking) => setSelectedBooking(booking)} />}
           {view === "bookings" && <BookingsView bookings={filteredBookings} salons={data.salons} salonMap={salonMap} barberMap={barberMap} currentTime={currentTime} statusFilter={statusFilter} salonFilter={salonFilter} typeFilter={typeFilter} setStatusFilter={setStatusFilter} setSalonFilter={setSalonFilter} setTypeFilter={setTypeFilter} onOpenBooking={setSelectedBooking} />}
           {view === "customers" && <CustomersView customers={data.customers} bookings={data.bookings} search={normalisedSearch} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} />}
-          {view === "salons" && <><SalonApprovalRequests salons={data.salons} search={normalisedSearch} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} /><SalonsView salons={data.salons} bookings={data.bookings} barbers={data.barbers} settlements={data.settlements} settlementPayments={data.settlementPayments} wallets={data.wallets} proinWallets={proinData.wallets} proinPrograms={proinData.programs} search={normalisedSearch} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} /><SalonCampaignCards salons={data.salons} data={discountData} search={normalisedSearch} onOpenDiscounts={() => openView("discounts")} /></>}
+          {view === "salons" && <><SalonApprovalRequests salons={data.salons} search={normalisedSearch} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} /><SalonsView salons={data.salons} bookings={data.bookings} barbers={data.barbers} settlements={data.settlements} settlementPayments={data.settlementPayments} wallets={data.wallets} proinWallets={proinData.wallets} proinPrograms={proinData.programs} salonCreditLimitAmount={discountData.vault.salonCreditLimitAmount} search={normalisedSearch} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} /><SalonCampaignCards salons={data.salons} data={discountData} search={normalisedSearch} onOpenDiscounts={() => openView("discounts")} /></>}
           {view === "barbers" && <BarbersView barbers={data.barbers} bookings={data.bookings} joinRequests={data.joinRequests} salonMap={salonMap} search={normalisedSearch} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} />}
           {view === "reviews" && <ReviewsView reviews={data.reviews} search={normalisedSearch} />}
           {view === "settlements" && <SettlementsView settlements={data.settlements} wallets={data.wallets} salonMap={salonMap} currentTime={currentTime} canOperate={Boolean(user && isLive)} onAdminAction={openAdminAction} />}
@@ -1512,7 +1519,7 @@ function GuideView({ onOpenView }: { onOpenView: (view: View) => void }) {
       </div>
       <div className="guide-steps compact">
         <article><b>01</b><div><strong>Approve a finance budget</strong><p>Use <em>Change budget</em> to set the maximum financial provision for outstanding rewards and salon reimbursements.</p></div></article>
-        <article><b>02</b><div><strong>Create paired referral rewards</strong><p>For “both people earn”, create two referral programs for the same inviter role: one with <em>Referral inviter</em> and one with <em>Referred account</em>. Customer referrals can be customer→customer or salon→customer; salon referrals are salon→salon.</p></div></article>
+        <article><b>02</b><div><strong>Create paired referral rewards</strong><p>For “both people earn”, create two referral programs for the same inviter role: one with <em>Referral inviter</em> and one with <em>Referred account</em>. Customer referrals can be customer→customer or salon→customer; salon referrals are salon→salon. A salon earns or triggers referral Proin only after <em>Approve referral rewards</em> is used on its salon card.</p></div></article>
         <article><b>03</b><div><strong>Set expiry and limits</strong><p>Define reward validity, program dates, total budget, grant limits, minimum booking value, maximum Proin per booking, redemption % and discount stacking. In referral-inviter programs, <em>Max rewards / invites per account</em> also limits how many pending + qualified invites can use one account’s referral code.</p></div></article>
         <article><b>04</b><div><strong>Add eligibility</strong><p>Optionally restrict salon IDs or service IDs. For referrals, select the inviter role and whether the inviter or referred account receives the reward. Change reward amount and invite cap by editing the program and saving a new version.</p></div></article>
         <article><b>05</b><div><strong>View or edit referral codes</strong><p>Use the <em>Referral codes</em> table to see every customer and salon invite code, who owns it, what type of invite it creates and how many referrals are linked. Edit can change the 6-character code or turn it inactive. Duplicate codes are rejected, and previous referral relationships keep the old code for audit.</p></div></article>
@@ -1800,7 +1807,7 @@ function journeyCampaignAction(salonMap: Map<string, Salon>, campaign?: Discount
   };
 }
 
-function SalonsView({ salons, bookings, barbers, settlements, settlementPayments, wallets, proinWallets, proinPrograms, search, canOperate, onAdminAction }: { salons: Salon[]; bookings: Booking[]; barbers: Barber[]; settlements: Settlement[]; settlementPayments: SalonSettlementPayment[]; wallets: SalonWallet[]; proinWallets: ProinWallet[]; proinPrograms: ProinProgram[]; search: string } & AdminControlProps) {
+function SalonsView({ salons, bookings, barbers, settlements, settlementPayments, wallets, proinWallets, proinPrograms, salonCreditLimitAmount, search, canOperate, onAdminAction }: { salons: Salon[]; bookings: Booking[]; barbers: Barber[]; settlements: Settlement[]; settlementPayments: SalonSettlementPayment[]; wallets: SalonWallet[]; proinWallets: ProinWallet[]; proinPrograms: ProinProgram[]; salonCreditLimitAmount: number; search: string } & AdminControlProps) {
   const visible = salons.filter((salon) => !search || [salon.name, salon.ownerName, salon.address].some((value) => value.toLowerCase().includes(search)));
   const salonMap = new Map(salons.map((salon) => [salon.id, salon]));
   const manualSalonPrograms = proinPrograms.filter((program) => program.sourceType === "manual" && program.walletType === "salon_promotion_credits");
@@ -1818,13 +1825,14 @@ function SalonsView({ salons, bookings, barbers, settlements, settlementPayments
     const pendingFromRecords = salonSettlements.filter((settlement) => settlement.status !== "paid").reduce((sum, settlement) => sum + (Number.isFinite(settlement.outstandingAmount) ? settlement.outstandingAmount : Math.max(0, settlement.pritzePayoutAmount - settlement.paidAmount)), 0);
     const pendingSettlement = settlementWallet ? settlementWallet.payableBalance : pendingFromRecords;
     const promotionWallet = proinWallets.find((wallet) => wallet.walletType === "salon_promotion_credits" && wallet.accountId === salon.id);
-    const creditLimit = promotionWallet?.creditLimitProin ?? 1000;
+    const creditLimit = promotionWallet?.creditLimitProin ?? salonCreditLimitAmount;
     const availableProin = promotionWallet?.availableProin ?? 0;
     const spendableProin = promotionWallet?.spendableProin ?? Math.max(0, availableProin + creditLimit);
     const paymentHistory = settlementPayments.filter((payment) => payment.salonId === salon.id).sort((left, right) => right.paidAtMillis - left.paidAtMillis).slice(0, 5);
     const salonControl = (control: string, value: boolean, label: string, danger = false): AdminAction => ({ title: `${label}: ${salon.name}`, description: "This changes salon availability for customers and is recorded in the administrator audit log.", confirmLabel: label, callableName: "updateSalonControlAsAdmin", payload: { salonId: salon.id, control, value }, fields: [reasonField], tone: danger ? "danger" : "default" });
     const creditLimitAction: AdminAction = { title: `Change ${salon.name}'s promotional credit limit`, description: "This is this salon's own maximum negative promotional Proin balance. It limits future salon-funded campaign burn and does not change another salon's limit.", confirmLabel: "Save credit limit", callableName: "setSalonPromotionCreditLimitAsAdmin", payload: { salonId: salon.id }, fields: [{ key: "creditLimitProin", label: "Promotional credit limit (Proin)", type: "number", min: 0, initialValue: String(creditLimit) }, reasonField] };
     const addCreditAction: AdminAction = { title: `Add promotional credit to ${salon.name}`, description: "Add a recorded Proin credit to this salon. The chosen manual program controls validity and its maximum reward. This does not pay cash to the salon.", confirmLabel: "Add promotional credit", callableName: "grantProinAsAdmin", payload: { accountId: salon.id, walletType: "salon_promotion_credits" }, fields: [{ key: "programId", label: "Manual salon credit program", type: "select", options: manualSalonPrograms.map((program) => ({ label: program.name, value: program.programId })) }, { key: "amountProin", label: "Credit to add (Proin)", type: "number", min: 1 }, { key: "sourceId", label: "Credit note or source ID", placeholder: "promotion-top-up-sep" }, { key: "idempotencyKey", label: "Unique reference", placeholder: "salon-credit-sep-001" }, reasonField] };
+    const referralApprovalAction: AdminAction = { title: `${salon.proinReferralApproved ? "Stop" : "Approve"} referral rewards for ${salon.name}`, description: salon.proinReferralApproved ? "Referral Proin that involves this salon will wait until it is approved again. Rewards already granted are not changed." : "Allows referral Proin that involves this salon: rewards it earns as an inviter, and the salon referral that brought it in once it completes its first booking. This is separate from listing approval and is recorded in the administrator audit log.", confirmLabel: salon.proinReferralApproved ? "Stop referral rewards" : "Approve referral rewards", callableName: "updateSalonControlAsAdmin", payload: { salonId: salon.id, control: "proinReferralApproved", value: !salon.proinReferralApproved }, fields: [reasonField] };
     const settlementAction = (amountInr: number, settleAll = false): AdminAction => ({ title: `${settleAll ? "Settle full pending amount for" : "Record payment to"} ${salon.name}`, description: `Record a payment that was already made outside Pritze. ${settleAll ? "The full current pending balance will be allocated to the oldest outstanding booking records and reduced to zero." : "You may record any amount up to the current pending balance."} Choose Bank transfer, UPI, or Cash and retain its reference for the audit trail.`, confirmLabel: settleAll ? "Record full settlement" : "Record payment", callableName: "recordSalonSettlementPaymentAsAdmin", payload: { salonId: salon.id }, fields: [{ key: "amountInr", label: "Amount paid outside Pritze (₹)", type: "number", min: 0.01, step: 0.01, initialValue: String(Math.max(0, Math.round(amountInr * 100) / 100)) }, { key: "paymentMethod", label: "Payment method", type: "select", initialValue: "bank_transfer", options: [{ label: "Bank transfer", value: "bank_transfer" }, { label: "UPI", value: "upi" }, { label: "Cash", value: "cash" }] }, { key: "paymentReference", label: "Transaction, receipt or ledger reference", placeholder: "For cash, enter the cash receipt or ledger reference" }, { key: "paidAtMillis", label: "Payment completed at", type: "datetime-local", initialValue: dateTimeLocalValue(Date.now()) }, reasonField] });
 
     return <article className={`salon-card phase-two-card ${salon.adminSuspended ? "suspended" : ""}`} key={salon.id}>
@@ -1835,7 +1843,7 @@ function SalonsView({ salons, bookings, barbers, settlements, settlementPayments
       <div className="salon-stats"><div><strong>{salon.rating.toFixed(1)} ★</strong><span>{salon.reviewCount} reviews</span></div><div><strong>{salonBarbers.filter((barber) => barber.isActive).length}</strong><span>active barbers</span></div><div><strong>{completed.length}</strong><span>completed</span></div></div>
       <div className="salon-card-foot"><span>{salon.openTime}–{salon.closeTime}</span><span>{salon.instantBookingsEnabled ? "Instant on" : "Instant paused"}</span></div>
       <div className="salon-private-payment"><span>Private payout details</span><strong>{salon.paymentUpiId || "UPI ID not added"}</strong>{salon.paymentQrCodeUrl ? <a href={salon.paymentQrCodeUrl} target="_blank" rel="noreferrer">View payment QR</a> : <small>QR code not added</small>}</div>
-      <section className="salon-finance-panel" aria-label={`${salon.name} finance`}><div className="salon-finance-heading"><div><span>Salon finance</span><small>External settlement and promotional credit</small></div><strong>{formatMoney(pendingSettlement)} pending</strong></div><div className="salon-finance-metrics"><div><span>Pending settlement</span><strong>{formatMoney(pendingSettlement)}</strong><small>{salonSettlements.filter((item) => item.status !== "paid").length} open booking records</small></div><div><span>Settled externally</span><strong>{formatMoney(settlementWallet?.paidAmount ?? 0)}</strong><small>Recorded payments</small></div><div><span>Promotional balance</span><strong>{formatProin(availableProin)}</strong><small>{formatProin(spendableProin)} available to spend</small></div><div><span>Salon credit limit</span><strong>{formatProin(creditLimit)}</strong><small>Maximum negative balance</small></div></div><div className="salon-finance-actions"><button disabled={!canOperate} onClick={() => onAdminAction(creditLimitAction)}>Change credit limit</button><button disabled={!canOperate || !manualSalonPrograms.length} onClick={() => onAdminAction(addCreditAction)}>Add promotional credit</button><button disabled={!canOperate || pendingSettlement <= 0} onClick={() => onAdminAction(settlementAction(pendingSettlement))}>Record external payment</button><button disabled={!canOperate || pendingSettlement <= 0} className="primary-control" onClick={() => onAdminAction(settlementAction(pendingSettlement, true))}>Settle full amount</button></div>{!manualSalonPrograms.length ? <small className="finance-hint">Create one manual salon-credit Proin program before adding a promotional credit.</small> : null}{pendingSettlement <= 0 ? <small className="finance-hint">Settlement actions unlock only when this salon has a pending Pritze payout.</small> : null}{paymentHistory.length ? <details className="salon-payment-history"><summary>Recent settlement history ({paymentHistory.length})</summary><div>{paymentHistory.map((payment) => <p key={payment.paymentId}><strong>{formatMoney(payment.amountInr)}</strong><span>{formatSettlementPaymentMethod(payment.paymentMethod)} · {payment.paymentReference} · {formatDateTime(payment.paidAtMillis)} · {payment.allocationCount} booking{payment.allocationCount === 1 ? "" : "s"}</span></p>)}</div></details> : <small className="finance-hint">No external settlement has been recorded for this salon yet.</small>}</section>
+      <section className="salon-finance-panel" aria-label={`${salon.name} finance`}><div className="salon-finance-heading"><div><span>Salon finance</span><small>External settlement and promotional credit</small></div><strong>{formatMoney(pendingSettlement)} pending</strong></div><div className="salon-finance-metrics"><div><span>Pending settlement</span><strong>{formatMoney(pendingSettlement)}</strong><small>{salonSettlements.filter((item) => item.status !== "paid").length} open booking records</small></div><div><span>Settled externally</span><strong>{formatMoney(settlementWallet?.paidAmount ?? 0)}</strong><small>Recorded payments</small></div><div><span>Promotional balance</span><strong>{formatProin(availableProin)}</strong><small>{formatProin(spendableProin)} available to spend</small></div><div><span>Salon credit limit</span><strong>{formatProin(creditLimit)}</strong><small>Maximum negative balance</small></div></div><div className="salon-finance-actions"><button disabled={!canOperate} onClick={() => onAdminAction(creditLimitAction)}>Change credit limit</button><button disabled={!canOperate || !manualSalonPrograms.length} onClick={() => onAdminAction(addCreditAction)}>Add promotional credit</button><button disabled={!canOperate} onClick={() => onAdminAction(referralApprovalAction)}>{salon.proinReferralApproved ? "Stop referral rewards" : "Approve referral rewards"}</button><button disabled={!canOperate || pendingSettlement <= 0} onClick={() => onAdminAction(settlementAction(pendingSettlement))}>Record external payment</button><button disabled={!canOperate || pendingSettlement <= 0} className="primary-control" onClick={() => onAdminAction(settlementAction(pendingSettlement, true))}>Settle full amount</button></div>{!manualSalonPrograms.length ? <small className="finance-hint">Create one manual salon-credit Proin program before adding a promotional credit.</small> : null}{!salon.proinReferralApproved ? <small className="finance-hint">Referral rewards are not approved for this salon, so referral Proin that involves it will wait.</small> : null}{pendingSettlement <= 0 ? <small className="finance-hint">Settlement actions unlock only when this salon has a pending Pritze payout.</small> : null}{paymentHistory.length ? <details className="salon-payment-history"><summary>Recent settlement history ({paymentHistory.length})</summary><div>{paymentHistory.map((payment) => <p key={payment.paymentId}><strong>{formatMoney(payment.amountInr)}</strong><span>{formatSettlementPaymentMethod(payment.paymentMethod)} · {payment.paymentReference} · {formatDateTime(payment.paidAtMillis)} · {payment.allocationCount} booking{payment.allocationCount === 1 ? "" : "s"}</span></p>)}</div></details> : <small className="finance-hint">No external settlement has been recorded for this salon yet.</small>}</section>
       <div className="control-cluster"><button disabled={!canOperate} className="primary-control" onClick={() => onAdminAction(salonProfileAction(salon))}>Edit profile</button><button disabled={!canOperate} onClick={() => onAdminAction(journeyCampaignAction(salonMap, undefined, salon))}>Create journey campaign</button><button disabled={!canOperate || salon.adminSuspended} onClick={() => onAdminAction(salonControl("isOpen", !salon.isOpen, salon.isOpen ? "Close salon" : "Open salon"))}>{salon.isOpen ? "Close" : "Open"}</button><button disabled={!canOperate || salon.adminSuspended} onClick={() => onAdminAction(salonControl("instantBookingsEnabled", !salon.instantBookingsEnabled, salon.instantBookingsEnabled ? "Pause instant bookings" : "Resume instant bookings"))}>{salon.instantBookingsEnabled ? "Pause instant" : "Resume instant"}</button><button disabled={!canOperate} className={salon.adminSuspended ? "" : "danger-link"} onClick={() => onAdminAction(salonControl("adminSuspended", !salon.adminSuspended, salon.adminSuspended ? "Restore salon" : "Suspend salon", !salon.adminSuspended))}>{salon.adminSuspended ? "Restore" : "Suspend"}</button><button disabled={!canOperate} onClick={() => onAdminAction(noteAction("salon", salon.id, salon.name))}>Note</button></div>
       {salon.services?.length ? <details className="service-controls"><summary>Manage all {salon.services.length} services</summary><div className="service-control-list">{salon.services.map((service) => <div key={service.id}><span>{service.name}<small>{formatMoney(service.price)} · {service.durationMinutes} min · {service.isAvailable ? "Available" : "Hidden"}</small></span><button disabled={!canOperate || salon.adminSuspended} onClick={() => onAdminAction(salonServiceAction(salon, service))}>Edit</button></div>)}</div></details> : null}
       <details className="service-controls team-controls"><summary>Manage team ({salonBarbers.length})</summary><div className="service-control-list">{salonBarbers.map((barber) => <div key={barber.id}><span>{barber.name}<small>{barber.speciality || "Team member"} · {barber.isActive ? "Active" : "Inactive"}</small></span><button disabled={!canOperate} onClick={() => onAdminAction(barberProfileAction(barber))}>Edit</button></div>)}{!salonBarbers.length ? <small>No team members added yet.</small> : null}</div></details>
@@ -2220,6 +2228,7 @@ function ProinOperationsView({ data, customerMap, salonMap, canOperate, onAdminA
   const salonCouponProgram = couponPrograms.find((program) => program.walletType === "salon_promotion_credits");
   const ownerSalonMap = new Map([...salonMap.values()].filter((salon) => salon.ownerUid).map((salon) => [salon.ownerUid ?? "", salon]));
   const referralStatsMap = new Map(data.referralStats.map((item) => [item.userId, item]));
+  const cut = data.truncated;
   const referralCountByCode = data.referrals.reduce((map, referral) => {
     const code = referral.referralCode || "";
     if (code) map.set(code, (map.get(code) ?? 0) + 1);
@@ -2370,11 +2379,16 @@ function ProinOperationsView({ data, customerMap, salonMap, canOperate, onAdminA
     };
   }
 
+  function lotOwnerName(lot: ProinLot) {
+    const isSalonCredit = lot.walletType === "salon_promotion_credits";
+    return (isSalonCredit ? salonMap.get(lot.accountId)?.name : customerMap.get(lot.accountId)?.name) ?? lot.accountId;
+  }
+
   function revocationAction(lot: ProinLot): AdminAction {
-    const customer = customerMap.get(lot.accountId);
+    const isSalonCredit = lot.walletType === "salon_promotion_credits";
     return {
-      title: `Adjust ${customer?.name ?? lot.accountId}'s Proin`,
-      description: `Remove up to ${formatProin(lot.availableProin)} that is still unused in this reward lot. Reserved, redeemed and expired Proin cannot be changed. The customer will be notified.`,
+      title: `Adjust ${lotOwnerName(lot)}'s ${isSalonCredit ? "promotional credit" : "Proin"}`,
+      description: `Remove up to ${formatProin(lot.availableProin)} that is still unused in this reward lot. Reserved, redeemed and expired Proin cannot be changed. ${isSalonCredit ? "The salon's balance drops by the same amount and cannot go past its credit line." : "The customer will be notified."}`,
       confirmLabel: "Revoke unused Proin",
       callableName: "revokeProinAsAdmin",
       payload: { lotId: lot.lotId },
@@ -2639,7 +2653,7 @@ function ProinOperationsView({ data, customerMap, salonMap, canOperate, onAdminA
     </section>
 
     <section className="panel main-panel proin-panel">
-      <PanelHeader title="Referral codes" subtitle="View and edit the actual customer and salon referral codes. Code changes affect future invites only." />
+      <PanelHeader title="Referral codes" subtitle={`View and edit the actual customer and salon referral codes. Code changes affect future invites only.${cut.referralCodes ? " Showing the 1,000 newest codes." : ""}`} />
       <div className="data-table proin-program-table">
         <div className="data-head"><span>Code / owner</span><span>Purpose</span><span>Usage</span><span>Status</span><span>Action</span></div>
         {[...data.referralCodes].sort((a, b) => Number(b.active) - Number(a.active) || a.code.localeCompare(b.code)).map((code) => (
@@ -2673,19 +2687,19 @@ function ProinOperationsView({ data, customerMap, salonMap, canOperate, onAdminA
     </section>
 
     <section className="panel main-panel proin-panel">
-      <PanelHeader title="Reward programs" subtitle="Referral, coupon, promotion and support policies are versioned on every save." />
+      <PanelHeader title="Reward programs" subtitle={`Referral, coupon, promotion and support policies are versioned on every save.${cut.programs ? " Only the first 500 programs are shown." : ""}`} />
       <div className="data-table proin-program-table">
         <div className="data-head"><span>Program</span><span>Reward / validity</span><span>Usage</span><span>Window</span><span>Action</span></div>
         {[...data.programs].sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name)).map((program) => {
           const usage = usageMap.get(program.programId);
-          return <div className="data-row" key={program.programId}><div><strong>{program.name}</strong><small>{program.programId} · {titleCase(program.sourceType.replaceAll("_", " "))} · v{program.version}</small></div><div><strong>{formatProin(program.rewardAmountProin)}</strong><small>{program.rewardValidityDays} days · up to {program.maximumRedemptionPercent}% per booking</small></div><div><strong>{usage?.grantCount ?? 0} grants</strong><small>{formatProin(usage?.grantedProin ?? 0)} of {formatProin(program.totalBudgetProin)}</small></div><div><span className={`proin-state ${program.active ? "active" : "inactive"}`}>{program.active ? "Active" : "Inactive"}</span><small>{formatDateTime(program.startsAtMillis)} – {formatDateTime(program.endsAtMillis)}</small></div><button className="control-button" disabled={!canOperate} onClick={() => onAdminAction(programAction(program))}>Edit</button></div>;
+          return <div className="data-row" key={program.programId}><div><strong>{program.name}</strong><small>{program.programId} · {titleCase(program.sourceType.replaceAll("_", " "))} · v{program.version}{program.systemManaged ? " · managed by its discount campaign" : ""}</small></div><div><strong>{formatProin(program.rewardAmountProin)}</strong><small>{program.rewardValidityDays} days · up to {program.maximumRedemptionPercent}% per booking</small></div><div><strong>{usage?.grantCount ?? 0} grants</strong><small>{formatProin(usage?.grantedProin ?? 0)} of {formatProin(program.totalBudgetProin)}</small></div><div><span className={`proin-state ${program.active ? "active" : "inactive"}`}>{program.active ? "Active" : "Inactive"}</span><small>{formatDateTime(program.startsAtMillis)} – {formatDateTime(program.endsAtMillis)}</small></div><button className="control-button" disabled={!canOperate || program.systemManaged} title={program.systemManaged ? "Edit this cashback in its discount campaign" : undefined} onClick={() => onAdminAction(programAction(program))}>Edit</button></div>;
         })}
       </div>
       {!data.programs.length ? <EmptyState title="No Proin programs" detail="Create an inactive, capped program before issuing any rewards." /> : null}
     </section>
 
     <section className="panel main-panel proin-panel">
-      <PanelHeader title="Coupon campaigns" subtitle="Plain coupon codes are never returned by Firebase; retain the approved code securely outside the app." />
+      <PanelHeader title="Coupon campaigns" subtitle={`Plain coupon codes are never returned by Firebase; retain the approved code securely outside the app.${cut.coupons ? " Only the first 500 coupons are shown." : ""}`} />
       <div className="data-table proin-coupon-table">
         <div className="data-head"><span>Coupon</span><span>Linked program</span><span>Claims</span><span>Claim window</span><span>Action</span></div>
         {[...data.coupons].sort((a, b) => Number(b.active) - Number(a.active) || b.claimEndsAtMillis - a.claimEndsAtMillis).map((coupon) => {
@@ -2698,7 +2712,7 @@ function ProinOperationsView({ data, customerMap, salonMap, canOperate, onAdminA
     </section>
 
     <section className="panel main-panel proin-panel">
-      <PanelHeader title="Payable Proin reimbursements" subtitle="Record a payment only after the external transfer has completed." />
+      <PanelHeader title="Payable Proin reimbursements" subtitle={`Record a payment only after the external transfer has completed.${cut.payableReimbursements ? " Only 1,000 payable reimbursements are shown; more appear as these are settled." : ""}`} />
       <div className="data-table proin-reimbursement-table">
         <div className="data-head"><span>Salon / booking</span><span>Amount</span><span>Created</span><span>Payment state</span><span>Action</span></div>
         {payable.map((item) => <div className="data-row" key={item.bookingId}><div><strong>{salonMap.get(item.salonId)?.name ?? "Unknown salon"}</strong><small>{item.bookingId}</small></div><strong>{formatMoney(item.amountInr)}</strong><span>{formatDateTime(item.createdAtMillis)}</span><span className="proin-state payable">Awaiting external payment</span><button className="control-button" disabled={!canOperate} onClick={() => onAdminAction(settlementAction(item))}>Record paid</button></div>)}
@@ -2707,12 +2721,12 @@ function ProinOperationsView({ data, customerMap, salonMap, canOperate, onAdminA
     </section>
 
     <section className="panel main-panel proin-panel">
-      <PanelHeader title="Unused customer Proin" subtitle="Only the available portion of an active, unexpired reward lot can be adjusted." />
+      <PanelHeader title="Unused Proin" subtitle={`Only the available portion of an active, unexpired reward lot can be adjusted. Salon promotional credit is listed under the salon's name.${revocableLots.length > 200 || cut.lots ? " Showing the 200 that expire soonest." : ""}`} />
       <div className="data-table proin-lot-table">
-        <div className="data-head"><span>Customer / reward</span><span>Unused</span><span>Protected</span><span>Expires</span><span>Action</span></div>
-        {revocableLots.slice(0, 200).map((lot) => <div className="data-row" key={lot.lotId}><div><strong>{customerMap.get(lot.accountId)?.name ?? lot.accountId}</strong><small>{titleCase(lot.sourceType.replaceAll("_", " "))} · {lot.programId}</small></div><strong>{formatProin(lot.availableProin)}</strong><span>{formatProin(lot.reservedProin)} reserved</span><span>{formatDateTime(lot.expiresAtMillis)}</span><button className="control-button danger-link" disabled={!canOperate} onClick={() => onAdminAction(revocationAction(lot))}>Adjust</button></div>)}
+        <div className="data-head"><span>Owner / reward</span><span>Unused</span><span>Protected</span><span>Expires</span><span>Action</span></div>
+        {revocableLots.slice(0, 200).map((lot) => <div className="data-row" key={lot.lotId}><div><strong>{lotOwnerName(lot)}</strong><small>{lot.walletType === "salon_promotion_credits" ? "Salon credit · " : ""}{titleCase(lot.sourceType.replaceAll("_", " "))} · {lot.programId}</small></div><strong>{formatProin(lot.availableProin)}</strong><span>{formatProin(lot.reservedProin)} reserved</span><span>{formatDateTime(lot.expiresAtMillis)}</span><button className="control-button danger-link" disabled={!canOperate} onClick={() => onAdminAction(revocationAction(lot))}>Adjust</button></div>)}
       </div>
-      {!revocableLots.length ? <EmptyState title="No unused Proin to adjust" detail="Active and unexpired customer reward lots will appear here." /> : null}
+      {!revocableLots.length ? <EmptyState title="No unused Proin to adjust" detail="Active and unexpired reward lots will appear here." /> : null}
     </section>
 
     <section className="proin-secondary-grid">

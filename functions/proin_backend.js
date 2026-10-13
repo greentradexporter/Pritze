@@ -21,16 +21,33 @@ const {
   SalonFinanceValidationError,
   settlementPaymentReference,
 } = require("./salon_finance_logic");
+const {discountSalonPromotionCreditLimit} = require("./discount_logic");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const RECONCILIATION_WALLET_LIMIT = 500;
-const RECONCILIATION_LOT_LIMIT = 5000;
-const RECONCILIATION_COUPON_LIMIT = 500;
-const RECONCILIATION_COUPON_CLAIM_LIMIT = 5000;
-const RECONCILIATION_RESERVATION_LIMIT = 5000;
-const RECONCILIATION_REIMBURSEMENT_LIMIT = 5000;
-const RECONCILIATION_SETTLEMENT_REFERENCE_LIMIT = 5000;
-const RECONCILIATION_SALON_PROMOTION_USAGE_LIMIT = 1000;
+// Firestore's field path for a document's own ID.
+const DOCUMENT_ID_FIELD = "__name__";
+// Reconciliation reads whole collections in pages. These ceilings only stop a
+// runaway scan; reaching one still reports the run as review_required.
+const RECONCILIATION_PAGE_SIZE = 1000;
+const RECONCILIATION_WALLET_LIMIT = 20000;
+const RECONCILIATION_LOT_LIMIT = 100000;
+const RECONCILIATION_PROGRAM_USAGE_LIMIT = 2000;
+const RECONCILIATION_COUPON_LIMIT = 2000;
+const RECONCILIATION_COUPON_CLAIM_LIMIT = 100000;
+const RECONCILIATION_RESERVATION_LIMIT = 100000;
+const RECONCILIATION_REIMBURSEMENT_LIMIT = 100000;
+const RECONCILIATION_SETTLEMENT_REFERENCE_LIMIT = 100000;
+const RECONCILIATION_SALON_PROMOTION_USAGE_LIMIT = 5000;
+// The Control Center lists are capped so the page stays loadable; each capped
+// list is ordered so the rows that matter come first and says when it is cut.
+const SNAPSHOT_PROGRAM_LIMIT = 500;
+const SNAPSHOT_COUPON_LIMIT = 500;
+const SNAPSHOT_SALON_WALLET_LIMIT = 2000;
+const SNAPSHOT_TOP_WALLET_LIMIT = 500;
+const SNAPSHOT_ACTIVE_LOT_LIMIT = 5000;
+const SNAPSHOT_PAYABLE_REIMBURSEMENT_LIMIT = 1000;
+const SNAPSHOT_SETTLED_REIMBURSEMENT_LIMIT = 200;
+const SNAPSHOT_REFERRAL_LIMIT = 1000;
 const DEFAULT_SALON_PROMOTION_CREDIT_LIMIT = 1000;
 
 function createProinBackend({admin, HttpsError}) {
@@ -76,6 +93,13 @@ function createProinBackend({admin, HttpsError}) {
         transaction.get(usageRef),
       ]);
       const before = programSnapshot.data() || null;
+      if (before?.systemManaged === true) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This cashback program belongs to a discount campaign. " +
+            "Edit that campaign to change it.",
+        );
+      }
       const usage = usageSnapshot.data() || {};
       const grantedProin = storedProin(usage.grantedProin);
       const grantCount = storedProin(usage.grantCount);
@@ -336,10 +360,12 @@ function createProinBackend({admin, HttpsError}) {
       if (amountProin <= 0) {
         throw new HttpsError("data-loss", "Program reward is invalid.");
       }
-      const maximumReward = storedPositiveInteger(
+      // The per-booking limit caps how much is spent at once, so it must never
+      // block the program's own reward; it only bounds a larger custom amount.
+      const maximumReward = Math.max(configuredReward, storedPositiveInteger(
         program.maximumProinPerBooking,
         configuredReward,
-      );
+      ));
       if (amountProin > maximumReward) {
         throw new HttpsError(
           "failed-precondition",
@@ -359,7 +385,7 @@ function createProinBackend({admin, HttpsError}) {
           "The Proin promotion budget does not cover this reward.",
         );
       }
-      const wallet = proinWalletState(walletSnapshot.data());
+      const wallet = proinWalletState(walletSnapshot.data(), walletType);
       if (walletSnapshot.exists && !proinWalletInvariant(wallet)) {
         throw new HttpsError(
           "data-loss",
@@ -408,8 +434,14 @@ function createProinBackend({admin, HttpsError}) {
       const programUsageAfter = grantUsage(programUsage, amountProin);
       const accountUsageAfter = grantUsage(accountUsage, amountProin);
       const timestamp = fieldValue.serverTimestamp();
+      const walletRecord = {...walletAfter};
+      // A grant must not pin a credit limit: an unset limit stays unset so the
+      // salon keeps the platform credit line.
+      if (!hasStoredCreditLimit(walletSnapshot.data())) {
+        delete walletRecord.creditLimitProin;
+      }
       transaction.set(walletRef, {
-        ...walletAfter,
+        ...walletRecord,
         walletId,
         walletType,
         accountId,
@@ -982,7 +1014,7 @@ function createProinBackend({admin, HttpsError}) {
       throw new HttpsError("not-found", "Salon not found.");
     }
     const walletId = proinWalletId("salon_promotion_credits", accountId);
-    const [walletSnapshot, lotsSnapshot] = await Promise.all([
+    const [walletSnapshot, lotsSnapshot, vaultSnapshot] = await Promise.all([
       db.collection("proinWallets").doc(walletId).get(),
       db.collection("proinLots")
         .where("walletId", "==", walletId)
@@ -990,8 +1022,12 @@ function createProinBackend({admin, HttpsError}) {
         .orderBy("expiresAt", "asc")
         .limit(50)
         .get(),
+      db.collection("platformFinance").doc("discountVault").get(),
     ]);
-    const wallet = proinWalletState(walletSnapshot.data());
+    const wallet = salonCreditWalletState(
+      walletSnapshot.data(),
+      vaultSnapshot.data(),
+    );
     if (walletSnapshot.exists && !proinWalletInvariant(wallet)) {
       throw new HttpsError(
         "data-loss",
@@ -1591,6 +1627,67 @@ function createProinBackend({admin, HttpsError}) {
     };
   }
 
+  // A redeemed salon-funded discount is paid from the discount vault through
+  // the salon settlement. The granted credit it used up therefore stops being
+  // a Proin liability and returns to the unallocated budget instead of
+  // becoming a second payable. Holds are not mirrored here: only a redemption
+  // moves finance, so a booking resolved by an older deployment cannot strand
+  // a reserved total. Increments keep this correct beside a customer Proin
+  // resolution that writes the same finance document earlier in the
+  // transaction.
+  function redeemSalonCreditLotsInTransaction({
+    transaction,
+    walletId,
+    allocations,
+  }) {
+    const db = firestore();
+    const timestamp = fieldValue.serverTimestamp();
+    const redeemedByProgram = new Map();
+    for (const allocation of allocations || []) {
+      const amountProin = storedProin(allocation?.amountProin);
+      if (amountProin <= 0) continue;
+      const programId = String(allocation.programId || "").trim();
+      if (!programId) {
+        throw new HttpsError(
+          "data-loss",
+          "A salon promotional credit lot is missing its program.",
+        );
+      }
+      redeemedByProgram.set(
+        programId,
+        (redeemedByProgram.get(programId) || 0) + amountProin,
+      );
+    }
+    let redeemedProin = 0;
+    for (const [programId, amountProin] of redeemedByProgram) {
+      redeemedProin += amountProin;
+      const usage = {
+        availableProin: fieldValue.increment(-amountProin),
+        redeemedProin: fieldValue.increment(amountProin),
+        updatedAt: timestamp,
+      };
+      transaction.set(
+        db.collection("proinProgramUsage").doc(programId),
+        usage,
+        {merge: true},
+      );
+      transaction.set(
+        db.collection("proinProgramAccountUsage")
+          .doc(`${programId}__${walletId}`),
+        usage,
+        {merge: true},
+      );
+    }
+    if (redeemedProin > 0) {
+      transaction.set(db.collection("proinFinance").doc("current"), {
+        outstandingLiabilityInr: fieldValue.increment(-redeemedProin),
+        unallocatedBudgetInr: fieldValue.increment(redeemedProin),
+        updatedAt: timestamp,
+      }, {merge: true});
+    }
+    return redeemedProin;
+  }
+
   async function revokeAvailableLotAsAdmin({adminUid, data, reason}) {
     const lotId = requiredText(data.lotId, "Proin lot id", 160);
     const requestId = requiredText(data.requestId, "revocation request id", 160);
@@ -1685,9 +1782,13 @@ function createProinBackend({admin, HttpsError}) {
       const finance = proinFinanceState(financeSnapshot.data());
       const programUsage = proinProgramUsageState(programUsageSnapshot.data());
       const accountUsage = proinProgramUsageState(accountUsageSnapshot.data());
+      // A salon balance is net of its credit-line spending, so it can be lower
+      // than the unused credit in a lot; its credit line bounds it instead.
+      const isSalonCreditWallet =
+        wallet.walletType === "salon_promotion_credits";
       if (!walletSnapshot.exists || !proinWalletInvariant(wallet) ||
           !financeSnapshot.exists || !proinFinanceInvariant(finance) ||
-          wallet.availableProin < amountProin ||
+          (!isSalonCreditWallet && wallet.availableProin < amountProin) ||
           finance.outstandingLiabilityInr < amountProin ||
           programUsage.availableProin < amountProin ||
           accountUsage.availableProin < amountProin) {
@@ -1711,6 +1812,14 @@ function createProinBackend({admin, HttpsError}) {
         unallocatedBudgetInr: finance.unallocatedBudgetInr + amountProin,
         lifetimeRevokedProin: finance.lifetimeRevokedProin + amountProin,
       };
+      if (isSalonCreditWallet &&
+          walletAfter.availableProin < -wallet.creditLimitProin) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Revoking this credit would take the salon past its credit line. " +
+            "Revoke less or raise the salon's credit limit first.",
+        );
+      }
       if (!proinWalletInvariant(walletAfter) ||
           !proinFinanceInvariant(financeAfter)) {
         throw new HttpsError("internal", "The Proin revocation would not balance.");
@@ -1994,7 +2103,8 @@ function createProinBackend({admin, HttpsError}) {
       await recordOperationalFailure({
         type: "proin_expiry_failure",
         title: "Proin expiry processing needs review",
-        detail: `${failures.length} Proin lots could not be expired.`,
+        detail: `${failures.length} Proin lots could not be expired. ` +
+          failures[0].message,
       });
     }
     return {
@@ -2026,8 +2136,13 @@ function createProinBackend({admin, HttpsError}) {
       const accountUsageRef = db.collection("proinProgramAccountUsage")
         .doc(`${programId}__${walletId}`);
       const financeRef = db.collection("proinFinance").doc("current");
-      const ledgerRef = db.collection("proinLedger")
-        .doc(`expiry_${lotRef.id}`);
+      // A lot can expire in two steps: its unused part at expiry, then a held
+      // part that a cancelled salon-funded booking hands back afterwards.
+      const alreadyExpiredProin = storedProin(lot.expiredProin);
+      const ledgerRef = db.collection("proinLedger").doc(
+        alreadyExpiredProin > 0 ?
+          `expiry_${lotRef.id}_${alreadyExpiredProin}` : `expiry_${lotRef.id}`,
+      );
       const [
         walletSnapshot,
         programUsageSnapshot,
@@ -2048,7 +2163,11 @@ function createProinBackend({admin, HttpsError}) {
           !financeSnapshot.exists || !proinFinanceInvariant(finance)) {
         throw new Error("Proin wallet or finance state is not balanced.");
       }
-      if (wallet.availableProin < amountProin ||
+      // A salon balance is net of its credit-line spending, so it can be lower
+      // than the unused credit in a lot; its credit line bounds it instead.
+      const isSalonCreditWallet =
+        wallet.walletType === "salon_promotion_credits";
+      if ((!isSalonCreditWallet && wallet.availableProin < amountProin) ||
           finance.outstandingLiabilityInr < amountProin) {
         throw new Error("Proin expiry exceeds its recorded liability.");
       }
@@ -2077,6 +2196,13 @@ function createProinBackend({admin, HttpsError}) {
         lifetimeExpiredProin:
           finance.lifetimeExpiredProin + amountProin,
       };
+      if (isSalonCreditWallet &&
+          walletAfter.availableProin < -wallet.creditLimitProin) {
+        throw new Error(
+          `Expiring this credit would take salon ${String(lot.accountId || "")} ` +
+            "past its credit line. Raise that salon's credit limit so it can expire.",
+        );
+      }
       if (!proinWalletInvariant(walletAfter) ||
           !proinFinanceInvariant(financeAfter)) {
         throw new Error("Proin expiry would not balance.");
@@ -2151,9 +2277,14 @@ function createProinBackend({admin, HttpsError}) {
     }, {merge: true});
   }
 
-  async function reconcile() {
+  async function reconcile({pageSize = RECONCILIATION_PAGE_SIZE} = {}) {
     const db = firestore();
     const nowMillis = Date.now();
+    const readUpTo = (collection, limit) => readCollectionInPages({
+      collection: db.collection(collection),
+      maximumDocuments: limit + 1,
+      pageSize,
+    });
     const [
       walletsSnapshot,
       lotsSnapshot,
@@ -2166,24 +2297,22 @@ function createProinBackend({admin, HttpsError}) {
       settlementReferencesSnapshot,
       salonPromotionUsageSnapshot,
     ] = await Promise.all([
-      db.collection("proinWallets")
-        .limit(RECONCILIATION_WALLET_LIMIT + 1).get(),
-      db.collection("proinLots")
-        .limit(RECONCILIATION_LOT_LIMIT + 1).get(),
+      readUpTo("proinWallets", RECONCILIATION_WALLET_LIMIT),
+      readUpTo("proinLots", RECONCILIATION_LOT_LIMIT),
       db.collection("proinFinance").doc("current").get(),
-      db.collection("proinProgramUsage").limit(501).get(),
-      db.collection("proinCouponUsage")
-        .limit(RECONCILIATION_COUPON_LIMIT + 1).get(),
-      db.collection("proinCouponClaims")
-        .limit(RECONCILIATION_COUPON_CLAIM_LIMIT + 1).get(),
-      db.collection("proinReservations")
-        .limit(RECONCILIATION_RESERVATION_LIMIT + 1).get(),
-      db.collection("proinSalonReimbursements")
-        .limit(RECONCILIATION_REIMBURSEMENT_LIMIT + 1).get(),
-      db.collection("proinSettlementPaymentReferences")
-        .limit(RECONCILIATION_SETTLEMENT_REFERENCE_LIMIT + 1).get(),
-      db.collection("salonPromotionCreditUsage")
-        .limit(RECONCILIATION_SALON_PROMOTION_USAGE_LIMIT + 1).get(),
+      readUpTo("proinProgramUsage", RECONCILIATION_PROGRAM_USAGE_LIMIT),
+      readUpTo("proinCouponUsage", RECONCILIATION_COUPON_LIMIT),
+      readUpTo("proinCouponClaims", RECONCILIATION_COUPON_CLAIM_LIMIT),
+      readUpTo("proinReservations", RECONCILIATION_RESERVATION_LIMIT),
+      readUpTo("proinSalonReimbursements", RECONCILIATION_REIMBURSEMENT_LIMIT),
+      readUpTo(
+        "proinSettlementPaymentReferences",
+        RECONCILIATION_SETTLEMENT_REFERENCE_LIMIT,
+      ),
+      readUpTo(
+        "salonPromotionCreditUsage",
+        RECONCILIATION_SALON_PROMOTION_USAGE_LIMIT,
+      ),
     ]);
     const walletScanTruncated =
       walletsSnapshot.size > RECONCILIATION_WALLET_LIMIT;
@@ -2191,7 +2320,8 @@ function createProinBackend({admin, HttpsError}) {
     const walletDocuments = walletsSnapshot.docs
       .slice(0, RECONCILIATION_WALLET_LIMIT);
     const lotDocuments = lotsSnapshot.docs.slice(0, RECONCILIATION_LOT_LIMIT);
-    const programUsageScanTruncated = programUsageSnapshot.size > 500;
+    const programUsageScanTruncated =
+      programUsageSnapshot.size > RECONCILIATION_PROGRAM_USAGE_LIMIT;
     const couponUsageScanTruncated =
       couponUsageSnapshot.size > RECONCILIATION_COUPON_LIMIT;
     const couponClaimScanTruncated =
@@ -2271,7 +2401,7 @@ function createProinBackend({admin, HttpsError}) {
       lotsByProgram.set(programId, values);
     }
     const programUsageById = new Map(programUsageSnapshot.docs
-      .slice(0, 500)
+      .slice(0, RECONCILIATION_PROGRAM_USAGE_LIMIT)
       .map((document) => [document.id, document.data()]));
     const programUsageMismatches = [];
     if (!lotScanTruncated && !programUsageScanTruncated) {
@@ -2281,14 +2411,19 @@ function createProinBackend({admin, HttpsError}) {
       ]);
       for (const programId of programIds) {
         const expected = summarizeLots(lotsByProgram.get(programId) || []);
+        // A salon credit hold stays in the program's available total until
+        // its discount is redeemed, so only customer holds count as reserved.
+        const salonHeldProin = summarizeLots(
+          (lotsByProgram.get(programId) || []).filter(isSalonCreditLot),
+        ).reservedProin;
         const actual = proinProgramUsageState(
           programUsageById.get(programId),
         );
         const expectedUsage = {
           grantCount: (lotsByProgram.get(programId) || []).length,
           grantedProin: expected.originalProin,
-          availableProin: expected.availableProin,
-          reservedProin: expected.reservedProin,
+          availableProin: expected.availableProin + salonHeldProin,
+          reservedProin: expected.reservedProin - salonHeldProin,
           redeemedProin: expected.redeemedProin,
           expiredProin: expected.expiredProin,
           revokedProin: expected.revokedProin,
@@ -2434,17 +2569,24 @@ function createProinBackend({admin, HttpsError}) {
     const reimbursementTotalsMatchFinance = !reimbursementScanTruncated &&
       payableFromReimbursements === finance.redeemedPayableInr &&
       settledFromReimbursements === finance.settledExpenseInr;
-    const lotTotals = summarizeLots(lotDocuments.map((document) => ({
+    const scannedLots = lotDocuments.map((document) => ({
       id: document.id,
       ...document.data(),
-    })));
+    }));
+    const lotTotals = summarizeLots(scannedLots);
+    // Salon credit never becomes a Proin payable or a finance hold: a held
+    // lot stays outstanding and a redeemed one leaves the liability outright.
+    const salonCreditLotTotals = summarizeLots(
+      scannedLots.filter(isSalonCreditLot),
+    );
     const financeMatchesLots = !lotScanTruncated &&
       lotTotals.invalidLotCount === 0 &&
       finance.outstandingLiabilityInr ===
         lotTotals.availableProin + lotTotals.reservedProin &&
-      finance.reservedLiabilityInr === lotTotals.reservedProin &&
+      finance.reservedLiabilityInr ===
+        lotTotals.reservedProin - salonCreditLotTotals.reservedProin &&
       finance.redeemedPayableInr + finance.settledExpenseInr ===
-        lotTotals.redeemedProin &&
+        lotTotals.redeemedProin - salonCreditLotTotals.redeemedProin &&
       finance.lifetimeGrantedProin === lotTotals.originalProin &&
       finance.lifetimeExpiredProin === lotTotals.expiredProin &&
       finance.lifetimeRevokedProin === lotTotals.revokedProin;
@@ -2502,6 +2644,7 @@ function createProinBackend({admin, HttpsError}) {
       financeMatchesLots,
       finance: proinFinanceView(finance),
       lotTotals,
+      salonCreditLotTotals,
       createdAt: fieldValue.serverTimestamp(),
       createdAtMillis: nowMillis,
     };
@@ -2559,47 +2702,111 @@ function createProinBackend({admin, HttpsError}) {
 
   async function phaseOneSnapshot() {
     const db = firestore();
+    // One extra row per capped list shows whether it was cut short.
+    const capped = (query, limit) => query.limit(limit + 1).get()
+      .then((snapshot) => ({
+        docs: snapshot.docs.slice(0, limit),
+        truncated: snapshot.size > limit,
+      }));
     const [
       programs,
       usage,
-      wallets,
+      salonWallets,
+      topWallets,
       lots,
       finance,
       reports,
       coupons,
       couponUsage,
-      reimbursements,
+      payableReimbursements,
+      settledReimbursements,
       referralCodes,
       referrals,
       referralStats,
+      vault,
     ] = await Promise.all([
-      db.collection("proinPrograms").limit(200).get(),
-      db.collection("proinProgramUsage").limit(200).get(),
-      db.collection("proinWallets").limit(500).get(),
-      db.collection("proinLots").limit(5000).get(),
+      capped(db.collection("proinPrograms"), SNAPSHOT_PROGRAM_LIMIT),
+      db.collection("proinProgramUsage").limit(SNAPSHOT_PROGRAM_LIMIT).get(),
+      // Every salon card needs its own wallet, so salon wallets are read in
+      // full; customer wallets are the largest balances first.
+      capped(
+        db.collection("proinWallets")
+          .where("walletType", "==", "salon_promotion_credits"),
+        SNAPSHOT_SALON_WALLET_LIMIT,
+      ),
+      capped(
+        db.collection("proinWallets").orderBy("availableProin", "desc"),
+        SNAPSHOT_TOP_WALLET_LIMIT,
+      ),
+      // Only unused lots can be adjusted, soonest expiry first.
+      capped(
+        db.collection("proinLots")
+          .where("status", "==", "active")
+          .orderBy("expiresAt", "asc"),
+        SNAPSHOT_ACTIVE_LOT_LIMIT,
+      ),
       db.collection("proinFinance").doc("current").get(),
       db.collection("proinReconciliationReports")
         .orderBy("createdAt", "desc").limit(20).get(),
-      db.collection("proinCoupons").limit(500).get(),
-      db.collection("proinCouponUsage").limit(500).get(),
-      db.collection("proinSalonReimbursements").limit(1000).get(),
-      db.collection("referralCodes").limit(1000).get(),
-      db.collection("referrals").limit(1000).get(),
-      db.collection("referralStats").limit(1000).get(),
+      capped(db.collection("proinCoupons"), SNAPSHOT_COUPON_LIMIT),
+      db.collection("proinCouponUsage").limit(SNAPSHOT_COUPON_LIMIT).get(),
+      capped(
+        db.collection("proinSalonReimbursements")
+          .where("status", "==", "payable"),
+        SNAPSHOT_PAYABLE_REIMBURSEMENT_LIMIT,
+      ),
+      // Only settled reimbursements carry a payment date.
+      capped(
+        db.collection("proinSalonReimbursements").orderBy("paidAt", "desc"),
+        SNAPSHOT_SETTLED_REIMBURSEMENT_LIMIT,
+      ),
+      capped(
+        db.collection("referralCodes").orderBy("createdAt", "desc"),
+        SNAPSHOT_REFERRAL_LIMIT,
+      ),
+      capped(
+        db.collection("referrals").orderBy("createdAt", "desc"),
+        SNAPSHOT_REFERRAL_LIMIT,
+      ),
+      db.collection("referralStats").limit(SNAPSHOT_REFERRAL_LIMIT).get(),
+      db.collection("platformFinance").doc("discountVault").get(),
     ]);
+    const walletDocuments = [...new Map(
+      [...salonWallets.docs, ...topWallets.docs]
+        .map((document) => [document.id, document]),
+    ).values()];
+    const reimbursementDocuments = [
+      ...payableReimbursements.docs,
+      ...settledReimbursements.docs,
+    ];
     return {
       generatedAtMillis: Date.now(),
+      truncated: {
+        programs: programs.truncated,
+        coupons: coupons.truncated,
+        salonWallets: salonWallets.truncated,
+        customerWallets: topWallets.truncated,
+        lots: lots.truncated,
+        payableReimbursements: payableReimbursements.truncated,
+        settledReimbursements: settledReimbursements.truncated,
+        referralCodes: referralCodes.truncated,
+        referrals: referrals.truncated,
+      },
       programs: programs.docs.map((document) =>
         proinProgramView(document.id, document.data())),
       programUsage: usage.docs.map((document) => ({
         programId: document.id,
         ...proinProgramUsageState(document.data()),
       })),
-      wallets: wallets.docs.map((document) => ({
+      wallets: walletDocuments.map((document) => ({
         walletId: document.id,
         walletType: String(document.data()?.walletType || ""),
         accountId: String(document.data()?.accountId || ""),
-        ...proinWalletView(proinWalletState(document.data())),
+        ...proinWalletView(
+          document.data()?.walletType === "salon_promotion_credits" ?
+            salonCreditWalletState(document.data(), vault.data()) :
+            proinWalletState(document.data()),
+        ),
       })),
       lots: lots.docs.map((document) => ({
         lotId: document.id,
@@ -2633,7 +2840,7 @@ function createProinBackend({admin, HttpsError}) {
         referralRecordView(document.id, document.data())),
       referralStats: referralStats.docs.map((document) =>
         referralStatsView(document.id, document.data())),
-      reimbursements: reimbursements.docs.map((document) => ({
+      reimbursements: reimbursementDocuments.map((document) => ({
         bookingId: document.id,
         salonId: String(document.data()?.salonId || ""),
         amountInr: storedProin(document.data()?.amountInr),
@@ -2654,6 +2861,62 @@ function createProinBackend({admin, HttpsError}) {
           Number(document.data()?.createdAtMillis) || 0,
       })),
     };
+  }
+
+  // A retry scan that always read the first page would never reach the rows
+  // behind ones that cannot succeed yet. Each call resumes after the last row
+  // the previous call returned. The position is saved before the page is
+  // processed so one slow page cannot hold up the rest of the queue.
+  async function nextRotatingScanPage({jobId, buildQuery, limit}) {
+    const db = firestore();
+    const pageSize = Math.max(1, Math.min(500, Number(limit) || 100));
+    const cursorRef = db.collection("proinJobState").doc(jobId);
+    const readPage = (afterDocumentId) => {
+      let query = buildQuery(db).orderBy(DOCUMENT_ID_FIELD);
+      if (afterDocumentId) query = query.startAfter(afterDocumentId);
+      return query.limit(pageSize).get();
+    };
+    const lastDocumentId = String(
+      (await cursorRef.get()).data()?.lastDocumentId || "",
+    );
+    let snapshot = await readPage(lastDocumentId);
+    if (lastDocumentId && snapshot.empty) snapshot = await readPage("");
+    await cursorRef.set({
+      lastDocumentId: snapshot.size < pageSize ?
+        "" : snapshot.docs[snapshot.size - 1].id,
+      updatedAt: fieldValue.serverTimestamp(),
+    });
+    return snapshot.docs;
+  }
+
+  // Qualified referrals whose reward is still owed. Ones waiting on approval
+  // or a first booking stay pending, which is why the scan rotates.
+  function nextReferralAwardScanPage({
+    includePreviouslyProcessed = false,
+    limit = 100,
+  } = {}) {
+    return nextRotatingScanPage({
+      jobId: includePreviouslyProcessed ?
+        "referralAwardBackfill" : "referralAwardRetry",
+      limit,
+      buildQuery: (db) => {
+        const query = db.collection("referrals")
+          .where("status", "==", "qualified");
+        return includePreviouslyProcessed ?
+          query : query.where("proinAwardPending", "==", true);
+      },
+    });
+  }
+
+  // Bookings whose discount cashback is still owed. Open bookings and awards
+  // that keep failing stay pending, which is why the scan rotates.
+  function nextPendingCashbackScanPage({limit = 100} = {}) {
+    return nextRotatingScanPage({
+      jobId: "discountCashbackRetry",
+      limit,
+      buildQuery: (db) => db.collection("bookings")
+        .where("discountCashbackStatus", "==", "pending"),
+    });
   }
 
   async function updateReconciliationAlert({
@@ -2749,9 +3012,12 @@ function createProinBackend({admin, HttpsError}) {
     expireLots,
     grantAsAdmin,
     grantQualifiedEvent,
+    nextPendingCashbackScanPage,
+    nextReferralAwardScanPage,
     phaseOneSnapshot,
     quoteBookingRedemption,
     reconcile,
+    redeemSalonCreditLotsInTransaction,
     refreshWalletExpiry,
     revokeAvailableLotAsAdmin,
     reserveBookingRedemptionInTransaction,
@@ -2761,6 +3027,26 @@ function createProinBackend({admin, HttpsError}) {
     upsertCoupon,
     upsertProgram,
   };
+}
+
+// Reads a collection in document-ID pages so a large ledger is never one
+// unbounded query. Only the ID and data are kept, which lets the snapshots be
+// released while the next page loads.
+async function readCollectionInPages({collection, maximumDocuments, pageSize}) {
+  const docs = [];
+  for (;;) {
+    const requested = Math.min(pageSize, maximumDocuments - docs.length);
+    if (requested <= 0) break;
+    let query = collection.orderBy(DOCUMENT_ID_FIELD).limit(requested);
+    if (docs.length > 0) query = query.startAfter(docs[docs.length - 1].id);
+    const page = await query.get();
+    for (const document of page.docs) {
+      const data = document.data();
+      docs.push({id: document.id, data: () => data});
+    }
+    if (page.size < requested) break;
+  }
+  return {docs, size: docs.length};
 }
 
 async function loadRedemptionPrograms({db, lots, transaction = null}) {
@@ -2978,6 +3264,8 @@ function proinProgramView(programId, program = {}) {
     endsAtMillis: timestampMillis(program.endsAt),
     version: storedProin(program.version),
     regulatoryMode: String(program.regulatoryMode || ""),
+    systemManaged: program.systemManaged === true,
+    linkedDiscountCampaignId: String(program.linkedDiscountCampaignId || ""),
   };
 }
 
@@ -3026,8 +3314,27 @@ function referralStatsView(userId, data = {}) {
   };
 }
 
-function proinWalletState(data = {}) {
-  const walletType = String(data?.walletType || "");
+function hasStoredCreditLimit(data) {
+  return Object.prototype.hasOwnProperty.call(data || {}, "creditLimitProin");
+}
+
+function isSalonCreditLot(lot) {
+  return String(lot?.walletType || "") === "salon_promotion_credits";
+}
+
+// The credit line a salon really has: its own limit when one was set,
+// otherwise the platform-wide line the discount engine applies.
+function salonCreditWalletState(data, vault) {
+  return {
+    ...proinWalletState(data, "salon_promotion_credits"),
+    creditLimitProin: discountSalonPromotionCreditLimit(vault, data),
+  };
+}
+
+// A wallet that has no document yet still has a type; pass it so a new salon
+// wallet is not read as a customer wallet with no credit line.
+function proinWalletState(data = {}, fallbackWalletType = "") {
+  const walletType = String(data?.walletType || fallbackWalletType || "");
   const isSalonPromotionWallet = walletType === "salon_promotion_credits";
   const creditLimitProin = isSalonPromotionWallet ?
     (Object.prototype.hasOwnProperty.call(data || {}, "creditLimitProin") ?

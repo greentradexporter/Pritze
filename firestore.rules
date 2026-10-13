@@ -233,6 +233,10 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    match /proinJobState/{jobId} {
+      allow read, write: if false;
+    }
+
     match /proinCoupons/{couponHash} {
       allow read, write: if false;
     }
